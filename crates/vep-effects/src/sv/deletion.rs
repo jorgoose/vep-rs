@@ -37,61 +37,60 @@ pub fn calculate(
     upstream_distance: u64,
     downstream_distance: u64,
 ) -> Option<TranscriptConsequence> {
-    let del_start = variant.start;
-    let del_end = variant.sv_end.unwrap_or(variant.end);
+    calculate_span(
+        variant,
+        variant.start,
+        variant.sv_end.unwrap_or(variant.end),
+        transcript,
+        upstream_distance,
+        downstream_distance,
+    )
+}
+
+/// [`calculate`] over an explicit deleted span, for a record whose lost bases are a
+/// part of its own span: a `<CNV:TR>` contraction loses the run's tail, not the run.
+/// The region terms read the deleted span; the flank window and DISTANCE read the
+/// record's own span, the Location its row prints, as `distance_to_transcript`
+/// (BaseTranscriptVariation.pm:582-605) reads `$vf->{start}` and `{end}`.
+pub(super) fn calculate_span(
+    variant: &InputVariant,
+    del_start: u64,
+    del_end: u64,
+    transcript: &Transcript,
+    upstream_distance: u64,
+    downstream_distance: u64,
+) -> Option<TranscriptConsequence> {
     let tx_start = transcript.start;
     let tx_end = transcript.end;
+    let span_start = variant.start;
+    let span_end = variant.sv_end.unwrap_or(variant.end);
 
-    if del_end < tx_start.saturating_sub(upstream_distance.max(downstream_distance))
-        || del_start > tx_end + upstream_distance.max(downstream_distance)
+    if span_end < tx_start.saturating_sub(upstream_distance.max(downstream_distance))
+        || span_start > tx_end.saturating_add(upstream_distance.max(downstream_distance))
     {
         return None;
     }
 
     let mut consequences: ConsequenceList = SmallVec::new();
-    let mut distance: Option<u64> = None;
 
     let overlaps_transcript = del_end >= tx_start && del_start <= tx_end;
 
     if !overlaps_transcript {
-        match transcript.strand {
-            Strand::Forward => {
-                if del_end < tx_start {
-                    let dist = tx_start - del_end;
-                    if dist <= upstream_distance {
-                        consequences.push(Consequence::UpstreamGeneVariant);
-                        distance = Some(dist);
-                    }
-                } else {
-                    let dist = del_start - tx_end;
-                    if dist <= downstream_distance {
-                        consequences.push(Consequence::DownstreamGeneVariant);
-                        distance = Some(dist);
-                    }
-                }
-            }
-            Strand::Reverse => {
-                if del_start > tx_end {
-                    let dist = del_start - tx_end;
-                    if dist <= upstream_distance {
-                        consequences.push(Consequence::UpstreamGeneVariant);
-                        distance = Some(dist);
-                    }
-                } else {
-                    let dist = tx_start - del_end;
-                    if dist <= downstream_distance {
-                        consequences.push(Consequence::DownstreamGeneVariant);
-                        distance = Some(dist);
-                    }
-                }
-            }
-        }
-
-        if consequences.is_empty() {
+        let upstream = match transcript.strand {
+            Strand::Forward => del_end < tx_start,
+            Strand::Reverse => del_start > tx_end,
+        };
+        let (term, flank) = if upstream {
+            (Consequence::UpstreamGeneVariant, upstream_distance)
+        } else {
+            (Consequence::DownstreamGeneVariant, downstream_distance)
+        };
+        let dist = distance_to_transcript(span_start, span_end, transcript);
+        if dist > flank {
             return None;
         }
-
-        return Some(build_consequence(transcript, consequences, distance));
+        consequences.push(term);
+        return Some(build_consequence(transcript, consequences, Some(dist)));
     }
 
     if del_start <= tx_start && del_end >= tx_end {
@@ -357,7 +356,7 @@ pub fn calculate(
     consequences.sort();
     consequences.dedup();
 
-    Some(build_consequence(transcript, consequences, distance))
+    Some(build_consequence(transcript, consequences, None))
 }
 
 /// Push a consequence only if not already present.
@@ -365,6 +364,16 @@ fn push_unique(consequences: &mut ConsequenceList, consequence: Consequence) {
     if !consequences.contains(&consequence) {
         consequences.push(consequence);
     }
+}
+
+/// The smallest of the four gaps between a span's ends and the transcript's ends
+/// (BaseTranscriptVariation.pm:582-605).
+fn distance_to_transcript(span_start: u64, span_end: u64, transcript: &Transcript) -> u64 {
+    span_start
+        .abs_diff(transcript.start)
+        .min(span_start.abs_diff(transcript.end))
+        .min(span_end.abs_diff(transcript.start))
+        .min(span_end.abs_diff(transcript.end))
 }
 
 /// Build the `TranscriptConsequence` from accumulated data, with the impact of
@@ -403,6 +412,7 @@ fn build_consequence(
         mane_plus_clinical: transcript.mane_plus_clinical.clone(),
         appris: transcript.appris.clone(),
         ccds: transcript.ccds.clone(),
+        protein_id: transcript.protein_id.clone(),
         swissprot: transcript.swissprot.clone(),
         trembl: transcript.trembl.clone(),
         refseq: transcript.refseq.clone(),
@@ -1039,5 +1049,34 @@ mod tests {
                 "stop_lost",
             ],
         );
+    }
+
+    /// Under `--protein` the ENSP column is filled on every transcript row from the
+    /// transcript's protein id, a structural-variant row included (ensembl-vep
+    /// `OutputFactory.pm` `BaseTranscriptVariationAllele_to_output_hash`, which every
+    /// `TranscriptStructuralVariationAllele` passes through): a `transcript_ablation`
+    /// row carries the deleted transcript's ENSP, as Ensembl VEP 116.2 prints
+    /// `ENSP00000284881.4` on the `ENST00000284881` row of `del_10_6_mb` in the
+    /// GRCh38-release116 golden corpus.
+    #[test]
+    fn transcript_ablation_row_carries_the_protein_id() {
+        let transcript = tx(); // protein ENSP00000000001
+        let v = make_del("21", 24_000_000, 26_000_000);
+        let tc = calculate(&v, &transcript, 5000, 5000).unwrap();
+        assert_eq!(
+            tc.consequences.to_vec(),
+            vec![Consequence::TranscriptAblation]
+        );
+        assert_eq!(tc.protein_id.as_deref(), Some("ENSP00000000001"));
+    }
+
+    /// A transcript without a translation prints no ENSP on any row.
+    #[test]
+    fn non_coding_transcript_row_has_no_protein_id() {
+        let mut transcript = tx();
+        transcript.protein_id = None;
+        let v = make_del("21", 24_000_000, 26_000_000);
+        let tc = calculate(&v, &transcript, 5000, 5000).unwrap();
+        assert_eq!(tc.protein_id, None);
     }
 }

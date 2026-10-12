@@ -14,8 +14,9 @@
 //! (e.g., "A/G/T") produce one `InputVariant` per ALT allele.
 
 use std::io::BufRead;
+use std::sync::Arc;
 
-use vep_core::coordinate::Strand;
+use vep_core::coordinate::{parse_coordinate, Strand};
 use vep_core::variant::InputVariant;
 
 use crate::error::IoError;
@@ -60,12 +61,10 @@ impl<R: BufRead> EnsemblParser<R> {
         }
 
         let chr = parts[0].to_string();
-        let start: u64 = parts[1]
-            .parse()
-            .map_err(|_| IoError::VcfParse(format!("Invalid start position: '{}'", parts[1])))?;
-        let end: u64 = parts[2]
-            .parse()
-            .map_err(|_| IoError::VcfParse(format!("Invalid end position: '{}'", parts[2])))?;
+        let start = parse_coordinate(parts[1])
+            .ok_or_else(|| IoError::VcfParse(format!("Invalid start position: '{}'", parts[1])))?;
+        let end = parse_coordinate(parts[2])
+            .ok_or_else(|| IoError::VcfParse(format!("Invalid end position: '{}'", parts[2])))?;
         let allele_string = parts[3];
         let strand_val: i8 = parts[4]
             .parse()
@@ -97,6 +96,10 @@ impl<R: BufRead> EnsemblParser<R> {
         let multi_allelic = alts.len() > 1;
 
         let mut variants = Vec::with_capacity(alts.len());
+        // OutputFactory.pm `VariationFeature_to_output_hash`, the ensembl `_line`
+        // branch: the lower coordinate, so an insertion written `100 99` is named
+        // at 99.
+        let line_name: Arc<str> = format!("{chr}_{}_{allele_string}", start.min(end)).into();
 
         for (i, alt) in alts.iter().enumerate() {
             let mut variant = InputVariant::new(
@@ -110,6 +113,7 @@ impl<R: BufRead> EnsemblParser<R> {
             variant.id = id.clone();
             variant.allele_index = i;
             variant.minimised = multi_allelic;
+            variant.input_line_name = Some(line_name.clone());
 
             variants.push(variant);
         }
@@ -153,6 +157,7 @@ impl<R: BufRead + Send> InputParser for EnsemblParser<R> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+    use vep_core::coordinate::MAX_COORD;
 
     #[test]
     fn test_parse_snv() {
@@ -189,6 +194,21 @@ mod tests {
         assert!(parser.next_variant().is_none());
     }
 
+    /// OutputFactory.pm `VariationFeature_to_output_hash`, the ensembl `_line`
+    /// branch: an ID-less line is named `chr_start_alleles` with the lower of its
+    /// two coordinates (99 for the insertion `100 99`) and the allele column as
+    /// written (`A/G/T` on every allele of a multi-allelic line); an ID names it.
+    #[test]
+    fn id_less_line_is_named_by_its_lower_coordinate_and_allele_column() {
+        let data = "21\t100\t99\t-/A\t1\n21\t200\t200\tA/G/T\t1\t.\n21\t300\t300\tC/T\t1\trs1\n";
+        let mut parser = EnsemblParser::new(Cursor::new(data.as_bytes()));
+        let mut names = Vec::new();
+        while let Some(v) = parser.next_variant() {
+            names.push(v.unwrap().uploaded_variation());
+        }
+        assert_eq!(names, ["21_99_-/A", "21_200_A/G/T", "21_200_A/G/T", "rs1"]);
+    }
+
     #[test]
     fn test_parse_multi_allelic() {
         let data = "21\t25585733\t25585733\tA/G/T\t1\trs699\n";
@@ -206,6 +226,25 @@ mod tests {
         assert!(v2.minimised);
 
         assert!(parser.next_variant().is_none());
+    }
+
+    /// A coordinate is read up to `MAX_COORD`; a start or end past it fails the line.
+    #[test]
+    fn coordinates_past_the_ceiling_fail_the_line() {
+        let past = MAX_COORD + 1;
+        let data = format!(
+            "21\t{MAX_COORD}\t{MAX_COORD}\tA/G\t1\n\
+             21\t{past}\t{past}\tA/G\t1\n\
+             21\t100\t{}\tA/G\t1\n",
+            i64::MAX
+        );
+        let mut parser = EnsemblParser::new(Cursor::new(data.as_bytes()));
+        let kept = parser.next_variant().unwrap().unwrap();
+        assert_eq!((kept.start, kept.end), (MAX_COORD, MAX_COORD));
+        let start_err = parser.next_variant().unwrap().unwrap_err().to_string();
+        assert!(start_err.contains("Invalid start position"), "{start_err}");
+        let end_err = parser.next_variant().unwrap().unwrap_err().to_string();
+        assert!(end_err.contains("Invalid end position"), "{end_err}");
     }
 
     #[test]

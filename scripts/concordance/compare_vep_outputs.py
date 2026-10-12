@@ -5,18 +5,20 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gzip
 import json
 import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
-from typing import Callable, Iterable, Iterator, TextIO
+from typing import Callable, Iterable, Iterator, Sequence, TextIO
 
 TupleKey = tuple[str, str, str, str, str]
 ContextTermSet = frozenset[str]
@@ -438,8 +440,9 @@ SV_TRANSCRIPT_SELECTION_BUCKET = "sv_transcript_selection"
 
 
 def _location_span(loc: str) -> tuple[str, int, int] | None:
-    """``chrom:start-end`` or ``chrom:pos`` as (chrom, start, end); None when unparseable."""
-    m = re.fullmatch(r"([^:]+):(\d+)(?:-(\d+))?", loc)
+    """``chrom:start-end`` or ``chrom:pos`` as (chrom, start, end), a coordinate the reference
+    numified below zero included (`21:-4-295`); None when unparseable."""
+    m = re.fullmatch(r"([^:]+):(-?\d+)(?:-(-?\d+))?", loc, re.ASCII)
     if not m:
         return None
     start = int(m.group(2))
@@ -658,6 +661,35 @@ def is_own_breakend_allele(allele: str) -> bool:
     return _OWN_BREAKEND_RE.match(allele) is not None
 
 
+def is_breakend_allele(allele: str) -> bool:
+    """Whether the allele column names a breakend's own end or its mate."""
+    return is_own_breakend_allele(allele) or bracket_mate(allele) is not None
+
+
+def dot_breakend_points(span: tuple[str, int, int]) -> list[str]:
+    """The Locations at which vep-rs can write the point `c:(P+1)` of a dot-notation breakend
+    without SVTYPE whose reference row spans ``span`` (chromosome, low, high): the span's start
+    and the base after it. The reference takes the sequence rules for the coordinates
+    (BaseVCF4.pm:264-275, 297-316): the start is P + 1 when the ALT's length differs from the
+    REF's and P when it does not, the end P + len(REF) - 1, the two written low first. A REF of
+    one base (`N N.`) gives `c:P-(P+1)` and the point is the base after the start; a REF of
+    three or more bases beside an ALT of another length (`NAC .N`) gives `c:(P+1)-(P+len(REF)-1)`
+    and the point is the start; an ALT of the REF's length (`NA N.`, `NAC NA.`, `NACG NAC.`)
+    gives `c:P-(P+len(REF)-1)` and the point is the base after the start."""
+    chrom, start, _end = span
+    return [f"{chrom}:{start}", f"{chrom}:{start + 1}"]
+
+
+def reference_mate_chromosome(allele: str) -> str | None:
+    """The mate chromosome of a bracket-notation breakend allele as the reference resolves it:
+    a ``chr`` prefix as written is removed and any other spelling is kept, so `N[chr21:...[`
+    names ``21`` and `N[Chr21:...[` names ``Chr21``, a name the cache files no transcript
+    under (StructuralVariationOverlap.pm:86-102 compares it with the transcript's); None for
+    any other allele."""
+    m = _BRACKET_MATE_RE.search(allele)
+    return m.group(1).removeprefix("chr") if m else None
+
+
 @dataclass(frozen=True)
 class OneSidedRule:
     """A divergence shape recognised on rows one engine wrote and the other did not.
@@ -666,9 +698,9 @@ class OneSidedRule:
     transcript, a one-sided rule judges a record: what the reference wrote for it
     (nothing, or rows under some alleles) against what vep-rs wrote. ``excludes`` says
     whether this comparator's adjusted F1 removes the rows it recognises;
-    ``excludes_with_cache`` whether a comparator with a transcript-to-chromosome
-    authority (the structural-variant comparator under its cache) does. A rule that only
-    classifies reports a count so the shape is visible without being credited to vep-rs.
+    ``excludes_with_cache`` whether the structural-variant comparator, which reads the input
+    records and a cache authority, sets the rows aside. A rule that only classifies reports a
+    count so the shape is visible without being credited to vep-rs.
     """
 
     bucket: str
@@ -683,11 +715,52 @@ REFERENCE_SKIPPED_RECORD_BUCKET = "reference_skipped_record"
 BND_OWN_ROWS_LOST_BUCKET = "bnd_own_chromosome_rows_lost"
 BND_SYNONYM_MATE_ROWS_LOST_BUCKET = "bnd_synonym_mate_rows_lost"
 FASTA_NAMED_SLICE_INTERGENIC_BUCKET = "fasta_named_slice_intergenic"
+BND_BARE_REFERENCE_ALLELE_ROW_BUCKET = "bnd_bare_reference_allele_row"
+BND_MATE_32_BIT_BUFFER_BUCKET = "bnd_mate_32bit_buffer_intergenic"
+GVCF_VARIANT_SITE_DROPPED_BUCKET = "gvcf_variant_site_dropped"
+DOT_BREAKEND_PAIR_BUCKET = "dot_breakend_without_svtype_pair"
+MISSING_ALT_ANNOTATED_BUCKET = "missing_alt_annotated"
+NON_INTEGER_END_BUCKET = "non_integer_end_annotated"
+CNV_TR_EMPTY_EXPANSION_BUCKET = "cnv_tr_empty_expansion_dropped"
+STAR_ALONE_SVTYPE_ANNOTATED_BUCKET = "star_alone_svtype_annotated"
+NON_NUMERIC_POS_NUMIFIED_BUCKET = "non_numeric_pos_numified"
+CNV_TR_RN_ZERO_ALLELE_DROPPED_BUCKET = "cnv_tr_rn_zero_allele_dropped"
+# The smallest coordinate at which Ensembl VEP 116.2 annotates every record of the input
+# buffer as intergenic_variant: the coordinate plus the default --distance flank reaches
+# 2^31, so the bound moves with the flank.
+BND_MATE_32_BIT_LIMIT = 2**31 - 5000
+# A coordinate with fewer digits than the bound cannot reach it.
+_BND_MATE_32_BIT_LIMIT_DIGITS = len(str(BND_MATE_32_BIT_LIMIT))
+# The largest coordinate vep-rs holds; a POS past it fails its line in every input format,
+# where the reference numifies the text and annotates the record.
+VEP_RS_COORDINATE_CEILING = 2**62 - 1
+# The POS spellings vep-rs reads besides a decimal integer: what Rust's `f64` parser accepts,
+# ASCII digits with an optional fraction and exponent and an optional `+`, blanks around.
+_VEP_RS_POS_NUMBER = re.compile(r"\+?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?", re.ASCII)
 
-# The three breakend shapes are counted, never set aside: deciding which of the rows the
-# reference would have written needs the cache's transcript-to-chromosome authority,
-# which this comparator does not read (the structural-variant comparator sets the first
-# two aside under it).
+
+def vep_rs_pos(text: str) -> int | None:
+    """The POS column as vep-rs's parsers read it: an unpadded decimal integer up to
+    `VEP_RS_COORDINATE_CEILING` exactly, or another spelling of an exact non-negative integer
+    below the ceiling that Rust's `f64` parser accepts, blanks around it ignored (`3e7`,
+    `30425650.0`, `30425650.`, `+30425650`, ` 30425650 `), read as the double it names
+    (` 72057594037927937 ` is 72057594037927936); None where vep-rs fails the line (`.`, `abc`,
+    `-5`, `0x1D04A1A`, `30_425_650`, fullwidth digits, `inf`, `1e400`, `30425650.5`)."""
+    stripped = text.strip(" \t\n\r\x0c")
+    if _VEP_RS_POS_NUMBER.fullmatch(stripped) is None:
+        return None
+    if text.removeprefix("+").isdigit():
+        value = int(text)
+        return value if value <= VEP_RS_COORDINATE_CEILING else None
+    # `VEP_RS_COORDINATE_CEILING` rounds up to 2^62 as a double, so the bound is strict.
+    number = float(stripped)
+    return int(number) if number.is_integer() and number < 2.0**62 else None
+
+
+# The two lost-row breakend shapes are counted, never set aside, by this comparator:
+# deciding which of the rows the reference would have written needs the cache's
+# transcript-to-chromosome authority, which this comparator does not read (the
+# structural-variant comparator sets them aside under it).
 REFERENCE_116_2_ONE_SIDED_RULES: tuple[OneSidedRule, ...] = (
     OneSidedRule(
         bucket=REFERENCE_SKIPPED_RECORD_BUCKET,
@@ -741,6 +814,177 @@ REFERENCE_116_2_ONE_SIDED_RULES: tuple[OneSidedRule, ...] = (
         excludes=False,
         taxonomy_class="fasta_named_slice_intergenic",
         perl_citation="Parser.pm:749; BaseVEP.pm get_slice; AnnotationType/Transcript.pm:141",
+    ),
+    OneSidedRule(
+        bucket=BND_BARE_REFERENCE_ALLELE_ROW_BUCKET,
+        definition=(
+            "A breakpoint record that names no mate (a bare <BND>, or one with SVLEN, POS2 or "
+            "an unreadable END2 and no bracket) is held as N/<BND> and, with no breakend "
+            "parsed, one allele is built per slash-separated part, the reference base N "
+            "included, so the reference writes every row twice under chromosome_breakpoint, "
+            "ALLELE_NUM 1 for the reference allele and 2 for the ALT; a reference allele has "
+            "no variant effect, so vep-rs writes the ALT row once and the reference-allele "
+            "rows are set aside: each duplicates the ALT row's tuple, so the unique-tuple "
+            "key stream drops it before the raw and the adjusted figure, and both "
+            "comparators count the rows so set aside per record."
+        ),
+        excludes=True,
+        excludes_with_cache=True,
+        taxonomy_class="bnd_bare_reference_allele_row",
+        perl_citation="Parser/VCF.pm:499; StructuralVariationOverlap.pm:64-77; OutputFactory.pm:2029",
+    ),
+    OneSidedRule(
+        bucket=BND_MATE_32_BIT_BUFFER_BUCKET,
+        definition=(
+            "A coordinate of the reference's input buffer that, plus the --distance flank, "
+            "reaches 2^31 (a breakend's mate position, a span's end or the record's own "
+            "position) turns every record of the buffer intergenic, that record and the "
+            "records loaded with it (the first such position is 2147478648 under the "
+            "default flank of 5000 and 2147483647 under --distance 1); the coordinates "
+            "enter the buffer's bounds with the flank added when the cache regions are "
+            "chosen. vep-rs annotates the buffer's records against their transcripts and a "
+            "mate at its coordinate. Counted on the reference's rows at the record's "
+            "Location and never set aside, since the records it reaches beyond that one "
+            "depend on the buffer boundaries."
+        ),
+        excludes=False,
+        taxonomy_class="bnd_mate_32bit_buffer_intergenic",
+        perl_citation="AnnotationSource.pm:190, 251-254, 306-309; InputBuffer.pm:386-389",
+    ),
+    OneSidedRule(
+        bucket=GVCF_VARIANT_SITE_DROPPED_BUCKET,
+        definition=(
+            "A gVCF variant site lists <NON_REF> beside its real allele (`A G,<NON_REF>`); "
+            "the <NON_REF> token routes the line to the structural path, where "
+            "`G/<NON_REF>` has no Sequence Ontology term, and the reference drops the site "
+            "whole, the real allele with it. vep-rs annotates the real allele and reads "
+            "<NON_REF> as the absence of a variant. vep-rs's rows at the site are set aside: "
+            "recognised here by the record's own name (`CHROM_POS_REF/ALT/<NON_REF>`) at a "
+            "Location the reference wrote nothing for, and in the structural-variant "
+            "comparator from the input record."
+        ),
+        excludes=True,
+        excludes_with_cache=True,
+        taxonomy_class="gvcf_variant_site_dropped",
+        perl_citation="Parser/VCF.pm:237-245, 469-481; Parser.pm:663-727",
+    ),
+    OneSidedRule(
+        bucket=DOT_BREAKEND_PAIR_BUCKET,
+        definition=(
+            "A dot-notation breakend without INFO/SVTYPE (`N.`, `.N`) takes the sequence "
+            "rules for its coordinates: the start is POS + 1 when the ALT's length differs "
+            "from the REF's and POS when it does not, the end is POS + len(REF) - 1, so the "
+            "reference writes the pair `POS-(POS+1)` with the positions of an insertion for "
+            "a one-base REF, the span `(POS+1)-(POS+len(REF)-1)` for a longer REF beside an "
+            "ALT of another length and `POS-(POS+len(REF)-1)` beside an ALT of its own "
+            "length; with `SVTYPE=BND` it writes the single base at POS + 1, as vep-rs "
+            "writes it for every REF. The reference's span row and vep-rs's point row at "
+            "the span's start or the base after it on the same feature are set aside "
+            "together."
+        ),
+        excludes=True,
+        excludes_with_cache=True,
+        taxonomy_class="dot_breakend_without_svtype_pair",
+        perl_citation="BaseVCF4.pm:255-275, 297-316",
+    ),
+    OneSidedRule(
+        bucket=MISSING_ALT_ANNOTATED_BUCKET,
+        definition=(
+            "A record whose ALT column is the missing value `.` is routed to the structural "
+            "path by INFO/SVTYPE and annotated as an allele: a `chromosome_breakpoint` for "
+            "`SVTYPE=BND`, a deletion over END for `SVTYPE=DEL`; without SVTYPE the "
+            "reference writes nothing for it, as vep-rs writes nothing in both cases. The "
+            "reference's rows are set aside by the structural-variant comparator, which "
+            "reads the input; the SNP/indel comparator cannot tell them from a record with "
+            "an allele."
+        ),
+        excludes=False,
+        excludes_with_cache=True,
+        taxonomy_class="missing_alt_annotated",
+        perl_citation="BaseVCF4.pm:486-490; Parser/VCF.pm:237-245; Parser.pm:710-711",
+    ),
+    OneSidedRule(
+        bucket=NON_INTEGER_END_BUCKET,
+        definition=(
+            "An INFO/END, SVLEN or POS that is not an integer (`END=30425949.5`, "
+            "`SVLEN=300.7`, `SVLEN=NaN`, POS `30425949.0` on the sequence path) is taken as "
+            "written, passes `looks_like_number`, and the record is annotated with the text "
+            "in its Location (`21:30425651-30425950.7`, `21:30425651-NaN`, `21:30425949.0`) "
+            "and a fractional DISTANCE; vep-rs refuses an END that is not a coordinate and "
+            "reads a SVLEN or POS at its numified value (`21:30425651-30425950`, the pair "
+            "`21:30425650-30425651`, `21:30425949`). The reference's rows, recognised by the "
+            "Location, are set aside in both comparators, and vep-rs's rows of the same "
+            "record by the structural-variant comparator, which reads the input."
+        ),
+        excludes=True,
+        excludes_with_cache=True,
+        taxonomy_class="non_integer_end_annotated",
+        perl_citation="BaseVCF4.pm:263, 302-308; Parser.pm:475",
+    ),
+    OneSidedRule(
+        bucket=CNV_TR_EMPTY_EXPANSION_BUCKET,
+        definition=(
+            "With a FASTA, a <CNV:TR> whose expansion yields no alternate allele, or one "
+            "equal to the reference run (`RN=.`, a RUC that is not a positive number, a RUC "
+            "times unit length equal to SVLEN), is expanded to an allele string with no "
+            "alternate and the reference writes nothing for it, without a warning; vep-rs "
+            "writes the symbolic rows over the run, as the reference does without a FASTA. "
+            "vep-rs's rows are set aside by the structural-variant comparator when the "
+            "input record has the shape and the reference wrote nothing at or beside the "
+            "run; the SNP/indel comparator does not judge it."
+        ),
+        excludes=False,
+        excludes_with_cache=True,
+        taxonomy_class="cnv_tr_empty_expansion_dropped",
+        perl_citation="Parser/VCF.pm:382-431, 516-543; Parser.pm:553-592",
+    ),
+    OneSidedRule(
+        bucket=STAR_ALONE_SVTYPE_ANNOTATED_BUCKET,
+        definition=(
+            "A record whose every ALT is `*` under a true INFO/SVTYPE is routed to the "
+            "structural path and annotated from INFO alone, a deletion over END for "
+            "`SVTYPE=DEL` or a `chromosome_breakpoint` at POS + 1 for `SVTYPE=BND`, although "
+            "`*` names no allele of the record; vep-rs writes no row for it. The reference's "
+            "rows are set aside by the structural-variant comparator, which reads the input; "
+            "the SNP/indel comparator cannot tell them from a record with an allele."
+        ),
+        excludes=False,
+        excludes_with_cache=True,
+        taxonomy_class="star_alone_svtype_annotated",
+        perl_citation="Parser/VCF.pm:237-245, 469-475; StructuralVariationOverlap.pm:64-77",
+    ),
+    OneSidedRule(
+        bucket=NON_NUMERIC_POS_NUMIFIED_BUCKET,
+        definition=(
+            "A POS that is not a non-negative number (`.`, empty, `0x1D04A1D`, fullwidth "
+            "digits, `30_425_949`, `-5`) is numified by the structural path's increment, `.` "
+            "to 0 and the record annotated from base 1, `30_425_949` from 31, `-5` from -4, "
+            "where vep-rs refuses the line; the reference's rows at the record's start are "
+            "set aside by the structural-variant comparator from the input, and by the "
+            "SNP/indel comparator when the Location's first coordinate is negative, the one "
+            "spelling no written POS reaches."
+        ),
+        excludes=True,
+        excludes_with_cache=True,
+        taxonomy_class="non_numeric_pos_numified",
+        perl_citation="BaseVCF4.pm:255-264; Parser.pm:475-488",
+    ),
+    OneSidedRule(
+        bucket=CNV_TR_RN_ZERO_ALLELE_DROPPED_BUCKET,
+        definition=(
+            "With a FASTA, a two-ALT <CNV:TR> of which one allele has `RN=0` loses an "
+            "allele: the empty expansion is an empty part of the allele string, which is "
+            "not read as multi-allelic, so the first allele alone is kept when the empty "
+            "part leads and the trailing empty part is dropped by the split; vep-rs writes "
+            "both alleles, and its rows of the dropped allele, told by their direction term "
+            "when the real allele is a gain, or when it is unchanged beside a leading empty "
+            "part (vep-rs reads an unchanged allele as a gain), are set aside by the "
+            "structural-variant comparator."
+        ),
+        excludes=False,
+        excludes_with_cache=True,
+        taxonomy_class="cnv_tr_rn_zero_allele_dropped",
+        perl_citation="Parser/VCF.pm:411, 428; Parser.pm:881, 978",
     ),
 )
 
@@ -838,13 +1082,38 @@ class ReferenceRecordScope:
     ``breakends``: for every (file, Location) at which either engine wrote a breakend
     allele, the alleles each side wrote and the mate chromosomes its bracket alleles
     name, for the two breakend classes.
+
+    ``bare_reference_rows``: per (file, Location), the reference-allele rows of a bare
+    breakpoint record the unique-tuple key stream dropped, counted on the reference's
+    raw output by `count_bare_breakpoint_reference_rows` and handed in through
+    `record_bare_reference_rows`, since the merge never sees a duplicate row.
+
+    ``mate_overflow``: the (file, Location) pairs at which the reference wrote a bracket
+    allele whose mate position is at least `BND_MATE_32_BIT_LIMIT`, or a Location whose
+    start or end is.
+
+    ``reference_only``: the (file, Location) pairs at which the reference wrote and vep-rs
+    nothing, under any allele, read by the class that recognises a numified POS from
+    the reference's coordinate alone.
+
+    ``gvcf_sites``: the (file, Location) pairs of vep-rs rows at a gVCF variant site, read
+    from the input VCF's shape (`gvcf_site_locations_from_vcf`) and from the generated name
+    of an ID-less record in vep-rs's output (`gvcf_site_locations`), handed in through
+    `record_gvcf_sites`; such a Location the reference wrote nothing for is
+    ``gvcf_absent`` rather than ``absent``, whatever its allele.
     """
 
     def __init__(self) -> None:
         self.absent: set[tuple[str, str]] = set()
+        self.gvcf_absent: set[tuple[str, str]] = set()
         self.breakends: dict[tuple[str, str], tuple[set[str], set[str], set[str]]] = {}
+        self.bare_reference_rows: dict[tuple[str, str], int] = {}
+        self.mate_overflow: set[tuple[str, str]] = set()
+        self.gvcf_sites: set[tuple[str, str]] = set()
+        self.reference_only: set[tuple[str, str]] = set()
         self._group: tuple[str, str] | None = None
         self._reference_wrote = False
+        self._rust_wrote = False
         self._rust_wrote_structural = False
 
     def observe(self, file_name: str, key_line: str, perl: bool, rust: bool) -> None:
@@ -855,7 +1124,20 @@ class ReferenceRecordScope:
             self._group = group
         if perl:
             self._reference_wrote = True
-        if rust and is_structural_allele(allele) and allele != _TANDEM_REPEAT_ALLELE:
+            coords = loc.partition(":")[2]
+            if (
+                len(coords) >= _BND_MATE_32_BIT_LIMIT_DIGITS
+                and max(map(len, coords.split("-"))) >= _BND_MATE_32_BIT_LIMIT_DIGITS
+            ):
+                span = _location_span(loc)
+                if span is not None and max(span[1], span[2]) >= BND_MATE_32_BIT_LIMIT:
+                    self.mate_overflow.add(group)
+        if rust:
+            self._rust_wrote = True
+        if rust and (
+            group in self.gvcf_sites
+            or (is_structural_allele(allele) and allele != _TANDEM_REPEAT_ALLELE)
+        ):
             self._rust_wrote_structural = True
         mate = bracket_mate(allele)
         if mate is not None or is_own_breakend_allele(allele):
@@ -868,14 +1150,32 @@ class ReferenceRecordScope:
                 rust_alleles.add(allele)
             if mate is not None:
                 mates.add(mate[0])
+                if perl and mate[1] >= BND_MATE_32_BIT_LIMIT:
+                    self.mate_overflow.add(group)
 
     def close(self) -> None:
         """Close the open Location group; called by the merge when its file ends."""
         if self._group is not None and self._rust_wrote_structural and not self._reference_wrote:
-            self.absent.add(self._group)
+            if self._group in self.gvcf_sites:
+                self.gvcf_absent.add(self._group)
+            else:
+                self.absent.add(self._group)
+        if self._group is not None and self._reference_wrote and not self._rust_wrote:
+            self.reference_only.add(self._group)
         self._group = None
         self._reference_wrote = False
+        self._rust_wrote = False
         self._rust_wrote_structural = False
+
+    def record_bare_reference_rows(self, file_name: str, rows_by_location: Counter[str]) -> None:
+        """Record one file's reference-allele rows of bare breakpoints, per Location."""
+        for loc, rows in rows_by_location.items():
+            if rows:
+                self.bare_reference_rows[(file_name, loc)] = rows
+
+    def record_gvcf_sites(self, file_name: str, locations: set[str]) -> None:
+        """Record one file's gVCF variant-site Locations, read from vep-rs's output."""
+        self.gvcf_sites.update((file_name, loc) for loc in locations)
 
 
 def _strip_chr(chrom: str) -> str:
@@ -885,6 +1185,262 @@ def _strip_chr(chrom: str) -> str:
     return chrom[3:] if chrom.lower().startswith("chr") else chrom
 
 
+_BARE_BREAKPOINT_ALLELE = "chromosome_breakpoint"
+
+
+def count_bare_breakpoint_reference_rows(
+    path: Path, canonical_contigs: frozenset[str] | None = None
+) -> Counter[str]:
+    """The reference's duplicate rows under `chromosome_breakpoint`, per Location.
+
+    A breakpoint record that names no mate is held as `N/<BND>` and, with no breakend
+    parsed, gets one allele per slash-separated part, the reference base `N` included
+    (StructuralVariationOverlap.pm:64-77), so every row is written twice, the second
+    for the reference allele, under the same key. The second and later rows of a key are
+    counted here, read through `iter_vep_key_lines` so that they are the rows the
+    unique-tuple key stream drops; a row that function skips, a contig outside
+    ``canonical_contigs`` included, counts nothing, as does a missing file.
+    """
+    rows_by_location: Counter[str] = Counter()
+    if not path.exists():
+        return rows_by_location
+    seen: set[str] = set()
+    for key in iter_vep_key_lines(path, canonical_contigs=canonical_contigs):
+        location, allele, _ = key.split("\t", 2)
+        if allele != _BARE_BREAKPOINT_ALLELE:
+            continue
+        if key in seen:
+            rows_by_location[location] += 1
+        else:
+            seen.add(key)
+    return rows_by_location
+
+
+# `CHROM_POS_REF/ALT...`, the name VEP gives an ID-less record; the chromosome may carry
+# underscores, the position is the first `_digits_` group after it.
+_GENERATED_NAME_RE = re.compile(r"^.+?_\d+_(.+)$")
+
+
+def gvcf_site_locations(path: Path, canonical_contigs: frozenset[str] | None = None) -> set[str]:
+    """The Locations of the rows in vep-rs's output whose record is a gVCF variant site:
+    an ID-less record is named `CHROM_POS_REF/ALT...` from its own line, so a name whose
+    ALT list carries `<NON_REF>` beside another allele is the site (a record with an ID is
+    named by the ID and is recognised from the input VCF, `gvcf_site_locations_from_vcf`).
+    A missing file yields the empty set."""
+    sites: set[str] = set()
+    if not path.exists():
+        return sites
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            if not line or line.startswith("#"):
+                continue
+            fields = line.split("\t")
+            if len(fields) < 7:
+                continue
+            name = _GENERATED_NAME_RE.match(fields[0])
+            if name is None:
+                continue
+            if not is_gvcf_variant_site(perl_split(name.group(1), "/")[1:]):
+                continue
+            location = canonical_location(fields[1].strip())
+            if canonical_contigs is not None and location.split(":", 1)[0] not in canonical_contigs:
+                continue
+            sites.add(location)
+    return sites
+
+
+_NON_REF_BLOCK = "<NON_REF>"
+
+
+def _is_non_ref_block(alt: str) -> bool:
+    return alt.upper() == _NON_REF_BLOCK
+
+
+def _names_an_allele(alt: str) -> bool:
+    """Whether an ALT names a variant: not the `<NON_REF>` block, `*` or `.`."""
+    return not _is_non_ref_block(alt) and alt not in ("*", ".")
+
+
+def perl_true(value: str | None) -> bool:
+    """Whether Perl reads an INFO value as true: defined, not empty and not `0`."""
+    return value not in (None, "", "0")
+
+
+def perl_fields(fields: Sequence[str]) -> list[str]:
+    """The fields Perl's list-context `split` keeps: the trailing empty fields dropped and the
+    middle ones kept, so `G,,T,,` is `G`, the empty field, `T`."""
+    kept = list(fields)
+    while kept and kept[-1] == "":
+        kept.pop()
+    return kept
+
+
+def perl_split(text: str, sep: str) -> list[str]:
+    """Perl's list-context `split` of ``text`` on the separator ``sep``, as the reference
+    splits the ALT column (BaseVCF4.pm:489): `<DEL>,` is the one field `<DEL>` and the empty
+    string has no field."""
+    return perl_fields(text.split(sep))
+
+
+def _info_written(info: str, key: str) -> str | None:
+    """The value of `key=value` in an INFO column, Perl's `defined $info->{key}`: `None` for
+    an absent key or a bare flag, the last occurrence winning as in the hash Ensembl VEP's
+    parser builds (BaseVCF4.pm:581-583), whose two-element list assignment
+    `my ($key,$value) = split('=',$info)` keeps the text up to a second `=`
+    (`END2=30425700=5` is `30425700`, `SVTYPE==DEL` the empty value)."""
+    value = None
+    for item in info.split(";"):
+        name, sep, text = item.partition("=")
+        if name == key:
+            value = text.partition("=")[0] if sep else None
+    return value
+
+
+# Parser/VCF.pm:241, the ALT forms that route a line to the structural path.
+_STRUCTURAL_ALT_LIST = re.compile(r"[<\[\]][^*]+[>\]\[]|^\.\w+|\w+\.$")
+
+
+def is_gvcf_variant_site(alts: Sequence[str], svtype: str | None = None) -> bool:
+    """Whether a record is a gVCF variant site vep-rs reads on its sequence path: `<NON_REF>`
+    beside alleles that name a variant, no true INFO/SVTYPE, and no remaining allele written
+    in a structural form (Parser/VCF.pm:237-245: without a true SVTYPE the remaining ALTs
+    alone decide the path, since a structural form is never a run of `ACGT`). A list of
+    `<NON_REF>` alone is a reference block; `*` or `.` beside the block names no allele; a
+    block beside a symbolic allele (`<DEL>,<NON_REF>`) is an unsupported structural list,
+    the skipped-record class; under a true SVTYPE every ALT, the block included, is an
+    allele of a structural record in both engines. A trailing empty field of the ALT list is
+    no field (`perl_fields`)."""
+    alts = perl_fields(alts)
+    real = [alt for alt in alts if _names_an_allele(alt)]
+    if not real or not any(map(_is_non_ref_block, alts)) or perl_true(svtype):
+        return False
+    return _STRUCTURAL_ALT_LIST.search(",".join(real)) is None
+
+
+def _minimised(ref: str, alt: str) -> tuple[str, str, int]:
+    """A bi-allelic indel minimised as vep-rs minimises it (`trim_alleles`): the shared
+    prefix is trimmed while both alleles have bases, then the shared suffix, and an emptied
+    allele reads `-`. Returns the two alleles and the bases trimmed in front, by which the
+    start moves."""
+    shared = 0
+    while shared < min(len(ref), len(alt)) and ref[shared].upper() == alt[shared].upper():
+        shared += 1
+    ref, alt = ref[shared:], alt[shared:]
+    while ref and alt and ref[-1].upper() == alt[-1].upper():
+        ref, alt = ref[:-1], alt[:-1]
+    return ref or "-", alt or "-", shared
+
+
+def gvcf_site_rows(pos: int, ref: str, alts: Sequence[str]) -> list[tuple[str, int, int]]:
+    """The (allele, start, end) vep-rs writes for each real allele of a gVCF variant site,
+    the sequence path of its parser: `<NON_REF>`, `*` and `.` name no allele; when any ALT's
+    length differs from REF's, a `*` of one base counted (Parser/VCF.pm:296-298), the first
+    base REF shares with every ALT is trimmed and the start moves one base, an emptied allele
+    reading `-`, an ALT carrying a `*` (`<*>`) kept whole and, beside other ALTs, left out of
+    the comparison (:306-316 with several ALTs, :328 with one; a `.` counts and never shares
+    the base); a single remaining allele whose length still differs from REF's is minimised,
+    its shared prefix then its shared suffix trimmed and the start moved by the prefix; an
+    insertion's end is its start minus one; the allele is written in upper case (`a g,<non_ref>`
+    is `G`, as Parser.pm:554 writes it). The minimisation needs the one ALT beside the block to
+    name the allele: a `*` or `.` beside the indel keeps the anchor-trimmed alleles, as Ensembl
+    VEP's `minimise_alleles` leaves a string of three parts as it is (Parser.pm:978-984). A
+    trailing empty field of the ALT list is no field (`perl_fields`)."""
+    named = [alt for alt in perl_fields(alts) if not _is_non_ref_block(alt)]
+    real = [alt for alt in named if _names_an_allele(alt)]
+    if not real:
+        return []
+    is_indel = any(len(alt) != len(ref) for alt in named)
+    # With one ALT its own first base decides (:328): a lone `<*>` filtered out would leave
+    # nothing to compare, and `all` of nothing anchors. With several, the alleles carrying a
+    # `*` are left out of the comparison (:306).
+    if len(named) == 1:
+        compared = named
+    else:
+        compared = [alt for alt in named if "*" not in alt]
+    anchored = bool(ref) and all(alt[:1].upper() == ref[:1].upper() for alt in compared)
+    prefix = 1 if is_indel and anchored else 0
+    trimmed_ref = ref[prefix:] or "-"
+    rows: list[tuple[str, int, int]] = []
+    for alt in real:
+        # An allele carrying a `*` (`<*>`) is kept as written (:315).
+        allele = alt if "*" in alt else (alt[prefix:] or "-")
+        start = pos + prefix
+        ref_part = trimmed_ref
+        if len(named) == 1 and "-" not in (ref_part, allele) and len(ref_part) != len(allele):
+            ref_part, allele, shared = _minimised(ref_part, allele)
+            start += shared
+        end = start - 1 if ref_part == "-" else start + len(ref_part) - 1
+        rows.append((allele.upper(), start, end))
+    return rows
+
+
+def sequence_location(chrom: str, start: int, end: int) -> str:
+    """The Location both engines print for a span: `chrom:start`, or `chrom:lo-hi` with an
+    insertion's `end = start - 1` written first (`21:30425650-30425651`)."""
+    lo, hi = min(start, end), max(start, end)
+    return f"{chrom}:{lo}" if lo == hi else f"{chrom}:{lo}-{hi}"
+
+
+def gvcf_site_locations_from_vcf(
+    path: Path, canonical_contigs: frozenset[str] | None = None
+) -> set[str]:
+    """The Locations vep-rs writes for every gVCF variant site of an input VCF (plain or
+    gzipped), recognised by the record's shape (`is_gvcf_variant_site`) whatever its ID, at the
+    POS as vep-rs reads it (`vep_rs_pos`); a record whose POS vep-rs refuses has no rows."""
+    sites: set[str] = set()
+    opener = gzip.open if path.suffix in (".gz", ".bgz") else open
+    with opener(path, "rt", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            if line.startswith("#"):
+                continue
+            fields = line.rstrip("\n").split("\t")
+            if len(fields) < 5:
+                continue
+            chrom, ref, alt = fields[0], fields[3], fields[4]
+            pos = vep_rs_pos(fields[1])
+            alts = perl_split(alt, ",")
+            svtype = _info_written(fields[7], "SVTYPE") if len(fields) > 7 else None
+            if pos is None or not is_gvcf_variant_site(alts, svtype):
+                continue
+            if canonical_contigs is not None and chrom not in canonical_contigs:
+                continue
+            for _allele, start, end in gvcf_site_rows(pos, ref, alts):
+                sites.add(canonical_location(sequence_location(chrom, start, end)))
+    return sites
+
+
+def input_vcf_for(output: Path, input_dir: Path | None, input_vcf: Path | None) -> Path | None:
+    """The input VCF behind an output file: `--input-vcf` when given, else the file in
+    `--input-dir` with the output's stem and a `.vcf`, `.vcf.gz` or `.vcf.bgz` suffix."""
+    if input_vcf is not None:
+        return input_vcf
+    if input_dir is None:
+        return None
+    for suffix in (".vcf", ".vcf.gz", ".vcf.bgz"):
+        candidate = input_dir / f"{output.stem}{suffix}"
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def no_input_vcf_warning(stem: str, input_dir: Path) -> str:
+    """The warning written to stderr for an output whose stem `--input-dir` holds no input VCF
+    for: the comparison goes on, recognising a gVCF variant site from an ID-less record's
+    generated name alone (`gvcf_site_locations`)."""
+    return (
+        f"WARNING: [compare_vep_outputs] no input VCF for {stem} under {input_dir}; "
+        "gVCF variant sites are recognised from an ID-less record's generated name only"
+    )
+
+
+def _non_integer_end(location: str) -> bool:
+    """Whether a coordinate of the Location is not an integer (`21:30425651-30425949.5`,
+    `21:30425651-NaN`, `21:30425949.0`); a coordinate the reference numified below zero
+    (`21:-4-295`) is an integer."""
+    _chrom, sep, coords = location.partition(":")
+    return bool(sep) and re.fullmatch(r"-?\d+(?:--?\d+)?", coords, re.ASCII) is None
+
+
 def apply_116_2_one_sided_rules(
     rows: list[dict[str, str]],
     masked_rows: set[int],
@@ -892,24 +1448,83 @@ def apply_116_2_one_sided_rules(
 ) -> dict[str, dict[str, int]]:
     """The 116.2 one-sided pass over the rows no pair rule removed.
 
-    Marks the rows of `REFERENCE_SKIPPED_RECORD_BUCKET`, the one 116.2 class that
-    excludes and whose rows are all vep-rs's, in ``masked_rows``; counts the three
-    breakend shapes without masking them. Returns the per-bucket statistics: ``count``
-    rows recognised, ``excluded`` rows set aside, ``records`` distinct (file, Location)
-    pairs the bucket reached.
+    Marks the set-aside rows in ``masked_rows``: vep-rs's rows of
+    `REFERENCE_SKIPPED_RECORD_BUCKET` and `GVCF_VARIANT_SITE_DROPPED_BUCKET`, the
+    reference's rows of `NON_INTEGER_END_BUCKET` and of `NON_NUMERIC_POS_NUMIFIED_BUCKET` (a
+    negative first coordinate at a Location vep-rs wrote nothing for, the one spelling of a
+    numified POS no written POS reaches without the input; a POS numified to 0 prints the
+    start 1, as POS 0 does in both engines, and
+    `30_425_949` prints 31, so those are the structural-variant comparator's), and both
+    rows of a `DOT_BREAKEND_PAIR_BUCKET` pair; counts, without masking them, the two
+    lost-row breakend shapes, the FASTA-named slice shape and the reference's rows at a
+    record whose coordinate overflows the buffer (`BND_MATE_32_BIT_BUFFER_BUCKET`).
+    `STAR_ALONE_SVTYPE_ANNOTATED_BUCKET` and `CNV_TR_RN_ZERO_ALLELE_DROPPED_BUCKET` need
+    the input record and count nothing here.
+    Each bucket's ``perl`` and ``rust`` say how many of its excluded rows are the
+    reference's and vep-rs's. The reference-allele rows of a bare breakpoint
+    (`BND_BARE_REFERENCE_ALLELE_ROW_BUCKET`) never reach ``rows``, the unique-tuple key
+    stream having dropped them as duplicates, so the class reports the rows the scope
+    counted on the reference's raw output, all of them excluded, and nothing is masked
+    for it. Returns the per-bucket statistics: ``count`` rows recognised, ``excluded``
+    rows set aside, ``records`` distinct (file, Location) pairs the bucket reached.
     """
     stats = {
-        rule.bucket: {"count": 0, "excluded": 0, "records": 0}
+        rule.bucket: {"count": 0, "excluded": 0, "records": 0, "perl": 0, "rust": 0}
         for rule in REFERENCE_116_2_ONE_SIDED_RULES
     }
     records: dict[str, set[tuple[str, str]]] = defaultdict(set)
+    # The bare-breakpoint rows are outside the tuple sets, so they count under neither
+    # side's subtraction.
+    bare_rows = sum(scope.bare_reference_rows.values())
+    stats[BND_BARE_REFERENCE_ALLELE_ROW_BUCKET].update({"count": bare_rows, "excluded": bare_rows})
+    records[BND_BARE_REFERENCE_ALLELE_ROW_BUCKET].update(scope.bare_reference_rows)
 
     def hit(bucket: str, idx: int, row: dict[str, str], exclude: bool) -> None:
         stats[bucket]["count"] += 1
         records[bucket].add((row["file_name"], row["location"]))
         if exclude:
             stats[bucket]["excluded"] += 1
+            stats[bucket]["perl" if row["source"] == "missing_in_rust" else "rust"] += 1
             masked_rows.add(idx)
+
+    # The dot-breakend pair: the reference's span row beside vep-rs's point at the span's start
+    # or the base after it (`dot_breakend_points`) under one breakend allele
+    # (`chromosome_breakpoint` for a bare `N.`, the `N.` and bracket strings of one whose INFO
+    # names a mate) on the same feature; the reference's rows whose Location carries a
+    # coordinate that is not an integer; and its rows at a Location vep-rs wrote nothing for
+    # whose start the reference numified below zero.
+    point_rows: dict[tuple[str, str, str, str], list[int]] = defaultdict(list)
+    for idx, row in enumerate(rows):
+        if idx in masked_rows or row["source"] != "extra_in_rust" or not is_breakend_allele(row["allele"]):
+            continue
+        span = _location_span(row["location"])
+        if span is not None and span[1] == span[2]:
+            point_rows[(row["file_name"], row["location"], row["allele"], row["feature"])].append(idx)
+    for idx, row in enumerate(rows):
+        if idx in masked_rows or row["source"] != "missing_in_rust":
+            continue
+        if _non_integer_end(row["location"]):
+            hit(NON_INTEGER_END_BUCKET, idx, row, exclude=True)
+            continue
+        span = _location_span(row["location"])
+        if (
+            span is not None
+            and (row["file_name"], row["location"]) in scope.reference_only
+            and span[1] < 0
+        ):
+            hit(NON_NUMERIC_POS_NUMIFIED_BUCKET, idx, row, exclude=True)
+            continue
+        if not is_breakend_allele(row["allele"]):
+            continue
+        if span is None or span[1] >= span[2]:
+            continue
+        for point in dot_breakend_points(span):
+            partners = point_rows.pop((row["file_name"], point, row["allele"], row["feature"]), ())
+            if partners:
+                hit(DOT_BREAKEND_PAIR_BUCKET, idx, row, exclude=True)
+                for rust_idx in partners:
+                    hit(DOT_BREAKEND_PAIR_BUCKET, rust_idx, rows[rust_idx], exclude=True)
+                break
 
     # The one-sided rows of each side per (file, Location, allele), for the FASTA shape,
     # which reads what the other side wrote under the same allele.
@@ -938,10 +1553,19 @@ def apply_116_2_one_sided_rules(
             own_rows_lost.add((file_name, loc))
 
     for idx, row in enumerate(rows):
-        if idx in masked_rows or row["source"] != "extra_in_rust":
+        if idx in masked_rows:
             continue
         group = (row["file_name"], row["location"])
+        if row["source"] == "missing_in_rust":
+            if group in scope.mate_overflow:
+                hit(BND_MATE_32_BIT_BUFFER_BUCKET, idx, row, exclude=False)
+            continue
+        if row["source"] != "extra_in_rust":
+            continue
         allele = row["allele"]
+        if group in scope.gvcf_absent:
+            hit(GVCF_VARIANT_SITE_DROPPED_BUCKET, idx, row, exclude=True)
+            continue
         if group in scope.absent:
             # The reference wrote nothing at the Location; the merge admitted the group
             # only on a structural vep-rs row, and every row of the record goes with it.
@@ -955,14 +1579,15 @@ def apply_116_2_one_sided_rules(
                 hit(BND_OWN_ROWS_LOST_BUCKET, idx, row, exclude=False)
             continue
         perl_alleles, _rust_alleles, _mates = breakend
-        mate = bracket_mate(allele)
-        # A synonym is any mate name that is not a name the cache files a chromosome under:
-        # the reference resolved it for the overlap and refused it at the slice test.
+        mate = reference_mate_chromosome(allele)
+        # A synonym is any mate name, read as the reference reads it, that is not a name the
+        # cache files a chromosome under: the reference resolved it for the overlap and
+        # refused it at the slice test.
         if (
             mate is not None
             and perl_alleles
             and allele not in perl_alleles
-            and mate[0] not in CACHE_CONTIG_NAMES
+            and mate not in CACHE_CONTIG_NAMES
         ):
             hit(BND_SYNONYM_MATE_ROWS_LOST_BUCKET, idx, row, exclude=False)
 
@@ -1208,7 +1833,8 @@ def filter_snp_indel_intended_divergences(
 
     if record_scope is not None:
         one_sided_stats = apply_116_2_one_sided_rules(rows, masked_rows, record_scope)
-        excluded_rust += one_sided_stats[REFERENCE_SKIPPED_RECORD_BUCKET]["excluded"]
+        excluded_perl += sum(s["perl"] for s in one_sided_stats.values())
+        excluded_rust += sum(s["rust"] for s in one_sided_stats.values())
         bucket_stats.update(one_sided_stats)
 
     if open_out is not None:
@@ -1359,6 +1985,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Filename glob for output pairing (default: *.txt)",
     )
     parser.add_argument(
+        "--input-dir",
+        help="Directory of the input VCFs (.vcf, .vcf.gz) the outputs were produced from, "
+        "paired with each output by stem. A gVCF variant site is then recognised by its "
+        "shape (<NON_REF> beside a real allele) whatever its ID; without an input only an "
+        "ID-less record's generated name reveals the site.",
+    )
+    parser.add_argument(
+        "--input-vcf",
+        help="The one input VCF every output pair was produced from (a single-input run); "
+        "takes precedence over --input-dir.",
+    )
+    parser.add_argument(
         "--summary-json",
         default="summary.json",
         help="Summary JSON filename (inside --report-dir)",
@@ -1411,11 +2049,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "one-sided divergence classes of the adjusted F1 (REFERENCE_REGISTRIES). Under "
         "115.2 the classes are the published ones; under 116.2 (default) a record the "
         "reference dropped as vep_skip is set aside whole and the three breakend shapes "
-        "of 116.1's chromosome-aware overlap are counted. The pair rules are the same "
+        "of 116.1's chromosome-aware overlap are counted, as is the reference-allele row "
+        "of a bare breakpoint. The pair rules are the same "
         "under both. run_concordance.sh and run_clone_measurement.sh derive the value "
         "from the reference set's provenance.",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.input_vcf is not None and not Path(args.input_vcf).is_file():
+        parser.error(f"--input-vcf {args.input_vcf} is not a file")
+    if args.input_dir is not None and not Path(args.input_dir).is_dir():
+        parser.error(f"--input-dir {args.input_dir} is not a directory")
+    return args
 
 
 def require_mode_args(args: argparse.Namespace) -> None:
@@ -1476,6 +2120,22 @@ def collapse_transcript_context_terms(raw: str) -> str:
     return "__context_only__"
 
 
+def canonical_location(location: str) -> str:
+    """The Location with each coordinate written as its number: Ensembl VEP prints an
+    INFO/END as given, so `21:30425651-030425949` and `21:30425651-+30425949` name the
+    same span as `21:30425651-30425949`. A coordinate that is not an integer (`30425949.5`)
+    stays as written."""
+    chrom, sep, coords = location.partition(":")
+    if not sep:
+        return location
+    return chrom + ":" + "-".join(_canonical_coordinate(c) for c in coords.split("-"))
+
+
+def _canonical_coordinate(text: str) -> str:
+    digits = text.removeprefix("+")
+    return str(int(digits)) if digits.isdigit() else text
+
+
 def iter_vep_key_lines(
     path: Path,
     consequence_transform: Callable[[str], str] | None = None,
@@ -1485,6 +2145,7 @@ def iter_vep_key_lines(
 
     Key format (5 columns):
       location, allele, feature, feature_type, consequence_set
+    The Location carries each coordinate as its number (`canonical_location`).
 
     Streaming, one row at a time, so a multi-million-row output never has to
     fit in memory.
@@ -1501,7 +2162,7 @@ def iter_vep_key_lines(
             if len(fields) < 7:
                 continue
 
-            location = fields[1].strip()
+            location = canonical_location(fields[1].strip())
             allele = fields[2].strip()
             feature = fields[4].strip()
             feature_type = fields[5].strip()
@@ -2483,6 +3144,8 @@ def main() -> int:
     report_dir.mkdir(parents=True, exist_ok=True)
 
     canonical_contigs = resolve_canonical_contigs(args)
+    input_dir = Path(args.input_dir).resolve() if args.input_dir else None
+    input_vcf_path = Path(args.input_vcf).resolve() if args.input_vcf else None
 
     perl_files = sorted(perl_dir.glob(args.glob))
     if not perl_files:
@@ -2547,6 +3210,18 @@ def main() -> int:
                 iter_vep_key_lines(rust_file, canonical_contigs=canonical_contigs),
                 rust_sorted,
             )
+            if record_scope is not None:
+                record_scope.record_bare_reference_rows(
+                    perl_file.name,
+                    count_bare_breakpoint_reference_rows(perl_file, canonical_contigs),
+                )
+                gvcf_sites = gvcf_site_locations(rust_file, canonical_contigs)
+                input_vcf = input_vcf_for(perl_file, input_dir, input_vcf_path)
+                if input_vcf is not None:
+                    gvcf_sites |= gvcf_site_locations_from_vcf(input_vcf, canonical_contigs)
+                elif input_dir is not None:
+                    print(no_input_vcf_warning(perl_file.stem, input_dir), file=sys.stderr)
+                record_scope.record_gvcf_sites(perl_file.name, gvcf_sites)
 
             (
                 perl_count,

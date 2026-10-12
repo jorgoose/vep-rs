@@ -31,16 +31,16 @@ use noodles::csi::binning_index::BinningIndex;
 use rayon::prelude::*;
 use rayon::ThreadPool;
 use smallvec::SmallVec;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::pick::{self, FilterConfig};
 use crate::runner::{
-    annotate_batch, annotate_one, mark_oversize_sv, prewarm_batch, AnnotationResources,
-    PipelineStats,
+    annotate_batch, annotate_one, apply_record_rules, mark_oversize_sv, prewarm_batch,
+    AnnotationResources, PipelineStats,
 };
 use crate::transcript_index::LazyTranscriptIndexes;
 use crate::variation_matcher;
-use crate::vcf_parser::{parse_vcf_line, vcf_line_is_non_variant};
+use crate::vcf_parser::{parse_vcf_line_with_max_sv_size, vcf_line_is_non_variant};
 use vep_core::consequence::Consequence;
 use vep_core::coordinate::normalize_chromosome;
 use vep_core::variant::InputVariant;
@@ -192,7 +192,7 @@ pub(crate) struct ReaderConfig<'a> {
     pub capture_raw_input: bool,
     pub allow_non_variant: bool,
     pub dont_skip: bool,
-    pub max_sv_size: u64,
+    pub max_sv_size: Option<u64>,
     pub output_format: &'a str,
     pub no_headers: bool,
     /// The VCF writer, for the header block a VCF input's own header lines feed.
@@ -310,7 +310,7 @@ pub(crate) struct Coordinator<'a> {
     pub write_ctx: &'a WriteContext<'a>,
     pub capture_raw_input: bool,
     pub dont_skip: bool,
-    pub max_sv_size: u64,
+    pub max_sv_size: Option<u64>,
     pub batch_size: usize,
     /// `--quiet` off: progress goes to stderr every 10,000 variants.
     pub progress: bool,
@@ -467,23 +467,21 @@ fn is_ascii_space(b: u8) -> bool {
     matches!(b, b'\t' | b'\n' | 0x0B | 0x0C | b'\r' | b' ')
 }
 
-/// `str::trim` of a line. A line whose outermost non-blank bytes are ASCII is
-/// trimmed as bytes; one with a non-ASCII byte at either end is validated and
-/// trimmed as a `str`, so Unicode blanks are handled as `str::trim` handles
-/// them.
+/// `str::trim_start` of a line. A line whose first non-blank byte is ASCII is
+/// trimmed as bytes; one opening with a non-ASCII byte is validated and trimmed as
+/// a `str`, so Unicode blanks are handled as `str::trim_start` handles them. The
+/// end of the line is kept as read, since Ensembl VEP's `chomp` removes the newline
+/// alone (ensembl-io ColumnBasedParser.pm:249): a blank after the last INFO value
+/// is part of that value, so `END2=30425949 ` names the mate `N[21:30425949 [`.
 fn trim_line(line: &[u8]) -> anyhow::Result<&[u8]> {
     let Some(start) = line.iter().position(|&b| !is_ascii_space(b)) else {
         return Ok(&line[..0]);
     };
-    let end = line
-        .iter()
-        .rposition(|&b| !is_ascii_space(b))
-        .expect("a non-blank byte exists");
-    if line[start].is_ascii() && line[end].is_ascii() {
-        return Ok(&line[start..=end]);
+    if line[start].is_ascii() {
+        return Ok(&line[start..]);
     }
     let text = std::str::from_utf8(line).context("Failed to read input line")?;
-    Ok(text.trim().as_bytes())
+    Ok(text.trim_start().as_bytes())
 }
 
 fn as_str(bytes: &[u8]) -> anyhow::Result<&str> {
@@ -492,7 +490,7 @@ fn as_str(bytes: &[u8]) -> anyhow::Result<&str> {
 
 /// The part of a data line the parser reads when no output format re-emits
 /// the line: the eight fixed columns, with INFO replaced by `.` for a record
-/// whose ALT holds no symbolic or breakend allele, since only the symbolic
+/// whose REF and ALTs are a run of `ACGT` together, since only the structural
 /// path reads INFO. Returned as `(head, tail)`, where `tail` is `\t.` for the
 /// placeholder and empty otherwise. A line with fewer than eight columns is
 /// returned whole, so the parser reports it as before.
@@ -512,8 +510,15 @@ fn parser_columns(line: &[u8]) -> (&[u8], &'static [u8]) {
             None => return (line, b""),
         }
     }
+    // Parser/VCF.pm:237-245 routes a record to the structural path only when REF and
+    // the ALTs together are not a run of `ACGT`, so a symbolic or breakend ALT keeps
+    // the column as an `N` reference base does.
+    let reference = &line[tabs[2] + 1..tabs[3]];
     let alt = &line[tabs[3] + 1..tabs[4]];
-    let info_needed = alt.iter().any(|&b| matches!(b, b'<' | b'[' | b']' | b'.'));
+    let info_needed = !reference
+        .iter()
+        .chain(alt.iter())
+        .all(|&b| matches!(b, b'A' | b'C' | b'G' | b'T' | b','));
     if info_needed {
         let info_start = tabs[6] + 1;
         let info_end = line[info_start..]
@@ -665,7 +670,9 @@ fn read_parsed(
                 if cfg.dont_skip {
                     bail!("parse error: {}", e);
                 }
-                debug!("skipping variant: {}", e);
+                // A skipped record is reported the way Ensembl VEP's parser reports
+                // one it drops (`skipped_variant_msg`), where the user sees it.
+                warn!("skipping variant: {}", e);
             }
             None => break,
         }
@@ -809,11 +816,16 @@ fn parse_lines(
         mut items,
     } = lines;
     let capture = c.capture_raw_input;
+    let max_sv_size = c.max_sv_size;
     let parsed: Vec<ParsedLine> = c.pool.install(|| {
         items
             .par_iter()
             .map(|item| match item {
-                Item::Data { span, .. } => Some(parse_vcf_line(&text[span.clone()], capture)),
+                Item::Data { span, .. } => Some(parse_vcf_line_with_max_sv_size(
+                    &text[span.clone()],
+                    capture,
+                    max_sv_size,
+                )),
                 Item::Text(_) => None,
             })
             .collect()
@@ -839,7 +851,7 @@ fn parse_lines(
                 if c.dont_skip {
                     bail!("line {}: parse error: {}", line_number, e);
                 }
-                debug!("line {}: skipping variant: {}", line_number, e);
+                warn!("line {}: skipping variant: {}", line_number, e);
             }
             (Item::Data { .. }, None) => unreachable!("every data item is parsed"),
         }
@@ -915,6 +927,8 @@ fn annotate_render_batch(
                         pick::apply_filters(variant, filter_config);
                     }
                 }
+                // A task's slice is whole records (the chunk ends at a unit end).
+                apply_record_rules(slice, resources.transcripts());
                 let mut out: Vec<u8> = Vec::with_capacity(reserve);
                 {
                     let slice: &[InputVariant] = slice;
@@ -1159,6 +1173,7 @@ fn write_stage(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vcf_parser::parse_vcf_line;
     use std::io::{BufReader, Cursor};
 
     fn scan_all(input: &[u8], fill: usize) -> Vec<Vec<u8>> {
@@ -1208,7 +1223,7 @@ mod tests {
     }
 
     #[test]
-    fn trim_line_matches_str_trim() {
+    fn trim_line_matches_str_trim_start() {
         for line in [
             "21\t100",
             "  21\t100  ",
@@ -1223,7 +1238,7 @@ mod tests {
         ] {
             assert_eq!(
                 trim_line(line.as_bytes()).unwrap(),
-                line.trim().as_bytes(),
+                line.trim_start().as_bytes(),
                 "line {line:?}"
             );
         }
@@ -1261,6 +1276,21 @@ mod tests {
         );
         let short = b"21\t100\trs1\tA\tG\t50\tPASS";
         assert_eq!(parser_columns(short), (&short[..], &b""[..]));
+        // An `N` reference base lets INFO/SVTYPE route the record to the structural
+        // path, so INFO stays; a lowercase allele is outside `ACGT` to Perl as well.
+        let ambiguous = b"21\t100\t.\tN\tG\t50\tPASS\tSVTYPE=DEL;END=400\tGT";
+        assert_eq!(
+            parser_columns(ambiguous),
+            (
+                &b"21\t100\t.\tN\tG\t50\tPASS\tSVTYPE=DEL;END=400"[..],
+                &b""[..]
+            )
+        );
+        let lowercase = b"21\t100\t.\tA\tg\t50\tPASS\tSVTYPE=DEL\tGT";
+        assert_eq!(
+            parser_columns(lowercase),
+            (&b"21\t100\t.\tA\tg\t50\tPASS\tSVTYPE=DEL"[..], &b""[..])
+        );
     }
 
     /// The elided INFO column changes nothing the parser produces for an
@@ -1405,7 +1435,7 @@ mod tests {
             capture_raw_input: false,
             allow_non_variant: false,
             dont_skip: false,
-            max_sv_size: 10_000_000,
+            max_sv_size: Some(10_000_000),
             output_format: "vep",
             no_headers: false,
             vcf_formatter: None,
@@ -1460,7 +1490,7 @@ mod tests {
             capture_raw_input: true,
             allow_non_variant: true,
             dont_skip: false,
-            max_sv_size: 10_000_000,
+            max_sv_size: Some(10_000_000),
             output_format: "vcf",
             no_headers: false,
             vcf_formatter: Some(&fmt),
@@ -1541,7 +1571,7 @@ mod tests {
             capture_raw_input: false,
             allow_non_variant: false,
             dont_skip: false,
-            max_sv_size: 10_000_000,
+            max_sv_size: Some(10_000_000),
             output_format: "vep",
             no_headers: false,
             vcf_formatter: None,
