@@ -22,7 +22,7 @@ import argparse
 import json
 import re
 import sys
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "concordance"))
@@ -53,6 +53,13 @@ SUITE_LABELS = {
     "s07": ("SV per-VCF (16 files)", "GRCh37"),
     "s08": ("SV per-VCF (16 files)", "GRCh38"),
 }
+CLINVAR = {"s01": "ClinVar GRCh37", "s02": "ClinVar GRCh38"}
+SV = {"s07": "GRCh37", "s08": "GRCh38"}
+FAMILIES = ("snv_indel", "sv")
+ARCH_LABELS = {"arm64": "ARM", "x86_64": "x86"}
+SV_SETS = (("clinvar_sv_", "ClinVar SV"), ("gnomad_sv_", "gnomAD SV"), ("1kg_sv_", "1000 Genomes SV"))
+SYNTHETIC = re.compile(r"^\d{2}_")
+SYNTHETIC_FILES = 13
 LIST_ITEM = re.compile(r"^\s*(?:[-*+]|\d+\.)\s")
 BULLET = re.compile(r"[-*] ")
 SENTENCE_END = re.compile(r"[.!?][\"'`)\]]*(?=\s|$)")
@@ -67,15 +74,29 @@ def half_up(x: float, places: int) -> str:
 
 
 def f1_9(intersection, a, b) -> str:
-    """F1 as 2I/(A+B) from the integer tuple counts at nine decimal places; an exact match reads 1.000000000.
-    Computed from the counts rather than copied from a record's rounded field, so the page never prints
-    a coarser rounding than the counts support."""
-    q = Decimal(2 * int(intersection)) / Decimal(int(a) + int(b))
+    """F1 as 2I/(A+B) from the integer tuple counts at nine decimal places; an exact match reads 1.000000000,
+    and so do two empty sides, the figure the records' own per-file `f1` carries for that case. Computed from
+    the counts rather than copied from a record's rounded field, so the page never prints a coarser rounding
+    than the counts support."""
+    denominator = int(a) + int(b)
+    if denominator == 0:
+        return "1.000000000"
+    q = Decimal(2 * int(intersection)) / Decimal(denominator)
     return str(q.quantize(Decimal("0.000000001"), rounding=ROUND_HALF_UP))
 
 
+def pooled_f1(cells: list[tuple[int, int, int]]) -> str:
+    """F1 of several cells from their summed (intersection, A, B) counts."""
+    return f1_9(*(sum(c) for c in zip(*cells)))
+
+
 def whole_seconds(x: Decimal) -> str:
-    return f"{int(x.quantize(Decimal(1), rounding=ROUND_HALF_UP)):,}"
+    """A wall time as whole seconds, rounded half up with thousands separators; one too large for the Decimal
+    context to round to a whole number is refused."""
+    try:
+        return f"{int(x.quantize(Decimal(1), rounding=ROUND_HALF_UP)):,}"
+    except InvalidOperation:
+        fail(f"a wall time of {x.normalize()} seconds is too large to round to whole seconds")
 
 
 def changelog_section(text: str, name: str) -> tuple[str, str | None]:
@@ -219,23 +240,51 @@ def latest_record(repo: Path, kind: str, version: str) -> Path:
     return records[-1]
 
 
+def six_dataset_shape(release: dict, conc: dict) -> bool:
+    """Whether a release record is of the six-dataset shape: its ClinVar GRCh37 cell carries the adjusted
+    counts, or its `perl_reference` block is keyed by suite family (`snv_indel`, `sv`). The version number
+    never decides, so a record of the earlier shape renders the earlier page whatever its version."""
+    block = release.get("perl_reference")
+    by_family = isinstance(block, dict) and any(isinstance(block.get(f), dict) for f in FAMILIES)
+    s01 = conc.get("s01")
+    return by_family or (isinstance(s01, dict) and "adj_intersection" in s01)
+
+
 def load_release_record(repo: Path, version: str) -> tuple[dict, dict, dict, str]:
-    """The release record, its per-suite concordance, its whole-genome concordance and the record directory's path."""
+    """The release record, its per-suite concordance, its whole-genome concordance and the record directory's
+    path; the record and its two blocks are refused by name when not objects, and the whole-genome block when
+    it lacks `per_dataset` or `pooled`. A record of the six-dataset shape needs the two ClinVar cells and the
+    two structural-variant cells; any other needs the eight scored suites."""
     record_path = latest_record(repo, "release", version)
     record = json.loads(record_path.read_text())
-    conc = record.get("concordance") or {}
-    missing = [s for s in SCORED if s not in conc]
+    if not isinstance(record, dict):
+        fail(f"{record_path.name} is not an object")
+    conc = record.get("concordance")
+    if not isinstance(conc, dict):
+        fail("the release record's concordance is not an object")
+    needed = (*CLINVAR, *SV) if six_dataset_shape(record, conc) else SCORED
+    missing = [s for s in needed if not isinstance(conc.get(s), dict)]
     if missing:
         fail(f"{record_path.name} lacks concordance rows for {missing}")
     pop = record.get("population_concordance")
-    if not pop:
+    if pop is None:
         fail(f"{record_path.name} lacks population_concordance")
+    if not isinstance(pop, dict):
+        fail("the release record's population_concordance is not an object")
+    per_dataset, _ = required(pop, ("per_dataset", "pooled"), "population_concordance")
+    if not isinstance(per_dataset, list):
+        fail("the release record's population_concordance.per_dataset is not a list")
     return record, conc, pop, record_path.relative_to(repo).parent.as_posix()
 
 
 def load_population_record(repo: Path, version: str) -> dict:
-    """The release's population record: the whole-genome wall time per chromosome and architecture."""
-    return json.loads(latest_record(repo, "population", version).read_text())
+    """The release's population record: the whole-genome wall time per chromosome and architecture; one that is
+    not an object is refused by name."""
+    path = latest_record(repo, "population", version)
+    population = json.loads(path.read_text())
+    if not isinstance(population, dict):
+        fail(f"{path.name} is not an object")
+    return population
 
 
 def comparator_version(population: dict, pop: dict, release: dict | None = None) -> str:
@@ -262,12 +311,48 @@ def comparator_version(population: dict, pop: dict, release: dict | None = None)
     fail("neither record names the Ensembl VEP version")
 
 
+def named_releases(where: str, block) -> dict[str, str]:
+    """The Ensembl VEP release each part of a `perl_reference` block names, keyed by its place: one part per
+    suite family when the block is keyed by family, else the block itself; an absent block names nothing."""
+    if not isinstance(block, dict):
+        return {}
+    parts = {f"{where}.{f}": block[f] for f in FAMILIES if isinstance(block.get(f), dict)} or {where: block}
+    out: dict[str, str] = {}
+    for name, part in parts.items():
+        try:
+            out[name] = release_from_provenance(part)
+        except ValueError as exc:
+            fail(f"the perl_reference block of {name} names no release: {exc}")
+    return out
+
+
+def reference_release(release: dict, pop: dict, population: dict) -> str:
+    """The one Ensembl VEP release the records' `perl_reference` blocks name: the release record's, the one
+    under its `population_concordance` and the population record's. A record without a block is refused
+    rather than read from an engine version, which a carried-forward wall-time run keeps at an earlier
+    release; blocks naming different releases are refused."""
+    named = named_releases("the release record", release.get("perl_reference"))
+    if not named:
+        fail("the release record carries no perl_reference block")
+    named.update(named_releases("population_concordance", pop.get("perl_reference")))
+    from_population = named_releases("the population record", population.get("perl_reference"))
+    if not from_population:
+        fail("the population record carries no perl_reference block")
+    named.update(from_population)
+    if len(set(named.values())) != 1:
+        fail("the records name different Ensembl VEP releases: " + ", ".join(f"{k} {v}" for k, v in named.items()))
+    return next(iter(named.values()))
+
+
 def wall_time_sums(population: dict) -> dict[tuple[str, str], Decimal]:
-    """Per (dataset, arch), the sum of the per-chromosome wall-time medians of the released binary."""
+    """Per (dataset, arch), the sum of the per-chromosome wall-time medians of the released binary; a cell's
+    dataset, arch or median is refused by name when absent, and its median when it is not a finite number."""
     sums: dict[tuple[str, str], Decimal] = {}
-    for cell in population["wall_time"]["vep_rs"]["per_cell"]:
-        key = (cell["dataset"], cell["arch"])
-        sums[key] = sums.get(key, Decimal(0)) + Decimal(str(cell["median_sec"]))
+    for index, cell in enumerate(population["wall_time"]["vep_rs"]["per_cell"]):
+        where = f"the population record's wall_time.vep_rs.per_cell[{index}]"
+        dataset, arch, median = required(cell, ("dataset", "arch", "median_sec"), where)
+        key = (dataset, arch)
+        sums[key] = sums.get(key, Decimal(0)) + median_seconds(median, where)
     return sums
 
 
@@ -283,24 +368,236 @@ def short_label(label: str) -> str:
     return label.replace(", whole genome", "")
 
 
-def whole_genome_row(label: str, entry: dict, arm: Decimal, x86: Decimal) -> str:
+def population_counts(entry, where: str) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+    """A population dataset's (intersection, Ensembl VEP tuples, vep-rs tuples), raw and then less the excluded
+    counts, each count refused by name when it is absent or not an integer."""
+    keys = ("intersection", "perl_tuples", "vep_rs_tuples", "excluded_perl", "excluded_rust")
+    values = required(entry, keys, where)
+    i, a, b, excluded_perl, excluded_rust = (integer(v, k, where) for v, k in zip(values, keys))
+    return (i, a, b), (i, a - excluded_perl, b - excluded_rust)
+
+
+def whole_genome_row(label: str, entry: dict, arm: Decimal, x86: Decimal, where: str) -> str:
     """A whole-genome row: raw F1 over every tuple and adjusted F1 over the tuples left after the excluded
     counts, both from the integer counts, then the wall time per architecture."""
-    i, a, b = int(entry["intersection"]), int(entry["perl_tuples"]), int(entry["vep_rs_tuples"])
-    adjusted = f1_9(i, a - int(entry["excluded_perl"]), b - int(entry["excluded_rust"]))
-    return f"| {label} | {f1_9(i, a, b)} | {adjusted} | {whole_seconds(arm)} | {whole_seconds(x86)} |"
+    raw, adjusted = population_counts(entry, where)
+    return f"| {label} | {f1_9(*raw)} | {f1_9(*adjusted)} | {whole_seconds(arm)} | {whole_seconds(x86)} |"
+
+
+def whole_genome_setup(population: dict) -> tuple[dict, dict[str, str], dict[tuple[str, str], Decimal], list[str]]:
+    """Where both pages' whole-genome tables start: the released binary's wall-time block, its instance type
+    per architecture, the per-(dataset, arch) sums of its per-chromosome medians and the table's header rows."""
+    vep_rs = population["wall_time"]["vep_rs"]
+    header = ["| Dataset | Raw F1 | Adjusted F1 | ARM (s) | x86 (s) |", "| --- | --- | --- | --- | --- |"]
+    return vep_rs, vep_rs["instance_types"], wall_time_sums(population), header
+
+
+def dataset_wall_time(dataset: str, sums: dict[tuple[str, str], Decimal]) -> tuple[Decimal, Decimal]:
+    """A population dataset's summed wall time on ARM, then on x86; one the population record did not time on
+    both architectures is refused."""
+    if any((dataset, arch) not in sums for arch in ARCH_LABELS):
+        fail(f"the population record has no wall time for {dataset}")
+    return sums[(dataset, "arm64")], sums[(dataset, "x86_64")]
+
+
+def required(block, keys: tuple[str, ...], where: str) -> tuple:
+    """The values under `keys` of a record block, refused by name when any is absent or the block is not an
+    object."""
+    values = block if isinstance(block, dict) else {}
+    missing = [k for k in keys if values.get(k) is None]
+    if missing:
+        fail(f"{where} carries no {', '.join(missing)}")
+    return tuple(values[k] for k in keys)
+
+
+def integer(value, key: str, where: str) -> int:
+    """A record's integer count, refused by name when it is not one: `int()` would read 19.6 as 19 and `true`
+    as 1, and `bool` is a subclass of `int`."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        fail(f"{where} carries {key} that is not an integer: {value!r}")
+    return value
+
+
+def median_seconds(value, where: str) -> Decimal:
+    """A record's `median_sec` as a Decimal, refused by name when it is not a number or not finite."""
+    try:
+        seconds = Decimal(str(value))
+    except InvalidOperation:
+        fail(f"{where} carries a median_sec that is not a number: {value!r}")
+    if not seconds.is_finite():
+        fail(f"{where} carries a median_sec that is not finite: {value!r}")
+    return seconds
+
+
+def int_triple(block, keys: tuple[str, str, str], where: str) -> tuple[int, int, int]:
+    """Three integer counts of a record block, each refused by name when absent or not an integer, so a record's
+    rounded F1 field is never printed in their place."""
+    i, a, b = required(block, keys, where)
+    return integer(i, keys[0], where), integer(a, keys[1], where), integer(b, keys[2], where)
+
+
+def whole_file_aggregate(release: dict, suite: str, arch: str) -> dict:
+    """The release record's `per_cell_aggregates` entry of one ClinVar cell and architecture, the released
+    binary's whole-file wall time; refused when absent or repeated, as is a `per_cell_aggregates` that is
+    not a list of objects."""
+    entries = release.get("per_cell_aggregates")
+    if not isinstance(entries, list) or not all(isinstance(a, dict) for a in entries):
+        fail("the release record's per_cell_aggregates is not a list of objects")
+    hits = [
+        a
+        for a in entries
+        if a.get("suite_id") == suite and a.get("arch") == arch and a.get("engine", "vep_rs") == "vep_rs"
+    ]
+    if len(hits) != 1:
+        fail(f"the release record has {len(hits)} per_cell_aggregates entries for {suite} on {arch}; one is read")
+    return hits[0]
+
+
+def whole_file_wall_time(release: dict, suite: str, arch: str) -> tuple[Decimal, str, int]:
+    """One ClinVar cell's aggregate as (median seconds, instance type, clone count), each refused by name when
+    absent, the median when it is not a finite number and the clone count when it is not an integer."""
+    where = f"the per_cell_aggregates entry for {suite} on {arch}"
+    keys = ("median_sec", "instance_type", "n_clones")
+    median, instance_type, n_clones = required(whole_file_aggregate(release, suite, arch), keys, where)
+    return median_seconds(median, where), str(instance_type), integer(n_clones, "n_clones", where)
+
+
+def one(values: set, what: str) -> str:
+    """The one value the ClinVar cells agree on, refused when they name several."""
+    if len(values) != 1:
+        fail(f"the ClinVar cells name {len(values)} {what}: {sorted(values)}")
+    return str(next(iter(values)))
+
+
+def clone_count_clause(clones: dict[tuple[str, str], int]) -> str:
+    """The clone count the ClinVar cells agree on, else each cell's own in the table's order, ClinVar GRCh37 then
+    GRCh38 and ARM before x86 within each, whatever the record's order:
+    `19 (ClinVar GRCh37, ARM), 20 (ClinVar GRCh37, x86), ... and 20 (ClinVar GRCh38, x86)`."""
+    if len(set(clones.values())) == 1:
+        return str(next(iter(clones.values())))
+    parts = [f"{n} ({CLINVAR[suite]}, {ARCH_LABELS[arch]})" for (suite, arch), n in clones.items()]
+    return f"{', '.join(parts[:-1])} and {parts[-1]}"
+
+
+def file_counts(block, where: str) -> dict[str, tuple[int, int, int]]:
+    """A `per_file` or `per_file_adjusted` block as {file: (intersection, Ensembl VEP tuples, vep-rs tuples)}."""
+    if not isinstance(block, dict) or not block:
+        fail(f"{where} is absent or empty")
+    keys = ("intersection", "perl_tuples", "engine_tuples")
+    return {name: int_triple(entry, keys, f"{where} {name}") for name, entry in block.items()}
+
+
+def sv_sets(cell: dict, where: str) -> list[tuple[str, list, list]]:
+    """A structural-variant cell's file sets as (label, raw cells, adjusted cells): the ClinVar, gnomAD and
+    1000 Genomes sets, each one file found by the prefix of its name, then the synthetic feature files,
+    named by a two-digit index, pooled. The two per-file blocks must list the same files, each real set
+    one file and the synthetic set SYNTHETIC_FILES; any other file is refused."""
+    listing = f"{where}.per_file"
+    raw = file_counts(cell.get("per_file"), listing)
+    adjusted = file_counts(cell.get("per_file_adjusted"), f"{where}.per_file_adjusted")
+    if raw.keys() != adjusted.keys():
+        fail(f"{where} per_file and per_file_adjusted list different files")
+    real: dict[str, list[str]] = {}
+    synthetic: list[str] = []
+    for name in raw:
+        label = next((label for prefix, label in SV_SETS if name.startswith(prefix)), None)
+        if label is not None:
+            real.setdefault(label, []).append(name)
+        elif SYNTHETIC.match(name):
+            synthetic.append(name)
+        else:
+            fail(f"{listing} lists {name}, a file of no known set")
+    sets: list[tuple[str, list, list]] = []
+    for _, label in SV_SETS:
+        files = real.get(label, [])
+        if len(files) != 1:
+            fail(f"{listing} lists {len(files)} files of the {label} set; one is read")
+        sets.append((label, [raw[files[0]]], [adjusted[files[0]]]))
+    if len(synthetic) != SYNTHETIC_FILES:
+        fail(f"{listing} lists {len(synthetic)} synthetic files; the set has {SYNTHETIC_FILES}")
+    sets.append((f"Synthetic ({SYNTHETIC_FILES} files)", [raw[n] for n in synthetic], [adjusted[n] for n in synthetic]))
+    return sets
+
+
+def six_dataset_blocks(
+    release: dict, conc: dict, pop: dict, population: dict, record_dir: str, version: str
+) -> list[str]:
+    """The page of the six-dataset shape: the whole-genome table (the four population datasets in the
+    record's order, the two genome-wide ClinVar files, then `All six` pooled from the summed integer counts
+    of all six) under a caption naming the reference release, both protocols, the instance types and the
+    peak memory, then the structural-variant F1 table (per assembly the ClinVar, gnomAD and 1000 Genomes
+    sets and the synthetic files pooled) under the caption that the paper's figures stay as published.
+    `All six` carries no wall time: the ClinVar whole-file medians were measured on another instance class
+    and protocol than the per-chromosome sums, so their sum is not a figure. A record's chromosome 21 cells
+    render no row."""
+    vep_rs, types, sums, rows = whole_genome_setup(population)
+    raw: list[tuple[int, int, int]] = []
+    adjusted: list[tuple[int, int, int]] = []
+    datasets = pop["per_dataset"]
+    if len(datasets) != 4:
+        fail(
+            f"the population concordance has {len(datasets)} datasets; "
+            "the six-dataset table pools four with the two ClinVar files"
+        )
+    for index, r in enumerate(datasets):
+        dataset, label = required(r, ("dataset", "label"), f"population_concordance.per_dataset[{index}]")
+        where = f"population_concordance.per_dataset {dataset}"
+        arm, x86 = dataset_wall_time(dataset, sums)
+        raw_counts, adjusted_counts = population_counts(r, where)
+        raw.append(raw_counts)
+        adjusted.append(adjusted_counts)
+        rows.append(whole_genome_row(short_label(str(label)), r, arm, x86, where))
+    clinvar_types: dict[str, set[str]] = {"arm64": set(), "x86_64": set()}
+    clones: dict[tuple[str, str], int] = {}
+    for suite, label in CLINVAR.items():
+        cell, where = conc[suite], f"concordance.{suite}"
+        i, a, b = int_triple(cell, ("intersection", "perl", "rust"), where)
+        adj = int_triple(cell, ("adj_intersection", "adj_perl", "adj_rust"), where)
+        raw.append((i, a, b))
+        adjusted.append(adj)
+        medians: dict[str, str] = {}
+        for arch, instance_types in clinvar_types.items():
+            seconds, instance_type, n_clones = whole_file_wall_time(release, suite, arch)
+            medians[arch] = whole_seconds(seconds)
+            instance_types.add(instance_type)
+            clones[(suite, arch)] = n_clones
+        rows.append(f"| {label} | {f1_9(i, a, b)} | {f1_9(*adj)} | {medians['arm64']} | {medians['x86_64']} |")
+    rows.append(f"| All six | {pooled_f1(raw)} | {pooled_f1(adjusted)} | | |")
+    caption = (
+        f"Whole genome against Ensembl VEP {reference_release(release, pop, population)}: the population datasets "
+        "one run per chromosome, each ClinVar release one genome-wide file; wall time is the sum of the "
+        f"per-chromosome medians of {int(vep_rs['n_clones_per_cell'])} machines at {int(population['fork'])} threads on "
+        f"`{types['arm64']}` (ARM) and `{types['x86_64']}` (x86) for the population datasets, and the whole-file "
+        f"median of {clone_count_clause(clones)} machines on `{one(clinvar_types['arm64'], 'ARM instance types')}` (ARM) "
+        f"and `{one(clinvar_types['x86_64'], 'x86 instance types')}` (x86) for the ClinVar files, another instance class "
+        "and protocol, so the `All six` row carries no wall time; peak memory at most "
+        f"{peak_rss_gb(population)} GB on any chromosome; tuple counts, per-chromosome rows and per-file counts are in "
+        f"the [provenance records]({REPO_URL}/tree/v{version}/{record_dir})."
+    )
+    sv_caption = (
+        "Structural-variant file sets measured on the released binary against the same reference, each set's files "
+        "pooled by summed counts; the paper's own figures stay as published in "
+        f"[docs/published-figures.md]({REPO_URL}/blob/v{version}/docs/published-figures.md)."
+    )
+    sv = ["| File set | Assembly | Raw F1 | Adjusted F1 |", "| --- | --- | --- | --- |"]
+    for suite, assembly in SV.items():
+        for label, raw_files, adjusted_files in sv_sets(conc[suite], f"concordance.{suite}"):
+            sv.append(f"| {label} | {assembly} | {pooled_f1(raw_files)} | {pooled_f1(adjusted_files)} |")
+    return ["## Concordance and wall time", caption, "\n".join(rows), sv_caption, "\n".join(sv)]
 
 
 def measurements_blocks(repo: Path, version: str) -> list[str]:
-    """The whole-genome table (one row per population dataset and the pooled row: raw and adjusted F1
-    from the release record's counts, wall time per architecture from the population record) under its
-    caption, then the chromosome 21 table over the eight scored suites under its caption. A suite row's
-    adjusted F1 is the record's `adj_f1`: the suite rows carry no excluded counts to derive it from."""
+    """The `## Concordance and wall time` blocks for the record's shape: six_dataset_blocks for a record of
+    the six-dataset shape, else the earlier page: the whole-genome table (one row per population dataset
+    and the pooled row: raw and adjusted F1 from the release record's counts, wall time per architecture
+    from the population record) under its caption, then the chromosome 21 table over the eight scored
+    suites under its caption. A suite row's adjusted F1 is the record's `adj_f1`: the suite rows carry no
+    excluded counts to derive it from."""
     release, conc, pop, record_dir = load_release_record(repo, version)
     population = load_population_record(repo, version)
-    vep_rs = population["wall_time"]["vep_rs"]
-    types = vep_rs["instance_types"]
-    sums = wall_time_sums(population)
+    if six_dataset_shape(release, conc):
+        return six_dataset_blocks(release, conc, pop, population, record_dir, version)
+    vep_rs, types, sums, rows = whole_genome_setup(population)
     caption = (
         f"Whole genome against Ensembl VEP {comparator_version(population, pop, release)}, one run per chromosome; "
         f"wall time is the sum of the per-chromosome medians of {int(vep_rs['n_clones_per_cell'])} machines "
@@ -308,17 +605,17 @@ def measurements_blocks(repo: Path, version: str) -> list[str]:
         f"peak memory at most {peak_rss_gb(population)} GB on any chromosome; tuple counts and "
         f"per-chromosome rows are in the [provenance records]({REPO_URL}/tree/v{version}/{record_dir})."
     )
-    rows = ["| Dataset | Raw F1 | Adjusted F1 | ARM (s) | x86 (s) |", "| --- | --- | --- | --- | --- |"]
-    total = {"arm64": Decimal(0), "x86_64": Decimal(0)}
-    for r in pop["per_dataset"]:
-        dataset = r["dataset"]
-        if any((dataset, arch) not in sums for arch in total):
-            fail(f"the population record has no wall time for {dataset}")
-        for arch in total:
-            total[arch] += sums[(dataset, arch)]
-        rows.append(whole_genome_row(short_label(r["label"]), r, sums[(dataset, "arm64")], sums[(dataset, "x86_64")]))
+    total_arm = total_x86 = Decimal(0)
+    for index, r in enumerate(pop["per_dataset"]):
+        dataset, label = required(r, ("dataset", "label"), f"population_concordance.per_dataset[{index}]")
+        arm, x86 = dataset_wall_time(dataset, sums)
+        total_arm += arm
+        total_x86 += x86
+        where = f"population_concordance.per_dataset {dataset}"
+        rows.append(whole_genome_row(short_label(str(label)), r, arm, x86, where))
     p = pop["pooled"]
-    rows.append(whole_genome_row(p["label"], p, total["arm64"], total["x86_64"]))
+    (label,) = required(p, ("label",), "population_concordance.pooled")
+    rows.append(whole_genome_row(str(label), p, total_arm, total_x86, "population_concordance.pooled"))
     chr21_caption = (
         "The paper's chromosome 21 cells measured on the released binary; the paper's own figures stay as "
         f"published in [docs/published-figures.md]({REPO_URL}/blob/v{version}/docs/published-figures.md)."
