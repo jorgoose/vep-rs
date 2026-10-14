@@ -10,8 +10,8 @@ use noodles::vcf;
 
 use vep_core::coordinate::parse_pos;
 use vep_core::sv_record::{structural_variants, StructuralRecordError, DEFAULT_MAX_SV_SIZE};
-use vep_core::sv_routing::{perl_true, routes_to_structural, variant_alts, written_alts};
-use vep_core::variant::{InputVariant, VariantClass};
+use vep_core::sv_routing::{joined, perl_true, routes_to_structural, variant_alts, written_alts};
+use vep_core::variant::{first_vcf_id, id_names_record, InputVariant, VariantClass};
 use vep_core::vcf_info::info_value;
 
 use crate::error::IoError;
@@ -84,8 +84,8 @@ impl VcfParser {
 
     /// Parse a single VCF record into one or more InputVariants (one per ALT allele).
     ///
-    /// The record is read as the command-line parser reads it: POS from its own text
-    /// (`pos_text`) as `parse_pos` reads it, INFO through `vep_core::vcf_info`, the ALT
+    /// The record is read as the command-line parser reads it: POS and the ID column from
+    /// its own text (`pos_text`, `id_text`), INFO through `vep_core::vcf_info`, the ALT
     /// list as Perl's `split` returns it with a gVCF site read as its real alleles
     /// (`vep_core::sv_routing`), a record whose every ALT is `*` as the one allele-less
     /// variant Ensembl VEP carries, and a structural record's alleles, spans, breakends
@@ -98,6 +98,7 @@ impl VcfParser {
         &self,
         record: &vcf::Record,
         pos_text: &str,
+        id_text: &str,
     ) -> Result<Vec<InputVariant>, IoError> {
         let chrom = record.reference_sequence_name().to_string();
 
@@ -109,13 +110,10 @@ impl VcfParser {
 
         let vcf_ref = record.reference_bases();
 
-        let ids = record.ids();
-        let ids_str: &str = ids.as_ref();
-        let id = if ids_str.is_empty() {
-            None
-        } else {
-            Some(ids_str.to_string())
-        };
+        // The ID column from the line's own text: noodles reads the missing value `.`
+        // and an empty column alike as an empty field.
+        let id = first_vcf_id(id_text).map(str::to_string);
+        let explicit_id = id.as_deref().filter(|id| id_names_record(id));
 
         let alt_bases = record.alternate_bases();
         let alt_column: &str = alt_bases.as_ref();
@@ -148,6 +146,7 @@ impl VcfParser {
                 vcf_ref,
                 written.iter().map(|(_, alt)| *alt),
             );
+            variant.uploaded_allele_string = Some(variant.allele_string.as_str().into());
             variant.id = id;
             variant.input_line_name = Some(line_name);
             return Ok(vec![variant]);
@@ -157,18 +156,48 @@ impl VcfParser {
         let mut variants = Vec::with_capacity(valid_alts.len());
 
         if !routes_to_structural(vcf_ref, &alts, svtype) {
-            let explicit_alts: Vec<Vec<u8>> = valid_alts
+            // Every ALT but a `*` votes on the anchor chop, so a `.` beside an allele
+            // vetoes it (Parser/VCF.pm:301-322, as the command-line parser's trim reads
+            // them); `*` and `.` then name no variant of their own.
+            let voting: Vec<&str> = alts
                 .iter()
-                .map(|(_, alt)| alt.as_bytes().to_vec())
+                .map(|(_, alt)| *alt)
+                .filter(|alt| *alt != "*")
                 .collect();
+            let voting_bytes: Vec<Vec<u8>> =
+                voting.iter().map(|alt| alt.as_bytes().to_vec()).collect();
             let vcf_ref_bytes = vcf_ref.as_bytes();
-            let (mut trimmed_ref, mut trimmed_alts, prefix_trimmed) =
-                trim_multi_alleles(vcf_ref_bytes, &explicit_alts);
+            let (mut trimmed_ref, mut trimmed_voting, prefix_trimmed) =
+                trim_multi_alleles(vcf_ref_bytes, &voting_bytes);
             // `validate_vf` upper-cases the allele string (Parser.pm:554).
             trimmed_ref.make_ascii_uppercase();
-            trimmed_alts
+            trimmed_voting
                 .iter_mut()
                 .for_each(|alt| alt.make_ascii_uppercase());
+            let trimmed_alts: Vec<Vec<u8>> = voting
+                .iter()
+                .zip(trimmed_voting)
+                .filter(|(alt, _)| **alt != ".")
+                .map(|(_, trimmed)| trimmed)
+                .collect();
+
+            // The record's allele strings as the command-line parser holds them: the
+            // raw REF and every ALT, and for several ALTs the chopped alleles with a
+            // `*` or `.` kept as written (Parser/VCF.pm:301-322).
+            let uploaded_alleles: Arc<str> = format!("{vcf_ref}/{}", joined(&alts, "/")).into();
+            let chopped: Option<Arc<str>> = (alts.len() > 1).then(|| {
+                let mut trimmed = trimmed_alts.iter();
+                let mut s = String::from_utf8_lossy(&trimmed_ref).into_owned();
+                for (_, alt) in &alts {
+                    s.push('/');
+                    if *alt == "*" || *alt == "." {
+                        s.push_str(alt);
+                    } else {
+                        s.push_str(&String::from_utf8_lossy(trimmed.next().unwrap()));
+                    }
+                }
+                s.into()
+            });
 
             for (local_idx, trimmed_alt) in trimmed_alts.into_iter().enumerate() {
                 let allele_idx = valid_alts[local_idx].0;
@@ -185,6 +214,8 @@ impl VcfParser {
                 variant.id = id.clone();
                 variant.allele_index = allele_idx;
                 variant.minimised = multi;
+                variant.uploaded_allele_string = Some(uploaded_alleles.clone());
+                variant.record_allele_string_multi = chopped.clone();
                 variants.push(variant);
             }
         } else {
@@ -195,7 +226,7 @@ impl VcfParser {
                 &written,
                 info_raw,
                 self.max_sv_size,
-                id.as_deref(),
+                explicit_id,
             ) {
                 Ok(variants) => variants,
                 Err(StructuralRecordError::Span(error)) => {
@@ -334,11 +365,10 @@ impl InputParser for VcfParser {
                             ))))
                         }
                     };
-                    let pos_text = std::str::from_utf8(&line)
-                        .ok()
-                        .and_then(|text| text.split('\t').nth(1))
-                        .unwrap_or("");
-                    match self.parse_record(&record, pos_text) {
+                    let mut columns = std::str::from_utf8(&line).unwrap_or("").split('\t');
+                    let pos_text = columns.nth(1).unwrap_or("");
+                    let id_text = columns.next().unwrap_or("");
+                    match self.parse_record(&record, pos_text, id_text) {
                         Ok(variants) => {
                             if variants.is_empty() {
                                 continue;
@@ -431,7 +461,7 @@ mod tests {
         assert_eq!(variant.ref_allele, b"-");
         assert_eq!(variant.alt_allele(), b"TT");
         assert_eq!(variant.allele_string, "-/TT");
-        assert_eq!(variant.id, None);
+        assert_eq!(variant.id, Some(".".into()));
     }
 
     #[test]
@@ -493,15 +523,24 @@ mod tests {
         assert!(parser.next_variant().is_none());
     }
 
+    /// A `.` ID is stored as written and stays the JSON `id`; an empty ID column is no
+    /// name, so the JSON `id` is the generated `chr_start_alleles` (Parser.pm:462); both
+    /// records are named by their line in `Uploaded_variation`.
     #[test]
     fn test_parse_missing_id() {
-        let data = make_vcf_data("21\t300\t.\tC\tT\t.\t.\t.\n");
+        let data = make_vcf_data("21\t300\t.\tC\tT\t.\t.\t.\n21\t300\t\tC\tT\t.\t.\t.\n");
         let reader: Box<dyn BufRead + Send> = Box::new(std::io::Cursor::new(data));
         let mut parser = VcfParser::new(reader).unwrap();
 
         let variant = parser.next_variant().unwrap().unwrap();
+        assert_eq!(variant.id, Some(".".into()));
+        assert_eq!(variant.uploaded_variation(), "21_300_C/T");
+        assert_eq!(variant.variation_name(), ".");
+
+        let variant = parser.next_variant().unwrap().unwrap();
         assert_eq!(variant.id, None);
         assert_eq!(variant.uploaded_variation(), "21_300_C/T");
+        assert_eq!(variant.variation_name(), "21_300_C/T");
     }
 
     #[test]

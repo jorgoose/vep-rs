@@ -415,15 +415,15 @@ pub struct Args {
     #[arg(long)]
     pub custom: Vec<String>,
 
-    /// Refused: would keep a --custom VCF source's FILTER column out of the output unless --fields names it; custom annotation is not supported
+    /// Refused: would keep a --custom VCF source's FILTER column out of the output unless the --custom source's fields argument names it; custom annotation is not supported
     #[arg(long = "custom_suppress_filter")]
     pub custom_suppress_filter: bool,
 
-    /// Accepted for VEP compatibility; not implemented (the transcript set is the --json_cache contents)
+    /// Suffixes the species directory of the output header's cache path with _refseq when --json_cache is absent (accepted for VEP compatibility; selects no transcript set, which is the --json_cache contents)
     #[arg(long)]
     pub refseq: bool,
 
-    /// Accepted for VEP compatibility; not implemented (the transcript set is the --json_cache contents)
+    /// Suffixes the species directory of the output header's cache path with _merged, after _refseq, when --json_cache is absent (accepted for VEP compatibility; selects no transcript set, which is the --json_cache contents)
     #[arg(long)]
     pub merged: bool,
 
@@ -466,8 +466,8 @@ impl Args {
              not supported"
         } else if self.custom_suppress_filter {
             "--custom_suppress_filter is not supported: it would keep a --custom VCF \
-             source's FILTER column out of the output unless --fields names it, and custom \
-             annotation is not supported"
+             source's FILTER column out of the output unless the --custom source's fields \
+             argument names it, and custom annotation is not supported"
         } else {
             return None;
         };
@@ -658,8 +658,8 @@ mod tests {
             args.refused_flag().as_deref(),
             Some(
                 "--custom_suppress_filter is not supported: it would keep a --custom VCF \
-                 source's FILTER column out of the output unless --fields names it, and custom \
-                 annotation is not supported"
+                 source's FILTER column out of the output unless the --custom source's fields \
+                 argument names it, and custom annotation is not supported"
             )
         );
     }

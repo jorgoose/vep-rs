@@ -1,6 +1,6 @@
 # CLI Reference
 
-The `vep` binary accepts the Perl VEP command-line interface. Most flags have the same name and behavior; a flag marked "Accepted for VEP compatibility" below is parsed and has no effect, so an existing VEP command line is accepted. The annotation cache is always `--json_cache`.
+The `vep` binary accepts the Perl VEP command-line interface. Most flags have the same name and behavior; a flag marked "Accepted for VEP compatibility" below is parsed and has no effect on the annotation (the cache flags among them only name the cache path the output header prints), so an existing VEP command line is accepted. The annotation cache is always `--json_cache`.
 
 ```bash
 # Show all flags
@@ -134,7 +134,7 @@ error.
 | Flag               | Type   | Default        | Description                                |
 | ------------------ | ------ | -------------- | ------------------------------------------ |
 | `--species`, `-s`  | String | `homo_sapiens` | Accepted for VEP compatibility; only names the species in the header's cache path when `--json_cache` is absent. The data annotated is the `--json_cache` contents |
-| `--assembly`, `-a` | String | --             | Genome assembly, `GRCh37` or `GRCh38` (`hg19`/`hg38` are accepted; an unrecognized value warns and leaves the plugin guards inert). Names the assembly in the JSON output's `assembly_name` and the Parquet footer metadata (without it the cache's own assembly is used there), and is **load-bearing for plugins**: it picks the coordinate column a dual-coordinate database is indexed on and refuses a data file whose own assembly contradicts it. Pass it whenever `--plugin` is used. |
+| `--assembly`, `-a` | String | --             | Genome assembly, `GRCh37` or `GRCh38` (`hg19`/`hg38` are accepted; an unrecognized value warns and leaves the plugin guards inert). Names the assembly in the JSON output's `assembly_name` and the Parquet footer metadata (without it the cache's own assembly is used there), and is **load-bearing for plugins**: it picks the coordinate column a dual-coordinate database is indexed on and refuses a data file whose own assembly contradicts it. Pass it whenever `--plugin` is used. When `--json_cache` is absent the flag also supplies the `_<assembly>` suffix of the header's cache path leaf, `<version>_GRCh38`; the leaf is the bare `<version>` when the flag is absent |
 
 ## Runtime
 
@@ -217,7 +217,7 @@ These flags control which annotation fields appear in the output (`--coding_only
 | --------------- | ------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `--plugin`      | String (repeatable) | --      | Load a plugin: `Name,param1,param2,...`. `Name` is a built-in (the names in [plugins.md](plugins.md), matched case-sensitively), the path of a C-ABI dylib, or a dylib name resolved as `lib<Name>.so` / `lib<Name>.dylib` under `--dir_plugins`. A name that is none of these is warned about and skipped (VEP's own default); a dylib that exists but fails to open, reports another ABI version or fails `init` aborts the run |
 | `--custom`      | String (repeatable) | --      | Accepted for VEP compatibility; not implemented (custom annotation sources are not loaded)                                                                                                                                                                                  |
-| `--custom_suppress_filter` | bool                | false   | Refused with an error: it would keep a `--custom` VCF source's `FILTER` column out of the output unless `--fields` names it, and custom annotation is not supported                                                                                                     |
+| `--custom_suppress_filter` | bool                | false   | Refused with an error: it would keep a `--custom` VCF source's `FILTER` column out of the output unless the `--custom` source's `fields` argument names it, and custom annotation is not supported                                                                      |
 | `--dir_plugins` | String              | --      | Directory searched for `lib<Name>.so` / `lib<Name>.dylib` when `--plugin <Name>` is neither a built-in nor a path                                                                                                                                                           |
 
 Dylib plugins implement ABI version 1 (`vep_plugin_abi_version`, `vep_plugin_create`,
@@ -235,8 +235,8 @@ batch continues. `crates/vep-plugin/examples/echo_plugin.rs` is a working exampl
 
 | Flag              | Type | Default | Description                                                                                       |
 | ----------------- | ---- | ------- | ------------------------------------------------------------------------------------------------- |
-| `--refseq`        | bool | false   | Accepted for VEP compatibility; not implemented (the transcript set is the `--json_cache` contents) |
-| `--merged`        | bool | false   | Accepted for VEP compatibility; not implemented (the transcript set is the `--json_cache` contents) |
+| `--refseq`        | bool | false   | Accepted for VEP compatibility; selects no transcript set (the transcript set is the `--json_cache` contents). Only suffixes the species directory of the header's cache path, `homo_sapiens_refseq`, when `--json_cache` is absent |
+| `--merged`        | bool | false   | Accepted for VEP compatibility; selects no transcript set (the transcript set is the `--json_cache` contents). Only suffixes the species directory of the header's cache path, `homo_sapiens_merged` (`homo_sapiens_refseq_merged` with `--refseq`), when `--json_cache` is absent |
 | `--gencode_basic` | bool | false   | Accepted for VEP compatibility; not implemented (the transcript set is the `--json_cache` contents) |
 
 ## Statistics

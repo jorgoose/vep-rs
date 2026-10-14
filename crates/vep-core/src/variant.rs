@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crate::consequence::{Consequence, TranscriptConsequence};
 use crate::coordinate::{normalize_chromosome, Strand};
-use crate::sv_routing::{sv_so_term_and_class, sv_type_abbreviation};
+use crate::sv_routing::{perl_true, sv_so_term_and_class, sv_type_abbreviation};
 
 /// Classification of variant types based on Sequence Ontology (SO) variant classes.
 ///
@@ -159,7 +159,10 @@ pub struct InputVariant {
     /// for the record's own breakend and 1 upward for its mates (`:89-101`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allele_num: Option<u32>,
-    /// Original input identifier (e.g., VCF ID field, or "chr:pos:ref:alt").
+    /// The record's name as Ensembl VEP's parser stores it before `validate_vf`: the
+    /// first `;`-joined ID of a VCF record ([`first_vcf_id`]) or the whole ID column
+    /// of an Ensembl-format line, `.` and `0` kept as written; `None` when the column
+    /// is absent or empty.
     pub id: Option<String>,
     /// Variant class.
     pub variant_class: VariantClass,
@@ -468,18 +471,15 @@ impl InputVariant {
         }
     }
 
-    /// The explicit input identifier, if the record carried one (VCF ID other
-    /// than `.`; the first of several `;`-separated IDs).
+    /// The identifier that names the record in `Uploaded_variation`: [`Self::id`]
+    /// when [`id_names_record`] admits it.
     fn explicit_id(&self) -> Option<&str> {
-        self.id
-            .as_deref()
-            .filter(|id| !id.is_empty() && *id != ".")
-            .map(|id| id.split(';').next().unwrap_or(id))
+        self.id.as_deref().filter(|id| id_names_record(id))
     }
 
     /// `Uploaded_variation` as VEP prints it (OutputFactory.pm
-    /// `VariationFeature_to_output_hash`): the input ID unless it is the
-    /// `chr_start_alleles` name VEP gives an ID-less record; else the name built
+    /// `VariationFeature_to_output_hash`): the identifier `explicit_id` admits unless
+    /// it is the `chr_start_alleles` name VEP gives an ID-less record; else the name built
     /// from the input line ([`Self::input_line_name`]); else, for an input format
     /// VEP names from the variant, `chr_start_alleles` where start is the
     /// anchor-trimmed start and the alleles are [`Self::uploaded_allele_string`].
@@ -528,16 +528,14 @@ impl InputVariant {
         }
     }
 
-    /// VEP's `variation_name`, the `id` of its JSON output: the first input ID
-    /// when there is one; the literal `.` for a VCF record whose ID column is
-    /// `.` (VEP keeps the dot as the name); else `chr_start_alleles` built from
-    /// [`Self::record_allele_string`].
+    /// VEP's `variation_name` after `validate_vf`, the `id` of its JSON output
+    /// (OutputFactory/JSON.pm:236): [`Self::id`] when Perl reads it as true, so a
+    /// `.` stays `.`; else `chr_start_alleles` built from
+    /// [`Self::record_allele_string`], the name Parser.pm:462 `||=` gives a record
+    /// whose ID is absent, empty or `0`.
     pub fn variation_name(&self) -> String {
-        if let Some(id) = self.explicit_id() {
+        if let Some(id) = self.id.as_deref().filter(|id| perl_true(id)) {
             return id.to_string();
-        }
-        if self.uploaded_allele_string.is_some() {
-            return ".".to_string();
         }
         let start = self.original_start.unwrap_or(self.start);
         format!(
@@ -617,6 +615,22 @@ impl InputVariant {
             String::from_utf8_lossy(self.alt_allele()).to_string()
         }
     }
+}
+
+/// The name Ensembl VEP's VCF parser gives a record from its ID field: the first of the
+/// `;`-joined IDs (ensembl-io BaseVCF4.pm:436-440 splits the field, Parser/VCF.pm:347
+/// takes `$ids->[0]`), `.` and `0` as written; `None` for an empty field or first
+/// element, which Perl's `split` and `||=` read alike as no name. An Ensembl-format ID
+/// column is not split (Parser/VEP_input.pm:127 takes the column whole).
+pub fn first_vcf_id(field: &str) -> Option<&str> {
+    field.split(';').next().filter(|id| !id.is_empty())
+}
+
+/// Whether a stored name ([`InputVariant::id`]) names its record in `Uploaded_variation`
+/// and may stand in for a breakend's mate: Parser.pm:462 `||=` replaces a Perl-false
+/// name (`0`) with the generated one, and OutputFactory.pm:900 rejects `.`.
+pub fn id_names_record(id: &str) -> bool {
+    perl_true(id) && id != "."
 }
 
 /// Classify a variant based on ref and alt alleles.
@@ -711,12 +725,52 @@ mod tests {
         assert_eq!(v.uploaded_variation(), "21_100_A/G");
         assert_eq!(v.variation_name(), "21_100_A/G");
 
+        // An Ensembl-format ID column is kept whole (Parser/VEP_input.pm:127).
         v.id = Some("rs123;rs456".into());
-        assert_eq!(v.uploaded_variation(), "rs123");
-        assert_eq!(v.variation_name(), "rs123");
+        assert_eq!(v.uploaded_variation(), "rs123;rs456");
+        assert_eq!(v.variation_name(), "rs123;rs456");
 
         v.id = Some(".".into());
         assert_eq!(v.uploaded_variation(), "21_100_A/G");
+        assert_eq!(v.variation_name(), ".");
+    }
+
+    /// Ensembl VEP names a record by its line when its stored name is `.`
+    /// (OutputFactory.pm:900), absent or `0` (Parser.pm:462 `||=` replaces a Perl-false
+    /// name with `chr_start_alleles`, which OutputFactory.pm:900 then rejects as the
+    /// generated name), and its JSON `id` (OutputFactory/JSON.pm:236) is that stored name
+    /// after the `||=`. On `21 100 . AT A`, minimised to `T/-` at 101, the names `.`,
+    /// none and `0` all yield the line name `21_100_AT/A`; the JSON `id` is `.` for `.`
+    /// and the generated `21_101_T/-` for none and `0`.
+    #[test]
+    fn a_perl_false_or_dot_name_yields_the_line_name_and_the_generated_json_id() {
+        let mut v = InputVariant::new("21".into(), 101, 101, b"T".to_vec(), b"-".to_vec());
+        v.uploaded_allele_string = Some("AT/A".into());
+        v.input_line_name = Some("21_100_AT/A".into());
+        v.minimised = true;
+        for (id, json_id) in [
+            (Some("."), "."),
+            (None, "21_101_T/-"),
+            (Some("0"), "21_101_T/-"),
+        ] {
+            v.id = id.map(str::to_string);
+            assert_eq!(v.uploaded_variation(), "21_100_AT/A", "ID {id:?}");
+            assert_eq!(v.variation_name(), json_id, "ID {id:?}");
+        }
+    }
+
+    /// `first_vcf_id` reads the ID field as ensembl-io BaseVCF4.pm:436-440 and
+    /// Parser/VCF.pm:347 do: the first `;`-joined element, `.` and `0` kept, an empty
+    /// field or element no name.
+    #[test]
+    fn first_vcf_id_takes_the_first_element_as_written() {
+        assert_eq!(first_vcf_id("rs2;."), Some("rs2"));
+        assert_eq!(first_vcf_id(".;rs2"), Some("."));
+        assert_eq!(first_vcf_id("0;rs2"), Some("0"));
+        assert_eq!(first_vcf_id("0"), Some("0"));
+        assert_eq!(first_vcf_id("."), Some("."));
+        assert_eq!(first_vcf_id(";rs2"), None);
+        assert_eq!(first_vcf_id(""), None);
     }
 
     #[test]
@@ -724,12 +778,14 @@ mod tests {
         // `21 100 . AT A`: VEP minimises to T/- at 101 and names the record by the raw
         // alleles at the trimmed start; its JSON id keeps the VCF's `.`.
         let mut v = InputVariant::new("21".into(), 101, 101, b"T".to_vec(), b"-".to_vec());
+        v.id = Some(".".into());
         v.uploaded_allele_string = Some("AT/A".into());
         v.minimised = true;
         assert_eq!(v.uploaded_variation(), "21_101_AT/A");
         assert_eq!(v.variation_name(), ".");
         assert_eq!(v.record_allele_string(), "T/-");
         // A record from a format without an ID column is named by its alleles.
+        v.id = None;
         v.uploaded_allele_string = None;
         assert_eq!(v.variation_name(), "21_101_T/-");
     }
@@ -739,6 +795,7 @@ mod tests {
         // `21 100 . TAG TA,T`: named by the raw alleles at the chopped start; the
         // JSON allele_string is the chopped working string.
         let mut v = InputVariant::new("21".into(), 101, 101, b"AG".to_vec(), b"A".to_vec());
+        v.id = Some(".".into());
         v.uploaded_allele_string = Some("TAG/TA/T".into());
         v.record_allele_string_multi = Some("AG/A/-".into());
         assert_eq!(v.uploaded_variation(), "21_101_TAG/TA/T");
