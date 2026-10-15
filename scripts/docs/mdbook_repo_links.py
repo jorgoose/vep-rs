@@ -6,15 +6,16 @@ The book's source is `docs/`, but those pages link outside it (`../README.md`,
 repository README, whose links are relative to the repository root. mdBook
 copies only `docs/` into the site, so those links would 404. This preprocessor:
 
-- replaces the content of the `index.md` chapter with `README.md`, so the
-  README is the single source of the home page;
+- replaces the content of the `index.md` chapter with `README.md` and of the
+  `changelog.md` chapter with `CHANGELOG.md`, so each has one source;
 - resolves every relative markdown link against the file it was written in;
 - keeps a link to a page in the book relative (mdBook turns `.md` into `.html`),
-  points `README.md` at the home page, and sends any other repository path to
-  its GitHub view on `main`.
+  points `README.md` and `CHANGELOG.md` at their pages, and sends any other
+  repository path to its GitHub view at the ref the site is built from.
 
 Links inside fenced code blocks are left alone. The GitHub base URL comes from
-`output.html.git-repository-url` in `book.toml`.
+`output.html.git-repository-url` in `book.toml`; the ref is `$VEP_RS_DOCS_REF`
+(a release tag, set by scripts/docs/stage_release_site.sh), else `main`.
 
 mdBook runs it (`[preprocessor.repo-links]` in `book.toml`): `supports <renderer>`
 exits 0, and otherwise it reads `[context, book]` JSON on stdin and writes the
@@ -29,10 +30,12 @@ import sys
 LINK = re.compile(r"(\]\()([^)\s]+)((?:\s+\"[^\"]*\")?\))")
 FENCE = re.compile(r"^\s*(```|~~~)")
 SCHEME = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*:")
-INDEX = "index.md"
+# Chapters whose content is a repository file outside the book source.
+REPO_FILE_CHAPTERS = {"index.md": "README.md", "changelog.md": "CHANGELOG.md"}
+CHAPTER_OF_REPO_FILE = {v: k for k, v in REPO_FILE_CHAPTERS.items()}
 
 
-def rewrite_target(target, base_dir, chapter_dir, src, root, chapters, blob_url):
+def rewrite_target(target, base_dir, chapter_dir, src, root, chapters, blob_url, ref):
     """Return the site-correct form of one link target.
 
     base_dir is the repository-relative directory the link was written in;
@@ -47,15 +50,15 @@ def rewrite_target(target, base_dir, chapter_dir, src, root, chapters, blob_url)
     if resolved.startswith("../"):
         return target
     in_book = None
-    if resolved == "README.md":
-        in_book = INDEX
+    if CHAPTER_OF_REPO_FILE.get(resolved) in chapters:
+        in_book = CHAPTER_OF_REPO_FILE[resolved]
     elif resolved.startswith(src + "/") and resolved[len(src) + 1 :] in chapters:
         in_book = resolved[len(src) + 1 :]
     if in_book is not None:
         rel = os.path.relpath(in_book, chapter_dir or ".").replace(os.sep, "/")
         return rel + sep + frag
     kind = "tree" if os.path.isdir(os.path.join(root, resolved)) else "blob"
-    return f"{blob_url}/{kind}/main/{resolved}" + sep + frag
+    return f"{blob_url}/{kind}/{ref}/{resolved}" + sep + frag
 
 
 def rewrite(content, **kw):
@@ -95,8 +98,8 @@ def main():
         if not source:
             continue
         chapter_dir = os.path.dirname(source)
-        if source == INDEX:
-            with open(os.path.join(root, "README.md"), encoding="utf-8") as f:
+        if source in REPO_FILE_CHAPTERS:
+            with open(os.path.join(root, REPO_FILE_CHAPTERS[source]), encoding="utf-8") as f:
                 chapter["content"] = f.read()
             base_dir = ""
         else:
@@ -109,6 +112,7 @@ def main():
             root=root,
             chapters=chapters,
             blob_url=blob_url,
+            ref=os.environ.get("VEP_RS_DOCS_REF") or "main",
         )
     json.dump(book, sys.stdout)
 

@@ -3,12 +3,13 @@
 
 Every relative link in the site must name a file the build wrote and, when it
 carries a fragment, an `id` on that page. Every link into this repository on
-GitHub (`<repo>/blob/main/<path>` or `<repo>/tree/main/<path>`) must name a path
-that exists in the checkout. External links are not fetched.
+GitHub (`<repo>/blob/<ref>/<path>` or `<repo>/tree/<ref>/<path>`) must name a
+path that exists in the tree the site was built from. External links are not
+fetched.
 
 Usage::
 
-    python3 scripts/docs/check_site_links.py [--site target/book] [--repo-url URL]
+    python3 scripts/docs/check_site_links.py [--site target/book] [--ref main] [--tree TREE-ISH]
 
 Exits 1 and lists each broken link if any. Stdlib only.
 """
@@ -16,6 +17,7 @@ Exits 1 and lists each broken link if any. Stdlib only.
 import argparse
 import html.parser
 import os
+import subprocess
 import sys
 import urllib.parse
 
@@ -48,7 +50,8 @@ def main():
     ap = argparse.ArgumentParser(description="Check the links of the built documentation site.")
     ap.add_argument("--site", default="target/book")
     ap.add_argument("--repo-url", default=REPO_URL)
-    ap.add_argument("--repo-root", default=".")
+    ap.add_argument("--ref", default="main", help="the ref the site's GitHub links name")
+    ap.add_argument("--tree", help="git tree-ish the site was built from; default the working tree")
     args = ap.parse_args()
 
     pages = {}
@@ -58,7 +61,16 @@ def main():
                 rel = os.path.relpath(os.path.join(dirpath, name), args.site)
                 pages[rel.replace(os.sep, "/")] = parse(os.path.join(dirpath, name))
 
-    prefixes = [args.repo_url.rstrip("/") + f"/{kind}/main/" for kind in ("blob", "tree")]
+    if args.tree:
+        listing = subprocess.run(
+            ["git", "ls-tree", "-r", "-t", "--name-only", args.tree],
+            check=True, capture_output=True, text=True,
+        ).stdout.splitlines()
+        in_repo = set(listing).__contains__
+    else:
+        in_repo = os.path.exists
+
+    prefixes = [args.repo_url.rstrip("/") + f"/{kind}/{args.ref}/" for kind in ("blob", "tree")]
     broken, checked = [], 0
     for page_path, page in sorted(pages.items()):
         if page_path in SKIP_PAGES:
@@ -69,7 +81,7 @@ def main():
             if repo_prefix:
                 checked += 1
                 target = urllib.parse.unquote(href[len(repo_prefix) :].split("#")[0])
-                if not os.path.exists(os.path.join(args.repo_root, target)):
+                if not in_repo(target.rstrip("/")):
                     broken.append((page_path, href, "no such path in the repository"))
                 continue
             if url.scheme or url.netloc or href.startswith("/"):

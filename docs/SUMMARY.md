@@ -14,3 +14,7 @@
 - [Intended divergences](intended-divergences.md)
   - [Divergence classes against 116.2](concordance-provenance/116.2-divergence-classes.md)
 - [Published figures](published-figures.md)
+
+---
+
+[Changelog](changelog.md)
