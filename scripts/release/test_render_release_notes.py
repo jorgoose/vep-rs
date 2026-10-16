@@ -72,6 +72,10 @@ def fixture_repo(tmp_path: Path) -> Path:
     (repo / ".github" / "release-notes").mkdir(parents=True)
     for rel in ("CHANGELOG.md", "CITATION.cff", "Cargo.toml"):
         shutil.copy(ROOT / rel, repo / rel)
+    # The repository's CITATION.cff names the current version, not the fixture release, and `read_doi`
+    # reads the top-level DOI as a version's own only when the file's version is the one rendered.
+    cff = repo / "CITATION.cff"
+    cff.write_text(re.sub(r"^version: .*$", f"version: {VERSION}", cff.read_text(), flags=re.MULTILINE))
     for record in (ROOT / "docs" / "concordance-provenance").glob(f"*-v{VERSION}.json"):
         shutil.copy(record, repo / "docs" / "concordance-provenance" / record.name)
     write_notes(repo, OPENER, f"Upgrade notes\n\n{repository_upgrade_notes()}")
@@ -207,7 +211,7 @@ def expected_page(repo: Path) -> str:
         "## Concordance and wall time",
         "Whole genome against Ensembl VEP 115.2, one run per chromosome; wall time is the sum of the per-chromosome "
         "medians of 20 machines at 16 threads on `c8gd.8xlarge` (ARM) and `c8id.8xlarge` (x86); peak memory at most "
-        "2.4 GB on any chromosome; tuple counts and per-chromosome rows are in the "
+        "2.5 GB on any chromosome; tuple counts and per-chromosome rows are in the "
         f"[provenance records]({REPO_URL}/tree/{TAG}/docs/concordance-provenance).",
         "\n".join(["| Dataset | Raw F1 | Adjusted F1 | ARM (s) | x86 (s) |", "| --- | --- | --- | --- | --- |", *expected_whole_genome_rows()]),
         "The paper's chromosome 21 cells measured on the released binary; the paper's own figures stay as published in "
@@ -287,16 +291,23 @@ def test_captions_carry_the_comparator_protocol_memory_and_record_link(tmp_path:
     assert (
         "Whole genome against Ensembl VEP 115.2, one run per chromosome; wall time is the sum of the per-chromosome "
         "medians of 20 machines at 16 threads on `c8gd.8xlarge` (ARM) and `c8id.8xlarge` (x86); peak memory at most "
-        "2.4 GB on any chromosome; tuple counts and per-chromosome rows are in the "
+        "2.5 GB on any chromosome; tuple counts and per-chromosome rows are in the "
         f"[provenance records]({REPO_URL}/tree/{TAG}/docs/concordance-provenance)."
     ) in body
     assert "-release-v" not in body and "-population-v" not in body
 
-    def raise_peak(record: dict) -> None:
-        record["wall_time"]["vep_rs"]["per_cell"][0]["peak_rss_mb_median"] = 2500
+    def set_peak(mb: float):
+        def edit(record: dict) -> None:
+            for cell in record["wall_time"]["vep_rs"]["per_cell"]:
+                cell["peak_rss_mb_median"] = 1_900.0
+            record["wall_time"]["vep_rs"]["per_cell"][0]["peak_rss_mb_median"] = mb
 
-    edit_record(repo, "population", raise_peak)
-    assert "peak memory at most 2.5 GB on any chromosome" in page(repo)
+        return edit
+
+    # The bound rounds up, never down: 2,500.0 MB is exactly 2.5 GB, anything above it reads 2.6 GB.
+    for mb, shown in ((2_500.0, "2.5"), (2_500.1, "2.6"), (2_502.7, "2.6"), (2_438.3, "2.5")):
+        edit_record(repo, "population", set_peak(mb))
+        assert f"peak memory at most {shown} GB on any chromosome" in page(repo), mb
 
 
 def test_the_concordance_caption_reads_the_perl_reference_block_when_a_record_carries_one(tmp_path: Path) -> None:
@@ -711,7 +722,7 @@ def expected_six_dataset_section() -> list[str]:
         "genome-wide file; wall time is the sum of the per-chromosome medians of 20 machines at 16 threads on `c8gd.8xlarge` "
         "(ARM) and `c8id.8xlarge` (x86) for the population datasets, and the whole-file median of 20 machines on "
         "`r8gd.8xlarge` (ARM) and `r8id.8xlarge` (x86) for the ClinVar files, another instance class and protocol, so the "
-        "`All six` row carries no wall time; peak memory at most 2.5 GB on any chromosome; tuple counts, per-chromosome rows "
+        "`All six` row carries no wall time; peak memory at most 2.6 GB on any chromosome; tuple counts, per-chromosome rows "
         f"and per-file counts are in the [provenance records]({REPO_URL}/tree/{TAG}/docs/concordance-provenance)."
     )
     sv_caption = (
@@ -1209,3 +1220,22 @@ def test_each_six_dataset_fault_is_refused_by_its_line_or_rendered_with_its_figu
         assert error(repo) == f"{expected}\n"
     else:
         assert expected in page(repo)
+
+
+def test_a_chromosome_peak_rss_that_is_absent_or_not_a_finite_number_is_refused_by_name(tmp_path: Path) -> None:
+    repo = six_dataset_repo(tmp_path)
+    where = f"{ERR}the population record's wall_time.vep_rs.per_cell[0] carries"
+    for edit, expected in (
+        (lambda r: drop_keys(timed_cell(r, 0), "peak_rss_mb_median"), f"{where} no peak_rss_mb_median"),
+        (lambda r: timed_cell(r, 0).update(peak_rss_mb_median=None), f"{where} no peak_rss_mb_median"),
+        (lambda r: timed_cell(r, 0).update(peak_rss_mb_median="n/a"), f"{where} a peak_rss_mb_median that is not a number: 'n/a'"),
+        (lambda r: timed_cell(r, 0).update(peak_rss_mb_median=float("nan")), f"{where} a peak_rss_mb_median that is not finite: nan"),
+        (lambda r: timed_cell(r, 0).update(peak_rss_mb_median=float("inf")), f"{where} a peak_rss_mb_median that is not finite: inf"),
+    ):
+        edit_record(repo, "population", edit)
+        assert error(repo) == f"{expected}\n"
+    # The earlier page builds its caption before its dataset rows, so an empty cell list reaches peak_rss_gb before
+    # the rows refuse it; the six-dataset page refuses it as a dataset without wall time first.
+    repo = fixture_repo(tmp_path / "empty")
+    edit_record(repo, "population", lambda r: r["wall_time"]["vep_rs"]["per_cell"].clear())
+    assert error(repo) == f"{ERR}the population record's wall_time.vep_rs.per_cell is empty\n"
