@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `--hgvsg` fills the `HGVSg` column (JSON `hgvsg`) with Ensembl VEP 116's genomic notation, read from `--fasta` and shifted 3'; empty without `--fasta` and for structural variants.
+
 ## [0.4.0] - 2026-10-16
 
 ### Added

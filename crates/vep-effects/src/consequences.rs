@@ -59,6 +59,9 @@ pub struct EffectsConfig {
     /// formats regardless of the flag (`runner::needs_hgvs_computation`). Embedders
     /// that always populate HGVS should likewise pass `true`.
     pub compute_hgvs: bool,
+    /// Compute the variant's HGVSg notation (`InputVariant::hgvsg`) under
+    /// `--hgvsg`; it needs `reference_fasta` and stays `None` without it.
+    pub compute_hgvsg: bool,
     /// Compute the `EXON` and `INTRON` ordinals for each transcript consequence.
     ///
     /// Off by default. Every output format prints them only under `--numbers`
@@ -83,6 +86,7 @@ impl Default for EffectsConfig {
             max_indel_3prime_shift: 2000,
             populate_loftee_context: false,
             compute_hgvs: false,
+            compute_hgvsg: false,
             compute_exon_intron_numbers: false,
             protein_version: false,
         }

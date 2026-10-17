@@ -244,6 +244,12 @@ impl IndexedFasta {
         Some(seq)
     }
 
+    /// The length of the contig `chr` names (an alias such as `chr21` for `21`
+    /// included), or `None` when the FASTA has no such contig.
+    pub fn contig_length(&self, chr: &str) -> Option<u64> {
+        self.record_for(chr).map(|rec| rec.len)
+    }
+
     fn record_for(&self, chr: &str) -> Option<&FaiRecord> {
         if let Some(rec) = self.records.get(chr) {
             return Some(rec);
