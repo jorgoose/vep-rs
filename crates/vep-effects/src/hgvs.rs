@@ -841,7 +841,7 @@ fn hgvsp_at(
 /// (100 bases, more for an allele over 50; `_get_flank_seq`, VariationFeature.pm
 /// 1805); the reference bases come from the FASTA, never from the input, so the
 /// type follows `hgvs_variant_notation` on the sequence there and a `delins` is
-/// clipped by `_clip_alleles` (VariationFeature.pm 2047).
+/// clipped by `_clip_alleles` (VariationFeature.pm 2046).
 ///
 /// `None` without a FASTA or when the FASTA lacks the chromosome, for a
 /// structural variant (whose rows carry no HGVSg), for an allele with a
@@ -855,7 +855,8 @@ pub fn generate_hgvsg(
         return None;
     }
     let fasta = reference_fasta?;
-    let chr_len = fasta.contig_length(&variant.chr)? as i64;
+    let (contig, chr_len) = fasta.contig(&variant.chr)?;
+    let chr_len = chr_len as i64;
 
     // The VariationFeature's allele string, upper-cased by `validate_vf`.
     let record = variant.record_allele_string().to_ascii_uppercase();
@@ -978,9 +979,10 @@ pub fn generate_hgvsg(
         genomic_clip_alleles(&mut n);
     }
 
-    // VariationFeature.pm 2036: the slice is the cache's chromosome, `MT` for the
-    // mitochondrion.
-    let numbering = if variant.chr == "MT" { 'm' } else { 'g' };
+    // VariationFeature.pm 2034: `m.` only when the slice is named `MT`; offline the
+    // slice is the FASTA contig the input chromosome resolves to (BaseVEP.pm
+    // `get_slice`), so a UCSC `chrM` FASTA gives `g.`.
+    let numbering = if contig == "MT" { 'm' } else { 'g' };
     Some(format_hgvs_string(
         &variant.original_chr,
         numbering,
@@ -1100,7 +1102,7 @@ fn three_prime_seq_offset(mut seq: Vec<u8>, post_seq: &[u8]) -> (Vec<u8>, i64) {
     (seq, offset)
 }
 
-/// `_clip_alleles` of VariationFeature.pm (2047), which `hgvs_genomic` applies
+/// `_clip_alleles` of VariationFeature.pm (2046), which `hgvs_genomic` applies
 /// to a `delins`: the shared leading and trailing bases are trimmed, moving
 /// `start` and `end`, and the type is re-read from what remains. An emptied
 /// reference becomes a `dup` of the trimmed leading bases when they end in the
@@ -1962,6 +1964,22 @@ mod tests {
         assert_eq!(
             hgvsg(&biallelic("chrM", 2, 2, "A", "C"), &fasta).as_deref(),
             Some("chrM:m.2A>C")
+        );
+    }
+
+    /// Ensembl VEP picks `m.` by the FASTA contig's name, not the input's: a UCSC
+    /// FASTA's `chrM` is numbered `g.` (Ensembl VEP 116 prints `chrM:g.2A>C`).
+    #[test]
+    fn test_hgvsg_ucsc_mitochondrion_uses_g_numbering() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fa = dir.path().join("ucsc.fa");
+        std::fs::write(&fa, ">chrM\nGATTACAGATTACA\n").expect("write FASTA");
+        std::fs::write(dir.path().join("ucsc.fa.fai"), "chrM\t14\t6\t14\t15\n")
+            .expect("write FASTA index");
+        let fasta = vep_fasta::IndexedFasta::from_path(&fa).expect("load indexed FASTA");
+        assert_eq!(
+            hgvsg(&biallelic("chrM", 2, 2, "A", "C"), &fasta).as_deref(),
+            Some("chrM:g.2A>C")
         );
     }
 

@@ -140,7 +140,7 @@ p.Ter124IleextTer14
 
 **`--hgvsg`**, boolean, default off. Ensembl VEP: same flag and default.
 
-Adds each allele's genomic notation (`HGVSg`; JSON `hgvsg`), as Ensembl VEP 116 writes it, named by the input chromosome (`21:g.`, `chr21:g.`, `m.` on `MT`). The reference bases come from `--fasta`.
+Adds each allele's genomic notation (`HGVSg`; JSON `hgvsg`), as Ensembl VEP 116 writes it, named by the input chromosome (`21:g.`, `chr21:g.`). It uses `m.` when the FASTA names the contig `MT`, so a UCSC `chrM` FASTA gives `chrM:g.`, as in Ensembl VEP. The reference bases come from `--fasta`.
 
 An insertion or deletion is shifted 3' along the forward strand whatever the transcript strand, at most as far as the flank Ensembl VEP reads: 100 bases, or 50 more than an allele longer than 50 (`21:g.14dup`, `21:g.25_26del`). Each ALT of a multi-allelic record is trimmed against the reference first.
 

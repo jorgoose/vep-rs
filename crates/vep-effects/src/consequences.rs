@@ -59,8 +59,10 @@ pub struct EffectsConfig {
     /// formats regardless of the flag (`runner::needs_hgvs_computation`). Embedders
     /// that always populate HGVS should likewise pass `true`.
     pub compute_hgvs: bool,
-    /// Compute the variant's HGVSg notation (`InputVariant::hgvsg`) under
-    /// `--hgvsg`; it needs `reference_fasta` and stays `None` without it.
+    /// Whether the caller sets the variant's HGVSg notation (`InputVariant::hgvsg`)
+    /// under `--hgvsg`. This crate does not read it: `vep-cli`'s
+    /// `annotate_variant` does, calling `hgvs::generate_hgvsg`, which needs
+    /// `reference_fasta` and gives `None` without it.
     pub compute_hgvsg: bool,
     /// Compute the `EXON` and `INTRON` ordinals for each transcript consequence.
     ///
