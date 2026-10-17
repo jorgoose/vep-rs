@@ -1983,6 +1983,68 @@ mod tests {
         );
     }
 
+    /// The 3' shift stops at the flank Ensembl VEP reads: 100 bases, or 50 more
+    /// than an allele longer than 50 bases. Contig `1` is `CG` x 100, then 150 `A`s
+    /// (201-350), then 50 `C`s. Ensembl VEP 116.2 prints `1:g.301del`,
+    /// `1:g.291_350del` and `1:g.251_305dup` for these records.
+    #[test]
+    fn test_hgvsg_shift_stops_at_the_flank() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fa = dir.path().join("flank.fa");
+        let seq = format!("{}{}{}", "CG".repeat(100), "A".repeat(150), "C".repeat(50));
+        std::fs::write(&fa, format!(">1\n{seq}\n")).expect("write FASTA");
+        std::fs::write(dir.path().join("flank.fa.fai"), "1\t400\t3\t400\t401\n")
+            .expect("write FASTA index");
+        let fasta = vep_fasta::IndexedFasta::from_path(&fa).expect("load indexed FASTA");
+        // VCF `1 200 GA G`
+        assert_eq!(
+            hgvsg(&biallelic("1", 201, 201, "A", "-"), &fasta).as_deref(),
+            Some("1:g.301del")
+        );
+        // VCF `1 200 G(A x 60) G`
+        assert_eq!(
+            hgvsg(&biallelic("1", 201, 260, &"A".repeat(60), "-"), &fasta).as_deref(),
+            Some("1:g.291_350del")
+        );
+        // VCF `1 200 G G(A x 55)`
+        assert_eq!(
+            hgvsg(&biallelic("1", 201, 200, "-", &"A".repeat(55)), &fasta).as_deref(),
+            Some("1:g.251_305dup")
+        );
+    }
+
+    /// A deletion shifted up to the contig's last base (the flank past the end
+    /// reads as `N`), and Ensembl VEP's `0_1ins` for an insertion before base 1
+    /// in a multi-allelic record (`22:g.17del`, `21:g.0_1insT`, `21:g.1C>G` in
+    /// Ensembl VEP 116.2).
+    #[test]
+    fn test_hgvsg_at_the_contig_ends() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fa = dir.path().join("ends.fa");
+        std::fs::write(&fa, ">22\nACGTACGTACGTAAAAA\n").expect("write FASTA");
+        std::fs::write(dir.path().join("ends.fa.fai"), "22\t17\t4\t17\t18\n")
+            .expect("write FASTA index");
+        let ends = vep_fasta::IndexedFasta::from_path(&fa).expect("load indexed FASTA");
+        // VCF `22 12 TA T`
+        assert_eq!(
+            hgvsg(&biallelic("22", 13, 13, "A", "-"), &ends).as_deref(),
+            Some("22:g.17del")
+        );
+
+        // VCF `21 1 C TC,G`
+        let (_dir, fasta) = hgvsg_fasta();
+        let record: std::sync::Arc<str> = "C/TC/G".into();
+        for (index, (alt, expected)) in [("TC", "21:g.0_1insT"), ("G", "21:g.1C>G")]
+            .into_iter()
+            .enumerate()
+        {
+            let mut variant = biallelic("21", 1, 1, "C", alt);
+            variant.record_allele_string_multi = Some(record.clone());
+            variant.allele_index = index;
+            assert_eq!(hgvsg(&variant, &fasta).as_deref(), Some(expected), "{alt}");
+        }
+    }
+
     /// An Ensembl-format line on the reverse strand is described on the forward
     /// strand: its alleles are complemented, and a deletion is shifted only when
     /// its complemented bases repeat downstream.
