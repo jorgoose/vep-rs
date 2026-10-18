@@ -175,7 +175,7 @@ pub fn calculate_consequences(
 ) -> Option<TranscriptConsequence> {
     let forward = variant.to_forward_strand();
     let analysed = forward.as_ref().unwrap_or(variant);
-    let mut tc = calculate_terms(analysed, variant.strand, transcript, config)?;
+    let mut tc = calculate_terms(analysed, transcript, config)?;
     // The display columns follow VEP's rendering path, kept apart from the
     // analysis that produced the terms.
     crate::display::apply_display_fields(
@@ -209,11 +209,9 @@ fn append_translation_version(tc: &mut TranscriptConsequence, transcript: &Trans
 }
 
 /// Consequence terms and the fields the analysis derives alongside them, for a
-/// `variant` whose alleles are on the forward strand and which its input record
-/// wrote on `input_strand`.
+/// `variant` whose alleles are on the forward strand.
 fn calculate_terms(
     variant: &InputVariant,
-    input_strand: vep_core::coordinate::Strand,
     transcript: &Transcript,
     config: &EffectsConfig,
 ) -> Option<TranscriptConsequence> {
@@ -565,12 +563,7 @@ fn calculate_terms(
     // HGVS strings are consumed solely by the output layer, so they are built
     // only when `compute_hgvs` is set.
     let hgvs = if config.compute_hgvs {
-        crate::hgvs::generate_hgvs(
-            variant,
-            input_strand,
-            transcript,
-            config.reference_fasta.as_deref(),
-        )
+        crate::hgvs::generate_hgvs(variant, transcript, config.reference_fasta.as_deref())
     } else {
         crate::hgvs::HgvsNotation::default()
     };

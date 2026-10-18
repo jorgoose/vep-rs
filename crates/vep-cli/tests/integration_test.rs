@@ -1554,12 +1554,13 @@ fn reverse_strand_ensembl_lines_follow_ensembl_vep() {
 
 /// HGVS of strand -1 Ensembl-format lines on APP (ENST00000346798, strand -1) as
 /// Ensembl VEP 116.2 writes it with the GRCh38 FASTA, of which the test keeps
-/// 21:26021751-26022050. The insertion `-/CTT -1` shifts one base like its strand 1
-/// twin `-/AAG`, but its HGVSp inserts Leu where the twin's inserts Ser:
-/// `shift_feature_seqs` (TranscriptVariationAllele.pm:1330) rotates the allele as
-/// the line writes it.
+/// 21:26021751-26022050. The insertion `-/CTT -1` is the same insertion as its
+/// strand 1 twin `-/AAG` and is annotated as the twin is. Ensembl VEP writes
+/// `p.Ala242_Asp243insLeu` for the `-1` line: `shift_feature_seqs`
+/// (TranscriptVariationAllele.pm:1330) rotates the allele as the line writes it, so
+/// its HGVSp depends on the strand the line is written on. Both lines insert Ser.
 #[test]
-fn reverse_strand_ensembl_hgvs_follows_ensembl_vep() {
+fn reverse_strand_ensembl_hgvs_matches_the_forward_twin() {
     const WINDOW_START: usize = 26_021_751;
     const WINDOW: &[u8] = b"GCAGTGGTGCTAGGGTGGATATTTCCAACTCTGGTATTACGCTTTCTTTTCCTTGGGGGTGGGGGGAATCCAAGCAAATGGTGGATTACCTCGAACCACC\
 TCTTCCACAGACTCTGTGGTGGTGGTGGTGGTGGTGGCAATGCTGGTGGTTCTCTCTGTGGCTTCTTCGTAGGGTTCCTCAGCCTCTTCCTCTACCTCAT\
@@ -1593,7 +1594,7 @@ CACCATCCTCATCGTCCTCGTCATCATCGGCTTCTTCTTCTTCCACCTCAGCCACTTCTTCCTCCTCTGCTACTTCTACT
             "cv1915683\t21:26021896\tA\tENSG00000142192\tENST00000346798\tTranscript\tmissense_variant\t959\t809\t270\tT/N\taCc/aAc\t-\tIMPACT=MODERATE;STRAND=-1;HGVSc=ENST00000346798.8:c.809C>A;HGVSp=ENSP00000284981.4:p.Thr270Asn",
             "cv721913\t21:26021943\tC\tENSG00000142192\tENST00000346798\tTranscript\tsynonymous_variant\t912\t762\t254\tV\tgtA/gtC\t-\tIMPACT=LOW;STRAND=-1;HGVSc=ENST00000346798.8:c.762A>C;HGVSp=ENSP00000284981.4:p.Val254%3D",
             "cv664060\t21:26021866-26021871\t-\tENSG00000142192\tENST00000346798\tTranscript\tinframe_deletion\t984-989\t834-839\t278-280\tTTT/T\tacCACCACa/aca\t-\tIMPACT=MODERATE;STRAND=-1;HGVSc=ENST00000346798.8:c.834_839del;HGVSp=ENSP00000284981.4:p.Thr279_Thr280del",
-            "cv2041960\t21:26021980-26021981\tCTT\tENSG00000142192\tENST00000346798\tTranscript\tinframe_insertion\t874-875\t724-725\t242\tA/AS\tgcc/gCTTcc\t-\tIMPACT=MODERATE;STRAND=-1;HGVSc=ENST00000346798.8:c.725_726insTTC;HGVSp=ENSP00000284981.4:p.Ala242_Asp243insLeu;HGVS_OFFSET=-1",
+            "cv2041960\t21:26021980-26021981\tCTT\tENSG00000142192\tENST00000346798\tTranscript\tinframe_insertion\t874-875\t724-725\t242\tA/AS\tgcc/gCTTcc\t-\tIMPACT=MODERATE;STRAND=-1;HGVSc=ENST00000346798.8:c.725_726insTTC;HGVSp=ENSP00000284981.4:p.Ala242_Asp243insSer;HGVS_OFFSET=-1",
             "cv2041960_fwd\t21:26021980-26021981\tAAG\tENSG00000142192\tENST00000346798\tTranscript\tinframe_insertion\t874-875\t724-725\t242\tA/AS\tgcc/gCTTcc\t-\tIMPACT=MODERATE;STRAND=-1;HGVSc=ENST00000346798.8:c.725_726insTTC;HGVSp=ENSP00000284981.4:p.Ala242_Asp243insSer;HGVS_OFFSET=-1",
         ]
     );

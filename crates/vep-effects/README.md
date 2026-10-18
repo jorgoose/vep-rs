@@ -84,7 +84,7 @@ The other callables a caller reaches for, each one phrase:
 - `mapper::map_genomic_span_to_cds_bounds(start, end, transcript) -> Option<CdsSpanBounds>`: the CDS and peptide bounds of a span, intronic ends snapped to the nearest exon boundary.
 - `coding::get_codon_change(variant, transcript, cds_pos) -> Option<CodonChange>`: the reference and alternate codons and residues of one variant, the changed base in upper case.
 - `display::display_fields(variant, transcript) -> DisplayFields`: the five display columns on their own.
-- `hgvs::generate_hgvs(variant, input_strand, transcript, fasta) -> HgvsNotation`: HGVSc, HGVSp and the shift offset in one call, for alleles on the forward strand that the input record wrote on `input_strand`; `generate_hgvsc` and `generate_hgvsp` give each alone for a forward-strand record.
+- `hgvs::generate_hgvs(variant, transcript, fasta) -> HgvsNotation`: HGVSc, HGVSp and the shift offset in one call; `generate_hgvsc` and `generate_hgvsp` give each alone.
 - `consequences::shift_indel_3prime_coords(variant, transcript, fasta, max_shift) -> Option<(u64, u64)>`: the shifted span of an insertion or deletion.
 
 `cargo doc` renders the full item list:

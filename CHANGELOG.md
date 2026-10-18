@@ -15,7 +15,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Reverse-strand (`-1`) Ensembl-format and region input is annotated on its forward-strand alleles, as in Ensembl VEP 116.2: consequences, HGVSc, HGVSp, plugin allele matching and `--vcf` REF/ALT. (#64)
-- HGVSp of a shifted insertion on a reverse-strand transcript keeps the inserted sequence as written when the shift exceeds its length, as Ensembl VEP 116.2 does. (#64)
 
 ## [0.4.0] - 2026-10-16
 
