@@ -517,7 +517,8 @@ pub fn generate_hgvs(
 /// shared bases are clipped, an exonic single-base substitution inside the CDS
 /// takes its CDS coordinate and every other position goes through
 /// `_get_cDNA_position`. Without a FASTA the reference bases come from the
-/// variant and no duplication is detected.
+/// variant and no duplication is detected. The alleles are read on the forward
+/// strand ([`InputVariant::to_forward_strand`]).
 pub fn generate_hgvsc(
     variant: &InputVariant,
     transcript: &Transcript,
@@ -763,6 +764,8 @@ fn rotate_sequence_for_transcript_3prime(
 /// (Perl's `_return_3prime(1)`, applied for HGVS whatever `--shift_3prime`
 /// says) when a reference FASTA is available; the shifted alleles are the
 /// deleted reference bases at the new position and the rotated insertion.
+/// The alleles are read on the forward strand; pass a strand -1 record through
+/// [`InputVariant::to_forward_strand`] and [`generate_hgvs`] instead.
 pub fn generate_hgvsp(
     variant: &InputVariant,
     transcript: &Transcript,

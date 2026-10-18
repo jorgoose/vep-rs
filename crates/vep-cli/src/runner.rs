@@ -1283,7 +1283,7 @@ pub(crate) fn annotate_variant(
     let (variant_start, variant_end) = structural_variant_bounds(variant);
     let has_predictions = prediction_config.sift.is_some() || prediction_config.polyphen.is_some();
     // Held apart while the loop runs: `calculate_consequences` copies a reverse-strand
-    // record per transcript, and the copy must not carry the rows already made.
+    // record per transcript, so the copy does not clone the rows already made.
     let mut consequences = std::mem::take(&mut variant.transcript_consequences);
 
     // For structural variants, use sv_end to query the full SV span so all
