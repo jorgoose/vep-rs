@@ -1445,3 +1445,156 @@ fn parquet_round_trip_nested() {
         adapter_text
     );
 }
+
+/// Annotates Ensembl-format `lines` against the release 116 golden corpus's pruned
+/// cache, as [`annotate_record`] does a VCF record, and returns the data lines.
+fn annotate_ensembl(lines: &str, extra: &[&str]) -> Vec<String> {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.txt");
+    std::fs::write(&input, lines).unwrap();
+    let output = dir.path().join("out");
+    let cache = format!(
+        "{}/../../tests/golden/116/GRCh38-release116/json_cache",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let result = vep_binary()
+        .args(["-i", input.to_str().unwrap()])
+        .args(["-o", output.to_str().unwrap()])
+        .args(["--json_cache", &cache, "--format", "ensembl"])
+        .args(["--offline", "--assembly", "GRCh38"])
+        .args(["--force_overwrite", "--no_stats", "--no_headers", "--quiet"])
+        .args(extra)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{extra:?}: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    std::fs::read_to_string(&output)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Ensembl-format lines on strand -1 as Ensembl VEP 116.2 annotates them: the
+/// alleles are reverse-complemented against every transcript, so `A/T -1` at
+/// 13639588, whose forward `T/A` repeats the genome's `T`, leaves ENST00000299443
+/// (strand 1) synonymous with `Act/Act`, and `C/A -1` reads as `G/T`, as the line
+/// `cv4047524_fwd` writes it on strand 1. The Allele column and JSON `allele_string`,
+/// `strand` and `variant_allele` keep the alleles as written; the VCF line and its
+/// CSQ allele are on the forward strand.
+#[test]
+fn reverse_strand_ensembl_lines_follow_ensembl_vep() {
+    let lines = "21\t13639588\t13639588\tA/T\t-1\tcv3308991\n\
+                 21\t13610310\t13610310\tT/C\t-1\tcv3216832\n\
+                 21\t14109002\t14109002\tC/A\t-1\tcv4047524\n\
+                 21\t14109002\t14109002\tG/T\t1\tcv4047524_fwd\n";
+    let on_transcripts = |row: &&String| {
+        ["ENST00000299443", "ENST00000400211", "ENST00000536861"]
+            .iter()
+            .any(|t| row.contains(t))
+    };
+    let rows = annotate_ensembl(lines, &[]);
+    assert_eq!(
+        rows.iter().filter(on_transcripts).collect::<Vec<_>>(),
+        [
+            "cv3308991\t21:13639588\tT\tENSG00000166351\tENST00000299443\tTranscript\tsynonymous_variant\t1935\t1483\t495\tT\tAct/Act\t-\tIMPACT=LOW;STRAND=1",
+            "cv3216832\t21:13610310\tC\tENSG00000166351\tENST00000299443\tTranscript\tmissense_variant\t534\t82\t28\tC/G\tTgc/Ggc\t-\tIMPACT=MODERATE;STRAND=1",
+            "cv4047524\t21:14109002\tA\tENSG00000188992\tENST00000400211\tTranscript\tmissense_variant\t1195\t1085\t362\tR/K\taGa/aAa\t-\tIMPACT=MODERATE;STRAND=-1",
+            "cv4047524\t21:14109002\tA\tENSG00000188992\tENST00000536861\tTranscript\tsynonymous_variant\t1466\t1356\t452\tK\taaG/aaA\t-\tIMPACT=LOW;STRAND=-1",
+            "cv4047524_fwd\t21:14109002\tT\tENSG00000188992\tENST00000400211\tTranscript\tmissense_variant\t1195\t1085\t362\tR/K\taGa/aAa\t-\tIMPACT=MODERATE;STRAND=-1",
+            "cv4047524_fwd\t21:14109002\tT\tENSG00000188992\tENST00000536861\tTranscript\tsynonymous_variant\t1466\t1356\t452\tK\taaG/aaA\t-\tIMPACT=LOW;STRAND=-1",
+        ]
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_str(&annotate_ensembl(lines, &["--json"])[0]).unwrap();
+    let csq = json["transcript_consequences"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tc| tc["transcript_id"] == "ENST00000299443")
+        .unwrap();
+    assert_eq!(
+        (
+            &json["allele_string"],
+            &json["strand"],
+            &csq["variant_allele"],
+            &csq["codons"]
+        ),
+        (
+            &serde_json::json!("A/T"),
+            &serde_json::json!(-1),
+            &serde_json::json!("T"),
+            &serde_json::json!("Act/Act")
+        )
+    );
+
+    let vcf: Vec<String> = annotate_ensembl(lines, &["--vcf"])
+        .iter()
+        .map(|line| {
+            let c: Vec<&str> = line.split('\t').collect();
+            let allele = c[7].trim_start_matches("CSQ=").split('|').next().unwrap();
+            format!("{} {} {} {} {}", c[1], c[2], c[3], c[4], allele)
+        })
+        .collect();
+    assert_eq!(
+        vcf,
+        [
+            "13639588 cv3308991 T A A",
+            "13610310 cv3216832 A G G",
+            "14109002 cv4047524 G T T",
+            "14109002 cv4047524_fwd G T T",
+        ]
+    );
+}
+
+/// HGVS of strand -1 Ensembl-format lines on APP (ENST00000346798, strand -1) as
+/// Ensembl VEP 116.2 writes it with the GRCh38 FASTA, of which the test keeps
+/// 21:26021751-26022050. The insertion `-/CTT -1` shifts one base like its strand 1
+/// twin `-/AAG`, but its HGVSp inserts Leu where the twin's inserts Ser:
+/// `shift_feature_seqs` (TranscriptVariationAllele.pm:1330) rotates the allele as
+/// the line writes it.
+#[test]
+fn reverse_strand_ensembl_hgvs_follows_ensembl_vep() {
+    const WINDOW_START: usize = 26_021_751;
+    const WINDOW: &[u8] = b"GCAGTGGTGCTAGGGTGGATATTTCCAACTCTGGTATTACGCTTTCTTTTCCTTGGGGGTGGGGGGAATCCAAGCAAATGGTGGATTACCTCGAACCACC\
+TCTTCCACAGACTCTGTGGTGGTGGTGGTGGTGGTGGCAATGCTGGTGGTTCTCTCTGTGGCTTCTTCGTAGGGTTCCTCAGCCTCTTCCTCTACCTCAT\
+CACCATCCTCATCGTCCTCGTCATCATCGGCTTCTTCTTCTTCCACCTCAGCCACTTCTTCCTCCTCTGCTACTTCTACTACTTTGTCTTCACTGTGAAG";
+    let dir = tempfile::tempdir().unwrap();
+    let fasta = dir.path().join("21.fa");
+    let mut sequence = vec![b'N'; WINDOW_START - 1];
+    sequence.extend_from_slice(WINDOW);
+    let mut contents = b">21\n".to_vec();
+    contents.extend_from_slice(&sequence);
+    contents.push(b'\n');
+    std::fs::write(&fasta, contents).unwrap();
+    let len = sequence.len();
+    std::fs::write(
+        dir.path().join("21.fa.fai"),
+        format!("21\t{len}\t4\t{len}\t{}\n", len + 1),
+    )
+    .unwrap();
+
+    let lines = "21\t26021896\t26021896\tG/A\t-1\tcv1915683\n\
+                 21\t26021943\t26021943\tT/C\t-1\tcv721913\n\
+                 21\t26021866\t26021871\tGTGGTG/-\t-1\tcv664060\n\
+                 21\t26021981\t26021980\t-/CTT\t-1\tcv2041960\n\
+                 21\t26021981\t26021980\t-/AAG\t1\tcv2041960_fwd\n";
+    let rows = annotate_ensembl(lines, &["--hgvs", "--fasta", fasta.to_str().unwrap()]);
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.contains("ENST00000346798"))
+            .collect::<Vec<_>>(),
+        [
+            "cv1915683\t21:26021896\tA\tENSG00000142192\tENST00000346798\tTranscript\tmissense_variant\t959\t809\t270\tT/N\taCc/aAc\t-\tIMPACT=MODERATE;STRAND=-1;HGVSc=ENST00000346798.8:c.809C>A;HGVSp=ENSP00000284981.4:p.Thr270Asn",
+            "cv721913\t21:26021943\tC\tENSG00000142192\tENST00000346798\tTranscript\tsynonymous_variant\t912\t762\t254\tV\tgtA/gtC\t-\tIMPACT=LOW;STRAND=-1;HGVSc=ENST00000346798.8:c.762A>C;HGVSp=ENSP00000284981.4:p.Val254%3D",
+            "cv664060\t21:26021866-26021871\t-\tENSG00000142192\tENST00000346798\tTranscript\tinframe_deletion\t984-989\t834-839\t278-280\tTTT/T\tacCACCACa/aca\t-\tIMPACT=MODERATE;STRAND=-1;HGVSc=ENST00000346798.8:c.834_839del;HGVSp=ENSP00000284981.4:p.Thr279_Thr280del",
+            "cv2041960\t21:26021980-26021981\tCTT\tENSG00000142192\tENST00000346798\tTranscript\tinframe_insertion\t874-875\t724-725\t242\tA/AS\tgcc/gCTTcc\t-\tIMPACT=MODERATE;STRAND=-1;HGVSc=ENST00000346798.8:c.725_726insTTC;HGVSp=ENSP00000284981.4:p.Ala242_Asp243insLeu;HGVS_OFFSET=-1",
+            "cv2041960_fwd\t21:26021980-26021981\tAAG\tENSG00000142192\tENST00000346798\tTranscript\tinframe_insertion\t874-875\t724-725\t242\tA/AS\tgcc/gCTTcc\t-\tIMPACT=MODERATE;STRAND=-1;HGVSc=ENST00000346798.8:c.725_726insTTC;HGVSp=ENSP00000284981.4:p.Ala242_Asp243insSer;HGVS_OFFSET=-1",
+        ]
+    );
+}

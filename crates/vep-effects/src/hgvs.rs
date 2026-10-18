@@ -473,15 +473,17 @@ pub struct HgvsNotation {
 }
 
 /// HGVSc, HGVSp and the shift offset for a variant-transcript pair, the indel
-/// shift computed once for both notations.
+/// shift computed once for both notations. The alleles are on the forward strand;
+/// `input_strand` is the strand the input record wrote them on.
 pub fn generate_hgvs(
     variant: &InputVariant,
+    input_strand: Strand,
     transcript: &Transcript,
     reference_fasta: Option<&vep_fasta::IndexedFasta>,
 ) -> HgvsNotation {
     let shifted = hgvs_shift(variant, transcript, reference_fasta);
     let hgvsc = hgvsc_at(variant, transcript, reference_fasta, shifted);
-    let hgvsp = hgvsp_at(variant, transcript, reference_fasta, shifted);
+    let hgvsp = hgvsp_at(variant, input_strand, transcript, reference_fasta, shifted);
     let offset = shifted
         .filter(|_| hgvsc.is_some() || hgvsp.is_some())
         .map(|(start, _)| {
@@ -565,7 +567,7 @@ fn hgvsc_at(
     };
     // A shifted insertion is described by its rotated allele.
     let alt_seq = in_transcript_orientation(match variant.variant_class {
-        VariantClass::Insertion => normalized_hgvs_alt_allele(variant, transcript, shifted)
+        VariantClass::Insertion => normalized_hgvs_alt_allele(variant, transcript.strand, shifted)
             .unwrap_or_else(|| alt_allele.to_vec()),
         _ => alt_allele.to_vec(),
     });
@@ -703,9 +705,11 @@ fn normalized_hgvs_ref_allele(
     Some(seq)
 }
 
+/// A shifted insertion's allele rotated `shift` bases toward the 3' end of a
+/// transcript on `strand`.
 fn normalized_hgvs_alt_allele(
     variant: &InputVariant,
-    transcript: &Transcript,
+    strand: Strand,
     shifted: Option<(u64, u64)>,
 ) -> Option<Vec<u8>> {
     if variant.variant_class != VariantClass::Insertion {
@@ -725,7 +729,7 @@ fn normalized_hgvs_alt_allele(
 
     Some(rotate_sequence_for_transcript_3prime(
         alt_allele,
-        transcript.strand,
+        strand,
         shift_steps,
     ))
 }
@@ -767,12 +771,19 @@ pub fn generate_hgvsp(
     reference_fasta: Option<&vep_fasta::IndexedFasta>,
 ) -> Option<String> {
     let shifted = hgvs_shift(variant, transcript, reference_fasta);
-    hgvsp_at(variant, transcript, reference_fasta, shifted)
+    hgvsp_at(
+        variant,
+        Strand::Forward,
+        transcript,
+        reference_fasta,
+        shifted,
+    )
 }
 
 /// `generate_hgvsp` with the 3' shift already computed.
 fn hgvsp_at(
     variant: &InputVariant,
+    input_strand: Strand,
     transcript: &Transcript,
     reference_fasta: Option<&vep_fasta::IndexedFasta>,
     shifted: Option<(u64, u64)>,
@@ -806,11 +817,20 @@ fn hgvsp_at(
         )
     );
 
+    // `shift_feature_seqs` (TranscriptVariationAllele.pm:1330) rotates
+    // `variation_feature_seq`, the allele as the record writes it, before
+    // `_get_alternate_cds` (2414) turns it onto the transcript strand, so a strand -1
+    // record's shifted insertion turns the opposite way to a forward one's.
+    let rotation = match (input_strand, transcript.strand) {
+        (Strand::Forward, strand) => strand,
+        (Strand::Reverse, Strand::Forward) => Strand::Reverse,
+        (Strand::Reverse, Strand::Reverse) => Strand::Forward,
+    };
     let shifted_variant = shifted.map(|(start, end)| {
         let ref_allele = normalized_hgvs_ref_allele(variant, shifted, reference_fasta)
             .unwrap_or_else(|| b"-".to_vec());
-        let alt_allele = normalized_hgvs_alt_allele(variant, transcript, shifted)
-            .unwrap_or_else(|| b"-".to_vec());
+        let alt_allele =
+            normalized_hgvs_alt_allele(variant, rotation, shifted).unwrap_or_else(|| b"-".to_vec());
         InputVariant::new(variant.chr.clone(), start, end, ref_allele, alt_allele)
     });
     let notation = crate::coding::perl_hgvs_protein(

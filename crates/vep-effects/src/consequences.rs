@@ -165,17 +165,22 @@ fn remove_consequence(consequences: &mut ConsequenceList, consequence: Consequen
 /// Maps the variant's start position to transcript coordinates and assigns
 /// the appropriate SO consequence terms based on where the variant falls
 /// relative to the transcript structure (UTR, coding, intron, etc.).
+///
+/// The analysis reads the alleles on the forward strand, so a reverse-strand record
+/// is analysed as [`InputVariant::to_forward_strand`].
 pub fn calculate_consequences(
     variant: &InputVariant,
     transcript: &Transcript,
     config: &EffectsConfig,
 ) -> Option<TranscriptConsequence> {
-    let mut tc = calculate_terms(variant, transcript, config)?;
+    let forward = variant.to_forward_strand();
+    let analysed = forward.as_ref().unwrap_or(variant);
+    let mut tc = calculate_terms(analysed, variant.strand, transcript, config)?;
     // The display columns follow VEP's rendering path, kept apart from the
     // analysis that produced the terms.
     crate::display::apply_display_fields(
         &mut tc,
-        variant,
+        analysed,
         transcript,
         config.compute_exon_intron_numbers,
     );
@@ -203,9 +208,12 @@ fn append_translation_version(tc: &mut TranscriptConsequence, transcript: &Trans
     }
 }
 
-/// Consequence terms and the fields the analysis derives alongside them.
+/// Consequence terms and the fields the analysis derives alongside them, for a
+/// `variant` whose alleles are on the forward strand and which its input record
+/// wrote on `input_strand`.
 fn calculate_terms(
     variant: &InputVariant,
+    input_strand: vep_core::coordinate::Strand,
     transcript: &Transcript,
     config: &EffectsConfig,
 ) -> Option<TranscriptConsequence> {
@@ -557,7 +565,12 @@ fn calculate_terms(
     // HGVS strings are consumed solely by the output layer, so they are built
     // only when `compute_hgvs` is set.
     let hgvs = if config.compute_hgvs {
-        crate::hgvs::generate_hgvs(variant, transcript, config.reference_fasta.as_deref())
+        crate::hgvs::generate_hgvs(
+            variant,
+            input_strand,
+            transcript,
+            config.reference_fasta.as_deref(),
+        )
     } else {
         crate::hgvs::HgvsNotation::default()
     };

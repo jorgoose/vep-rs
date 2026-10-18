@@ -12,6 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The documentation site opens on a landing page and holds six sections of short pages, with every old page anchor redirecting to its new page. (#65)
 - The README is shortened to what vep-rs is, why, installation, quick start and a map of the site; its generated release sections are unchanged. (#65)
 
+### Fixed
+
+- Reverse-strand (`-1`) Ensembl-format and region input is annotated on its forward-strand alleles: consequences, codons, HGVS, plugin allele matching and VCF REF/ALT follow Ensembl VEP 116.2.
 ## [0.4.0] - 2026-10-16
 
 ### Added

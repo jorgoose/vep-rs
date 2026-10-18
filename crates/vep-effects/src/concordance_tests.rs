@@ -2209,7 +2209,7 @@ fn concordance_hgvsc_perl_shifted_insertion_reports_the_offset() {
     let (_dir, fasta) = hgvsc_fasta_fixture(&[(211, b'G'), (212, b'G')]);
 
     let variant = InputVariant::new("1".into(), 211, 210, b"-".to_vec(), b"G".to_vec());
-    let hgvs = generate_hgvs(&variant, &tx, Some(&fasta));
+    let hgvs = generate_hgvs(&variant, Strand::Forward, &tx, Some(&fasta));
     assert_eq!(hgvs.hgvsc.as_deref(), Some("ENST00000000001.1:c.63dup"));
     assert_eq!(hgvs.offset, Some(2));
 }
@@ -2224,13 +2224,13 @@ fn concordance_hgvsc_perl_shifted_deletion_reports_the_offset() {
     let (_dir, fasta) = hgvsc_fasta_fixture(&[(210, b'G'), (211, b'G'), (212, b'G')]);
 
     let variant = InputVariant::new("1".into(), 210, 211, b"GG".to_vec(), b"-".to_vec());
-    let hgvs = generate_hgvs(&variant, &tx, Some(&fasta));
+    let hgvs = generate_hgvs(&variant, Strand::Forward, &tx, Some(&fasta));
     assert_eq!(hgvs.hgvsc.as_deref(), Some("ENST00000000001.1:c.62_63del"));
     assert_eq!(hgvs.offset, Some(1));
 
     // No matching base after the deletion: it stays put and no offset is emitted.
     let (_dir, fasta) = hgvsc_fasta_fixture(&[(210, b'G'), (211, b'G')]);
-    let hgvs = generate_hgvs(&variant, &tx, Some(&fasta));
+    let hgvs = generate_hgvs(&variant, Strand::Forward, &tx, Some(&fasta));
     assert_eq!(hgvs.hgvsc.as_deref(), Some("ENST00000000001.1:c.61_62del"));
     assert_eq!(hgvs.offset, None);
 }
@@ -2247,7 +2247,7 @@ fn concordance_hgvsc_perl_reverse_strand_shift_has_negative_offset() {
     let (_dir, fasta) = hgvsc_fasta_fixture(&[(5989, b'C'), (5990, b'C')]);
 
     let variant = InputVariant::new("1".into(), 5991, 5990, b"-".to_vec(), b"C".to_vec());
-    let hgvs = generate_hgvs(&variant, &tx, Some(&fasta));
+    let hgvs = generate_hgvs(&variant, Strand::Forward, &tx, Some(&fasta));
     assert_eq!(hgvs.hgvsc.as_deref(), Some("ENST00000000001.1:c.62dup"));
     assert_eq!(hgvs.offset, Some(-2));
 }
