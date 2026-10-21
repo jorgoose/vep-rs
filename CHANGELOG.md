@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- The container image distrusts the two compromised eMudhra CA roots until Debian trixie ships the fixed ca-certificates, so cache downloads cannot be intercepted through a forged certificate.
+- The container image distrusts the two compromised eMudhra CA roots until Debian trixie ships the fixed ca-certificates, so cache downloads cannot be intercepted through a forged certificate. (#70)
 
 ## [0.4.0] - 2026-10-16
 
