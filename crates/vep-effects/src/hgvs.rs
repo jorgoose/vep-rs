@@ -473,7 +473,8 @@ pub struct HgvsNotation {
 }
 
 /// HGVSc, HGVSp and the shift offset for a variant-transcript pair, the indel
-/// shift computed once for both notations.
+/// shift computed once for both notations. The alleles are read on the forward
+/// strand ([`InputVariant::to_forward_strand`]).
 pub fn generate_hgvs(
     variant: &InputVariant,
     transcript: &Transcript,

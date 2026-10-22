@@ -1552,13 +1552,31 @@ fn reverse_strand_ensembl_lines_follow_ensembl_vep() {
     );
 }
 
-/// HGVS of strand -1 Ensembl-format lines on APP (ENST00000346798, strand -1) as
-/// Ensembl VEP 116.2 writes it with the GRCh38 FASTA, of which the test keeps
-/// 21:26021751-26022050. The insertion `-/CTT -1` is the same insertion as its
-/// strand 1 twin `-/AAG` and is annotated as the twin is. Ensembl VEP writes
-/// `p.Ala242_Asp243insLeu` for the `-1` line: `shift_feature_seqs`
-/// (TranscriptVariationAllele.pm:1330) rotates the allele as the line writes it, so
-/// its HGVSp depends on the strand the line is written on. Both lines insert Ser.
+/// A FASTA of chromosome 21 in `dir` holding `window` from `start` and `N` elsewhere,
+/// with its `.fai`.
+fn chr21_window_fasta(dir: &std::path::Path, start: usize, window: &[u8]) -> std::path::PathBuf {
+    let fasta = dir.join("21.fa");
+    let mut sequence = vec![b'N'; start - 1];
+    sequence.extend_from_slice(window);
+    let mut contents = b">21\n".to_vec();
+    contents.extend_from_slice(&sequence);
+    contents.push(b'\n');
+    std::fs::write(&fasta, contents).unwrap();
+    let len = sequence.len();
+    std::fs::write(
+        dir.join("21.fa.fai"),
+        format!("21\t{len}\t4\t{len}\t{}\n", len + 1),
+    )
+    .unwrap();
+    fasta
+}
+
+/// HGVS of strand -1 Ensembl-format lines on APP (ENST00000346798, strand -1) with the
+/// GRCh38 FASTA, of which the test keeps 21:26021751-26022050. Every row is Ensembl VEP
+/// 116.2's but the HGVSp of the insertion `-/CTT -1`, the same insertion as its strand 1
+/// twin `-/AAG`: both insert Ser, and Ensembl VEP writes `p.Ala242_Asp243insLeu` for the
+/// `-1` line because `shift_feature_seqs` (TranscriptVariationAllele.pm:1330) rotates the
+/// allele as the line writes it.
 #[test]
 fn reverse_strand_ensembl_hgvs_matches_the_forward_twin() {
     const WINDOW_START: usize = 26_021_751;
@@ -1566,19 +1584,7 @@ fn reverse_strand_ensembl_hgvs_matches_the_forward_twin() {
 TCTTCCACAGACTCTGTGGTGGTGGTGGTGGTGGTGGCAATGCTGGTGGTTCTCTCTGTGGCTTCTTCGTAGGGTTCCTCAGCCTCTTCCTCTACCTCAT\
 CACCATCCTCATCGTCCTCGTCATCATCGGCTTCTTCTTCTTCCACCTCAGCCACTTCTTCCTCCTCTGCTACTTCTACTACTTTGTCTTCACTGTGAAG";
     let dir = tempfile::tempdir().unwrap();
-    let fasta = dir.path().join("21.fa");
-    let mut sequence = vec![b'N'; WINDOW_START - 1];
-    sequence.extend_from_slice(WINDOW);
-    let mut contents = b">21\n".to_vec();
-    contents.extend_from_slice(&sequence);
-    contents.push(b'\n');
-    std::fs::write(&fasta, contents).unwrap();
-    let len = sequence.len();
-    std::fs::write(
-        dir.path().join("21.fa.fai"),
-        format!("21\t{len}\t4\t{len}\t{}\n", len + 1),
-    )
-    .unwrap();
+    let fasta = chr21_window_fasta(dir.path(), WINDOW_START, WINDOW);
 
     let lines = "21\t26021896\t26021896\tG/A\t-1\tcv1915683\n\
                  21\t26021943\t26021943\tT/C\t-1\tcv721913\n\
@@ -1596,6 +1602,37 @@ CACCATCCTCATCGTCCTCGTCATCATCGGCTTCTTCTTCTTCCACCTCAGCCACTTCTTCCTCCTCTGCTACTTCTACT
             "cv664060\t21:26021866-26021871\t-\tENSG00000142192\tENST00000346798\tTranscript\tinframe_deletion\t984-989\t834-839\t278-280\tTTT/T\tacCACCACa/aca\t-\tIMPACT=MODERATE;STRAND=-1;HGVSc=ENST00000346798.8:c.834_839del;HGVSp=ENSP00000284981.4:p.Thr279_Thr280del",
             "cv2041960\t21:26021980-26021981\tCTT\tENSG00000142192\tENST00000346798\tTranscript\tinframe_insertion\t874-875\t724-725\t242\tA/AS\tgcc/gCTTcc\t-\tIMPACT=MODERATE;STRAND=-1;HGVSc=ENST00000346798.8:c.725_726insTTC;HGVSp=ENSP00000284981.4:p.Ala242_Asp243insSer;HGVS_OFFSET=-1",
             "cv2041960_fwd\t21:26021980-26021981\tAAG\tENSG00000142192\tENST00000346798\tTranscript\tinframe_insertion\t874-875\t724-725\t242\tA/AS\tgcc/gCTTcc\t-\tIMPACT=MODERATE;STRAND=-1;HGVSc=ENST00000346798.8:c.725_726insTTC;HGVSp=ENSP00000284981.4:p.Ala242_Asp243insSer;HGVS_OFFSET=-1",
+        ]
+    );
+}
+
+/// An insertion on a reverse-strand transcript shifted further than its length keeps
+/// the protein it makes. `-/TCT` between 21:25891759 and 25891760 adds a fourth Lys to
+/// APP's Lys724-Lys726 (ENST00000346798, strand -1; `c.2175_2177dup`, `K/KK`,
+/// HGVS_OFFSET -4), on either strand. Ensembl VEP 116.2 writes the other columns as here
+/// and `p.Lys726_Gln727insGlu` for both lines: `shift_feature_seqs`
+/// (TranscriptVariationAllele.pm:1338) rotates a reverse-strand transcript's allele by
+/// its length less the shift, which is no rotation once the shift is longer. The test
+/// keeps 21:25891610-25891909 of the GRCh38 FASTA.
+#[test]
+fn reverse_transcript_insertion_shifted_past_its_length_keeps_its_protein() {
+    const WINDOW_START: usize = 25_891_610;
+    const WINDOW: &[u8] = b"ACACTGATTCGTTTTTTAAAAGAGATACTTAGCTAGTTCTTAGCAAAAAGCTAAGCCTAATTCTCTCATAGTCTTAATTCCCACTTGGAAACATGCAGTC\
+AAGTTTACCTACCTCCACCACACCATGATGAATGGATGTGTACTGTTTCTTCTTCAGCATCACCAAGGTGATGACGATCACTGTCGCTATGACAACACCG\
+CCCACCATGAGTCCAATGATTGCACCTTTGTTTGAACCCACATCTTCTGCAAAGAACACCTTGAAAACAAATTAAGAAAAAGAATTTTAATTTCTAAATG";
+    let dir = tempfile::tempdir().unwrap();
+    let fasta = chr21_window_fasta(dir.path(), WINDOW_START, WINDOW);
+
+    let lines = "21\t25891760\t25891759\t-/TCT\t1\tlys_fwd\n\
+                 21\t25891760\t25891759\t-/AGA\t-1\tlys_rev\n";
+    let rows = annotate_ensembl(lines, &["--hgvs", "--fasta", fasta.to_str().unwrap()]);
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.contains("ENST00000346798"))
+            .collect::<Vec<_>>(),
+        [
+            "lys_fwd\t21:25891759-25891760\tTCT\tENSG00000142192\tENST00000346798\tTranscript\tinframe_insertion\t2323-2324\t2173-2174\t725\tK/KK\taag/aAGAag\t-\tIMPACT=MODERATE;STRAND=-1;HGVSc=ENST00000346798.8:c.2175_2177dup;HGVSp=ENSP00000284981.4:p.Lys726dup;HGVS_OFFSET=-4",
+            "lys_rev\t21:25891759-25891760\tAGA\tENSG00000142192\tENST00000346798\tTranscript\tinframe_insertion\t2323-2324\t2173-2174\t725\tK/KK\taag/aAGAag\t-\tIMPACT=MODERATE;STRAND=-1;HGVSc=ENST00000346798.8:c.2175_2177dup;HGVSp=ENSP00000284981.4:p.Lys726dup;HGVS_OFFSET=-4",
         ]
     );
 }

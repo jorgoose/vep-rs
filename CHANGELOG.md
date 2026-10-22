@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Reverse-strand (`-1`) Ensembl-format and region input is annotated on its forward-strand alleles, as in Ensembl VEP 116.2: consequences, HGVSc, HGVSp, plugin allele matching and `--vcf` REF/ALT. (#64)
+- Reverse-strand (`-1`) Ensembl-format and region input is annotated on its forward-strand alleles, as its strand 1 twin is: consequences, HGVSc, HGVSp, plugin allele matching and `--vcf` REF/ALT. (#64)
 
 ## [0.4.0] - 2026-10-16
 
