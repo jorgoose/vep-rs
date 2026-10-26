@@ -1,20 +1,20 @@
 # Coming from Ensembl VEP
 
-This page is for a reader who runs Ensembl VEP today and wants to know what changes when the same command line runs on vep-rs.
+This page is for a reader who runs Ensembl VEP and wants to know what changes when the same command line runs on vep-rs.
 
 ## What stays the same
 
-vep-rs takes the same input files and flag names as Ensembl VEP and writes the same output layouts. The consequence terms are Ensembl VEP's own Sequence Ontology vocabulary. The VEP default, `--vcf`, `--json` and `--tab` outputs match Ensembl VEP's layouts. vep-rs adds `--parquet`.
+vep-rs takes the same input files and flag names as Ensembl VEP and writes the same output layouts. The consequence terms are Ensembl VEP's own Sequence Ontology vocabulary. The VEP default, `--vcf`, `--json` and `--tab` outputs match Ensembl VEP's layouts. vep-rs adds `--output_format parquet`.
 
-`--plugin <Name>,<params>` and `--dir_plugins` keep their roles. A plugin name resolves to one of the built-in plugins first, and otherwise to a dynamic library in `--dir_plugins`. `--fasta` takes an uncompressed, `faidx`-indexed genome and gives `--hgvs` the reference context for the 3' shifting of indels.
+`--plugin <Name>,<params>` and `--dir_plugins` keep their roles. A plugin name resolves to one of the built-in plugins first, and otherwise to a dynamic library in `--dir_plugins`. `--fasta` takes a `samtools faidx`-indexed genome, plain or compressed with `bgzip` (Ensembl's `dna_index` files), and gives `--hgvs` the reference context for the 3' shifting of indels; `--hgvs` without a FASTA is refused, as Ensembl VEP refuses it offline.
 
 ## What differs
 
-**The transcript cache.** `--json_cache` names a directory built by `vep-cache-builder` or converted from an Ensembl VEP cache ([Cache setup](../cache-setup.md)). `--cache`, `--offline`, `--dir_cache`, `--cache_version` and `--species` are accepted but do not locate a cache, and vep-rs never contacts a database. `--database`, `--host`, `--port`, `--user` and `--password` do not exist and are rejected as unknown flags. The transcript set is the cache's contents, so `--refseq`, `--merged` and `--gencode_basic` select nothing.
+**The transcript cache.** The cache is a directory built by `vep-cache-builder` or converted from an Ensembl VEP cache ([Cache setup](../cache-setup.md)). It is found under `--dir_cache`, `--species` and `--cache_version` in Ensembl VEP's `<dir_cache>/<species>/<version>_<assembly>` layout, or named directly with `--json_cache`; a run with no cache stops with an error, and vep-rs never contacts a database. `--cache` and `--offline` are accepted: vep-rs always annotates from the local cache, and a directory given to `--cache` is the cache root when `--dir_cache` is absent. `--refseq` and `--merged` select the `_refseq` or `_merged` species directory. `--refseq` also resolves an HGVS gene name among RefSeq transcripts first, under `--json_cache` too, where `--merged` changes nothing. `--gencode_basic` drops every transcript without the `gencode_basic` attribute as the cache loads.
 
-**Flags accepted without effect, and flags refused.** Some Ensembl VEP flags are accepted but change nothing, among them `--regulatory`, `--custom`, `--coding_only`, `--pick_order`, `--domains`, `--mirna` and the statistics flags, so no summary file and no regulatory, custom or domain annotation is written. Three flags, `--regulatory_gff`, `--extended_promoters` and `--custom_suppress_filter`, are refused with an error that says what each would do, and [Compatibility with Ensembl VEP](../cli/compatibility.md) lists every flag in both groups.
+**Flags accepted without effect, and flags refused.** Some Ensembl VEP flags are accepted but change nothing, among them `--regulatory`, `--custom` and the statistics flags, so no summary file and no regulatory or custom annotation is written. The flags that need an Ensembl database are refused with an error that says what each would do: `--database`, `--host`, `--port`, `--user`, `--password`, `--registry`, `--db_version`, `--genomes`, `--is_multispecies`, `--lrg` and `--ambiguous_hgvs`. So are `--regulatory_gff`, `--extended_promoters` and `--custom_suppress_filter`, which belong to regulatory and custom annotation, and `--gp`, `--convert` and `--af_exac`. [Compatibility with Ensembl VEP](../cli/compatibility.md) lists every flag in both groups.
 
-**Consequence terms and input formats.** The six regulatory-feature consequence terms are never assigned, because no regulatory-feature cache is loaded. `--format` takes `vcf`, `ensembl`, `hgvs`, `region` and `guess`. HGVS input is genomic (`:g.`) only, and the `id`, `spdi` and `caid` formats are not read.
+**Consequence terms and input formats.** The six regulatory-feature consequence terms are never assigned, because no regulatory-feature cache is loaded. `--format` takes `ensembl`, `vcf`, `hgvs`, `id`, `spdi`, `region` and `guess`; `guess` detects the format from the first data line, as Ensembl VEP does. HGVS input in genomic (`g.`, `m.`), transcript (`c.`, `n.`) or protein (`p.`) notation resolves against `--fasta` and the transcript cache, and a region or SPDI input needs `--fasta` too. An identifier list resolves each name against the cache's variation files, so a cache without them refuses the format; CAid input is refused, as Ensembl VEP refuses it offline.
 
 **Where the outputs differ.** Each case where the two engines' outputs are known to differ is traced to the mechanism in Ensembl VEP's source and reproducible from the record; the [Intended divergences](../intended-divergences.md) pages list them all.
 
@@ -32,14 +32,14 @@ vep-cache-builder \
   --output-dir $HOME/.vep/json_cache/homo_sapiens/116_GRCh38
 ```
 
-**2. Your Ensembl VEP command.** As it runs today, for example:
+**2. Your Ensembl VEP command.** As it runs, for example:
 
 ```bash
 vep --cache --offline --dir_cache $HOME/.vep --assembly GRCh38 \
   -i input.vcf -o output.txt
 ```
 
-**3. The same command on vep-rs.** With `--json_cache` added; the other flags stay and are accepted:
+**3. The same command on vep-rs.** A cache built or converted into Ensembl VEP's own layout, `$HOME/.vep/homo_sapiens/116_GRCh38`, is found by `--dir_cache`, `--species` and `--cache_version`, and the command runs unchanged. A cache elsewhere, such as the one step 1 builds, is named with `--json_cache`; the other flags stay and are accepted:
 
 ```bash
 vep --cache --offline --dir_cache $HOME/.vep --assembly GRCh38 \
@@ -47,4 +47,4 @@ vep --cache --offline --dir_cache $HOME/.vep --assembly GRCh38 \
   -i input.vcf -o output.txt
 ```
 
-`--json_cache` names the directory holding `info.json` and `transcripts/`, so `116_GRCh38` itself and not its parent; [Cache setup](../cache-setup.md) covers the GRCh37 command, variation data and the SIFT and PolyPhen matrices.
+`--json_cache` names the directory holding `info.json` and `transcripts/`, so `116_GRCh38` itself and not its parent; [Cache setup](../cache-setup.md) covers the GRCh37 command and variation data, and [SIFT and PolyPhen predictions](../cache-predictions.md) covers the matrices.

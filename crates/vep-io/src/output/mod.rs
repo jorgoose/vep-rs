@@ -4,6 +4,7 @@
 //! Output formatters for VEP results.
 
 pub mod fields;
+pub mod frequency;
 pub mod json;
 pub mod parquet;
 pub mod tab;
@@ -34,6 +35,17 @@ pub trait OutputFormatter: Send {
             lines.extend(self.format_variant(variant)?);
         }
         Ok(lines)
+    }
+
+    /// [`Self::format_record`] as bytes, for a format that writes input bytes
+    /// back and so must carry a line that is not UTF-8 as it was read. The
+    /// default is the text lines' bytes.
+    fn format_record_bytes(&self, record: &[&InputVariant]) -> Result<Vec<Vec<u8>>, IoError> {
+        Ok(self
+            .format_record(record)?
+            .into_iter()
+            .map(String::into_bytes)
+            .collect())
     }
 
     /// Write any footer/closing content to the output.

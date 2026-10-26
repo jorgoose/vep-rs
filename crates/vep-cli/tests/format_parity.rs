@@ -2,12 +2,13 @@
 // Licensed under the Apache License, Version 2.0 (see LICENSE).
 
 //! Format-parity tests: the `--tab`, `--vcf` and `--json` outputs (and the
-//! Parquet output when the DuckDB CLI is installed) on each golden corpus are
-//! compared with the Ensembl VEP files committed beside it. Header lines VEP
-//! fills with run-specific values (time, paths, command line, Perl API
-//! component versions) compare by shape; every other header line and every data
-//! value compares exactly, except the consequence keys the corpus manifest
-//! documents as divergent.
+//! Parquet output when the DuckDB CLI is installed) on each golden corpus, and
+//! on each `flag_sets` run of its manifest that names the format, are compared
+//! with the Ensembl VEP files committed beside it. Header lines VEP fills with
+//! run-specific values (time, paths, command line, Perl API component versions)
+//! compare by shape; every other header line and every data value compares
+//! exactly, except the consequence keys the corpus manifest documents as
+//! divergent. The Parquet round trip runs on the manifest's own run alone.
 
 mod common;
 
@@ -15,15 +16,15 @@ use std::path::Path;
 use std::process::Command;
 
 use common::{
-    compare_entries, compare_tab_headers, compare_vcf_headers, corpora, input_records, parse_json,
-    parse_tab, parse_vcf, read_expected, run_vep, vep_command, Corpus, Documented,
+    compare_run, corpora, default_run, parse_tab, parse_vcf, run_output, run_vep, runs,
+    vep_command, Run,
 };
 
-fn check(corpus: &Corpus, label: &str, header: String, body: String, failures: &mut Vec<String>) {
+fn check(run: &Run, label: &str, header: String, body: String, failures: &mut Vec<String>) {
     if !header.is_empty() || !body.is_empty() {
         failures.push(format!(
-            "== corpus {}/{} ({label})\n{header}{body}",
-            corpus.release, corpus.name
+            "== corpus {} ({label})\n{header}{body}",
+            run.label()
         ));
     }
 }
@@ -33,16 +34,10 @@ fn tab_output_matches_vep_on_every_corpus() {
     let tmp = tempfile::tempdir().unwrap();
     let mut failures = Vec::new();
     for corpus in &corpora() {
-        let expected = read_expected(&corpus.dir, "tab.txt");
-        let actual = run_vep(corpus, "tab", tmp.path(), &[]);
-        let documented = Documented::from_manifest(&corpus.manifest);
-        check(
-            corpus,
-            "--tab",
-            compare_tab_headers(&expected, &actual),
-            compare_entries(&parse_tab(&expected), &parse_tab(&actual), &documented),
-            &mut failures,
-        );
+        for run in runs(corpus).iter().filter(|r| r.compares("tab")) {
+            let (header, body) = compare_run(run, "tab", tmp.path());
+            check(run, "--tab", header, body, &mut failures);
+        }
     }
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
@@ -52,21 +47,10 @@ fn vcf_output_matches_vep_on_every_corpus() {
     let tmp = tempfile::tempdir().unwrap();
     let mut failures = Vec::new();
     for corpus in &corpora() {
-        let expected = read_expected(&corpus.dir, "vcf.vcf");
-        let actual = run_vep(corpus, "vcf", tmp.path(), &[]);
-        let documented = Documented::from_manifest(&corpus.manifest);
-        let inputs = input_records(corpus);
-        check(
-            corpus,
-            "--vcf",
-            compare_vcf_headers(&expected, &actual),
-            compare_entries(
-                &parse_vcf(&expected, &inputs),
-                &parse_vcf(&actual, &inputs),
-                &documented,
-            ),
-            &mut failures,
-        );
+        for run in runs(corpus).iter().filter(|r| r.compares("vcf")) {
+            let (header, body) = compare_run(run, "vcf", tmp.path());
+            check(run, "--vcf", header, body, &mut failures);
+        }
     }
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
@@ -76,23 +60,134 @@ fn json_output_matches_vep_on_every_corpus() {
     let tmp = tempfile::tempdir().unwrap();
     let mut failures = Vec::new();
     for corpus in &corpora() {
-        let expected = read_expected(&corpus.dir, "json.jsonl");
-        let actual = run_vep(corpus, "json", tmp.path(), &[]);
-        let documented = Documented::from_manifest(&corpus.manifest);
-        let inputs = input_records(corpus);
-        check(
-            corpus,
-            "--json",
-            String::new(),
-            compare_entries(
-                &parse_json(&expected, &inputs),
-                &parse_json(&actual, &inputs),
-                &documented,
-            ),
-            &mut failures,
-        );
+        for run in runs(corpus).iter().filter(|r| r.compares("json")) {
+            let (header, body) = compare_run(run, "json", tmp.path());
+            check(run, "--json", header, body, &mut failures);
+        }
     }
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+/// Ensembl VEP lists `OverlapBP` and `OverlapPC` as the fields `--overlaps` adds
+/// (`Constants.pm` 131), last among the flag fields of the tab columns and of the
+/// VCF CSQ fields (after `FLAGS`, and after the `SYMBOL_SOURCE` and `HGNC_ID` that
+/// `--vcf` switches on), and fills them on every structural variant row except a
+/// breakpoint's, when the overlap is positive, with the overlap length and
+/// `sprintf("%.2f")` of the percentage of the feature it covers (`OutputFactory.pm`
+/// 2087-2094). On the GRCh38 corpus the 272-base deletion
+/// `gnomAD-SV_v3_DEL_chr21_9b2929e7` (21:13610236-13610507) against ENST00000299443
+/// carries 272 and 0.75 and against ENST00000620442 272 and 1.73, the values Ensembl
+/// VEP 116.2 writes for those rows; the breakend `synth_bnd_inter_0055_A` carries
+/// neither (`-` in tab, empty in VCF). Without the flag neither format names the
+/// two fields.
+#[test]
+fn overlaps_adds_overlapbp_overlappc_columns_to_tab_and_vcf() {
+    let tmp = tempfile::tempdir().unwrap();
+    let corpora = corpora();
+    let corpus = corpora
+        .iter()
+        .find(|c| c.release == "116" && c.name == "GRCh38")
+        .expect("the 116/GRCh38 corpus");
+    let run = default_run(corpus);
+    let deletion_id = "gnomAD-SV_v3_DEL_chr21_9b2929e7";
+    let breakend_id = "synth_bnd_inter_0055_A";
+    let column_line = |tab: &str| {
+        tab.lines()
+            .find(|l| l.starts_with("#Uploaded_variation"))
+            .unwrap()
+            .to_string()
+    };
+    let csq_format = |vcf: &str| {
+        vcf.lines()
+            .find(|l| l.starts_with("##INFO=<ID=CSQ"))
+            .unwrap()
+            .to_string()
+    };
+
+    let tab = run_vep(&run, "tab", tmp.path(), &[]);
+    assert!(column_line(&tab).ends_with("\tFLAGS"));
+    assert!(!tab.contains("OverlapBP"));
+    let vcf = run_vep(&run, "vcf", tmp.path(), &[]);
+    assert!(csq_format(&vcf).ends_with("|FLAGS|SYMBOL_SOURCE|HGNC_ID\">"));
+    assert!(!vcf.contains("OverlapBP"));
+
+    let tab = run_vep(&run, "tab", tmp.path(), &["--overlaps"]);
+    assert!(column_line(&tab).ends_with("\tFLAGS\tOverlapBP\tOverlapPC"));
+    let rows = parse_tab(&tab);
+    let tab_values = |id: &str, feature: &str| {
+        let row = rows
+            .iter()
+            .find(|e| e.fields["Uploaded_variation"] == id && e.feature == feature)
+            .unwrap_or_else(|| panic!("tab row {id} x {feature}"));
+        (
+            row.fields["OverlapBP"].as_str(),
+            row.fields["OverlapPC"].as_str(),
+        )
+    };
+    assert_eq!(tab_values(deletion_id, "ENST00000299443"), ("272", "0.75"));
+    assert_eq!(tab_values(deletion_id, "ENST00000620442"), ("272", "1.73"));
+    assert_eq!(tab_values(breakend_id, "ENST00000374832"), ("-", "-"));
+
+    let vcf = run_vep(&run, "vcf", tmp.path(), &["--overlaps"]);
+    assert!(csq_format(&vcf).ends_with("|FLAGS|SYMBOL_SOURCE|HGNC_ID|OverlapBP|OverlapPC\">"));
+    let inputs = run.input_records();
+    let entries = parse_vcf(&vcf, &inputs);
+    let csq_values = |id: &str, feature: &str| {
+        let id_column = format!("\t{id}\t");
+        let record = inputs
+            .iter()
+            .position(|l| l.contains(&id_column))
+            .unwrap_or_else(|| panic!("input record {id}"));
+        let entry = entries
+            .iter()
+            .find(|e| e.record == Some(record) && e.feature == feature)
+            .unwrap_or_else(|| panic!("CSQ entry of record {record} x {feature}"));
+        (
+            entry.fields["OverlapBP"].as_str(),
+            entry.fields["OverlapPC"].as_str(),
+        )
+    };
+    assert_eq!(csq_values(deletion_id, "ENST00000299443"), ("272", "0.75"));
+    assert_eq!(csq_values(deletion_id, "ENST00000620442"), ("272", "1.73"));
+    assert_eq!(csq_values(breakend_id, "ENST00000374832"), ("", ""));
+
+    // The flat Parquet output takes the tab columns, so it gains the two under the flag.
+    if !duckdb_available() {
+        eprintln!("skipping the Parquet half: duckdb CLI not installed");
+        return;
+    }
+    let write_parquet = |flags: &[&str], dir: &str| {
+        let parquet_dir = tmp.path().join(dir);
+        let mut cmd = vep_command(&run, tmp.path());
+        cmd.arg("-o")
+            .arg(&parquet_dir)
+            .args(["--output_format", "parquet", "--parquet_shape", "flat"])
+            .args(flags);
+        let out = run_output(&run, &mut cmd);
+        assert!(
+            out.status.success(),
+            "vep --output_format parquet {flags:?} failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        format!("{}/**/*.parquet", parquet_dir.display()).replace('\'', "''")
+    };
+    let overlap_columns = |glob: &str| {
+        duckdb_csv(&format!(
+            "SELECT count(*) FROM (DESCRIBE SELECT * FROM read_parquet('{glob}')) \
+             WHERE column_name IN ('OverlapBP', 'OverlapPC')"
+        ))
+        .trim()
+        .to_string()
+    };
+    let plain_glob = write_parquet(&[], "plain.parquet");
+    assert_eq!(overlap_columns(&plain_glob), "0");
+    let overlaps_glob = write_parquet(&["--overlaps"], "overlaps.parquet");
+    assert_eq!(overlap_columns(&overlaps_glob), "2");
+    let values = duckdb_csv(&format!(
+        "SELECT OverlapBP, OverlapPC FROM read_parquet('{overlaps_glob}') \
+         WHERE Uploaded_variation = '{deletion_id}' AND Feature = 'ENST00000299443'"
+    ));
+    assert_eq!(values.trim(), "272,0.75");
 }
 
 fn duckdb_available() -> bool {
@@ -118,7 +213,8 @@ fn parquet_round_trips_to_the_tab_output() {
     let tmp = tempfile::tempdir().unwrap();
     let mut failures = Vec::new();
     for corpus in &corpora() {
-        let tab = run_vep(corpus, "tab", tmp.path(), &[]);
+        let run = default_run(corpus);
+        let tab = run_vep(&run, "tab", tmp.path(), &[]);
         let mut expected_rows: Vec<&str> = tab.lines().filter(|l| !l.starts_with("##")).collect();
         expected_rows.sort_unstable();
         for shape in ["flat", "nested"] {
@@ -126,14 +222,14 @@ fn parquet_round_trips_to_the_tab_output() {
                 "{}_{}_{shape}.parquet",
                 corpus.release, corpus.name
             ));
-            let mut cmd = vep_command(corpus, tmp.path());
+            let mut cmd = vep_command(&run, tmp.path());
             cmd.arg("-o").arg(&parquet_dir).args([
                 "--output_format",
                 "parquet",
                 "--parquet_shape",
                 shape,
             ]);
-            let out = cmd.output().unwrap();
+            let out = run_output(&run, &mut cmd);
             assert!(
                 out.status.success(),
                 "vep --output_format parquet ({shape}) failed:\n{}",
@@ -196,15 +292,15 @@ fn parquet_row_groups_prune_on_bloom_filters() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let corpus = &corpora()[0];
+    let corpora = corpora();
+    let run = default_run(&corpora[0]);
     let parquet_dir = tmp.path().join("rowgroups.parquet");
-    let out = vep_command(corpus, tmp.path())
-        .arg("-o")
+    let mut cmd = vep_command(&run, tmp.path());
+    cmd.arg("-o")
         .arg(&parquet_dir)
         .args(["--output_format", "parquet", "--parquet_shape", "flat"])
-        .args(["--parquet_row_group_size", "2048"])
-        .output()
-        .unwrap();
+        .args(["--parquet_row_group_size", "2048"]);
+    let out = run_output(&run, &mut cmd);
     assert!(
         out.status.success(),
         "vep --output_format parquet failed:\n{}",

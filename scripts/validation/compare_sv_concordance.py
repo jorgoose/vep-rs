@@ -183,7 +183,7 @@ def fastvep_symbolic_allele_to_so_class(allele: str) -> str:
     The rules below are vep-rs's own typing (`vep_core::sv_routing`: `sv_so_term_and_class`
     over `sv_type_abbreviation` for a type with a Sequence Ontology term,
     `classify_symbolic_alt` for one without) followed by its display rule, so the
-    mapping is identical to what the scored vep-rs arm already writes:
+    mapping is what the scored vep-rs arm writes, the `<CPX>` row excepted:
 
         token (case-insensitive)   vep-rs VariantClass       Allele written
         -------------------------  ------------------------  --------------------------
@@ -204,7 +204,9 @@ def fastvep_symbolic_allele_to_so_class(allele: str) -> str:
         <CN2> / <CN=2>             Duplication               duplication
         <CNn> (any other n)        CopyNumberVariation       copy_number_variation
         <CNV...>, <CN...>          CopyNumberVariation       copy_number_variation
-        <CPX[:x]>                  ComplexStructural         CPX
+        <CPX[:x]>                  ComplexStructural         CPX (<CPX[:x]> as written
+                                                             without INFO/SVTYPE; both
+                                                             spellings are set aside)
 
     Left UNCHANGED, deliberately:
 
@@ -269,8 +271,10 @@ def fastvep_symbolic_allele_to_so_class(allele: str) -> str:
     if upper.startswith("<CNV") or upper.startswith("<CN"):
         return "copy_number_variation"
     if upper.startswith("<CPX"):
-        # Perl strips the angle brackets and any `:subtype`; vep-rs's
-        # ComplexStructural display rule does the same.
+        # A type with no Sequence Ontology term prints Ensembl VEP's type string: the ALT
+        # as written (`<CPX>`) or INFO/SVTYPE (`CPX`, Parser/VCF.pm:469-481). Ensembl VEP
+        # skips such a record and `record_alleles` lists both spellings to set its rows
+        # aside, so the fastVEP token maps to the bare abbreviation.
         return "CPX"
     return allele
 
@@ -787,9 +791,9 @@ def filter_cross_chromosome_divergences(
     THE DEFECT. Given a structural variant whose `CHROM` is `21` and whose `INFO/CHR2`
     reads `chr21`, Ensembl VEP r115.2 annotates it against transcripts on chromosome 22
     at numerically similar coordinates: for a 25 kb `<DEL>` at `21:23699593-23724683`,
-    VEP names 122 transcripts of which 120 resolve to chr22 by Ensembl's own id lookup
-    and only 2 to chr21. A deletion on one chromosome cannot truncate a transcript on
-    another, so those 120 are wrong output.
+    nearly every transcript VEP names resolves to chr22 by Ensembl's own id lookup. A
+    deletion on one chromosome cannot truncate a transcript on another, so those rows
+    are wrong output.
 
     IT IS NOT ASSEMBLY-SPECIFIC. The GRCh38 gnomAD SV VCF carries `CHR2=chr21` against
     an unprefixed `CHROM` while the GRCh37 file carries `CHR2=21`, and the defect fires
@@ -1012,11 +1016,12 @@ def filter_intended_divergences(
     # which always annotates the complete set for the chromosome. Without a
     # direction test the same predicate also absorbs the opposite shape, vep-rs
     # naming FEWER transcripts than Perl, which is not a Perl defect (on the 25 kb
-    # `<DEL>` at 21:23699593-23724683 in gnomAD SV, Perl names 122 transcripts and
-    # vep-rs names 2, an under-annotation this filter must not mask); masking it
-    # would convert a vep-rs coverage gap into an excluded transcript-selection
-    # divergence and inflate adjusted F1. This arm carries the same SCOPE gate as its sibling
-    # above and keys on the full location for the same identity reason.
+    # `<DEL>` at 21:23699593-23724683 in gnomAD SV, Perl names far more
+    # transcripts than vep-rs, an under-annotation this filter must not mask);
+    # masking it would convert a vep-rs coverage gap into an excluded
+    # transcript-selection divergence and inflate adjusted F1. This arm carries the
+    # same SCOPE gate as its sibling above and keys on the full location for the
+    # same identity reason.
     excluded_perl: set[AnnotTuple] = set()
     for t in perl_only:
         loc, allele, feature, _ft, _csq = t
@@ -1308,8 +1313,9 @@ _CNV_TR_SYMBOLIC_CODING_TERMS = frozenset({
 })
 # Without a FASTA the reference never expands a <CNV:TR>: every record is a symbolic
 # `tandem_repeat` over the run, a copy-number gain to `copy_number_gain`, so a loss reads
-# `feature_elongation` with the region terms where vep-rs reads the deletion of the run's
-# tail (Parser/VCF.pm:516-527, Utils/VariationEffect.pm:246-256).
+# `feature_elongation` with the region terms (Parser/VCF.pm:516-527,
+# Utils/VariationEffect.pm:246-256); vep-rs reads every symbolic `<CNV:TR>` allele as a
+# gain too.
 _CNV_TR_UNEXPANDED_TERMS = frozenset({
     "feature_elongation", "feature_truncation", "coding_sequence_variant",
     "inframe_deletion", "frameshift_variant", "inframe_insertion", "stop_lost",
@@ -1771,32 +1777,38 @@ def vep_rs_unsupported_alt_allele(alt: str, svtype: str | None) -> str:
     (`classify_symbolic_alt` with `display_allele`): the class term of the ALT's own prefix
     read without regard to case (`<del>`, `<DEL:>` and `<DEL >` are `deletion`, `<CN=X>` and
     `<CN>` `copy_number_variation`, `<Bnd>` `chromosome_breakpoint`), else the class
-    INFO/SVTYPE names, else the text inside the brackets up to the first colon with every
-    bracket removed (`<<DEL>>` is `DEL`, `<:DEL>` the empty string, `<DÉL>` `DÉL`)."""
+    INFO/SVTYPE names, else the type string Ensembl VEP keeps for the record
+    (Parser/VCF.pm:469-481): INFO/SVTYPE as written when it is set and the ALT does not open
+    with a VCF 4.4 form, else the ALT as written (`<<DEL>>`, `<:DEL>`, `<CPX:X>`)."""
     upper = alt.upper()
     for prefix, term in _VEP_RS_ALT_PREFIX_TERMS:
         if upper.startswith(prefix):
             return term
     if svtype is not None and svtype.upper() in _VEP_RS_SVTYPE_TERMS:
         return _VEP_RS_SVTYPE_TERMS[svtype.upper()]
-    return alt.strip("<>").split(":", 1)[0]
+    if perl_true(svtype) and not _VCF44_SYMBOLIC.match(alt):
+        return svtype
+    return alt
 
 
 def record_alleles(v: VcfVariant) -> set[str]:
     """Every Allele string either engine writes for a VCF record, normalised as the
     comparator normalises them: the Sequence Ontology class of each symbolic ALT and of the
     whole ALT list (`copy_number_variation` for a DEL beside a DUP), the raw abbreviation of
-    a type with no term as both engines spell it (`CPX`, `<NON_REF>`) and the class term
-    vep-rs prints for it (`vep_rs_unsupported_alt_allele`: `deletion` for `<del>`), each
-    bracket breakend string with `chr` stripped inside the brackets, the own-end strings of
-    a breakend record (`N.`, `.N`, `chromosome_breakpoint`, the REF base with the dot), the
-    mate string a `<BND>` record's CHR2/END2 give, and a sequence ALT as written."""
+    a type with no term and its bracketed spelling (`CPX`, `<CPX>`, `<NON_REF>`) and the
+    string vep-rs prints for it (`vep_rs_unsupported_alt_allele`: `deletion` for `<del>`,
+    else INFO/SVTYPE or the ALT as written), each bracket breakend string with `chr`
+    stripped inside the brackets, the own-end strings of a breakend record (`N.`, `.N`,
+    `chromosome_breakpoint`, the REF base with the dot), the mate string a `<BND>` record's
+    CHR2/END2 give, and a sequence ALT as written."""
     alleles: set[str] = set()
     info = _info_fields(v.info)
     alts = perl_split(v.alt, ",")
     svtype = info.get("SVTYPE")
     sv_type = "/".join(alts)
     whole = perl_so_abbrev(svtype if svtype and not _VCF44_SYMBOLIC.match(sv_type) else sv_type)
+    # The type string Ensembl VEP keeps for the record (Parser/VCF.pm:469-475).
+    record_type = svtype if perl_true(svtype) and not _VCF44_SYMBOLIC.match(sv_type) else sv_type
     # Under a type the table lacks, vep-rs keeps each symbolic ALT's own class, INFO/SVTYPE
     # naming the class of a mixed list (a symbolic ALT beside a sequence allele).
     mixed = any(alt.startswith("<") for alt in alts) and any(
@@ -1811,7 +1823,12 @@ def record_alleles(v: VcfVariant) -> set[str]:
                 raw = re.sub(r":.+", "", alt[1:-1])
                 alleles.update({raw, f"<{raw}>", alt})
             if whole is None:
-                alleles.add(vep_rs_unsupported_alt_allele(f"<{svtype}>" if mixed and svtype else alt, svtype))
+                own = f"<{svtype}>" if mixed and svtype else alt
+                written = vep_rs_unsupported_alt_allele(own, svtype)
+                alleles.add(written)
+                if written in (own, svtype):
+                    # An ALT with no class term prints the record's type string.
+                    alleles.add(record_type)
         elif _BRACKET_MATE_RE.search(alt):
             alleles.add(normalize_allele(alt))
             alleles |= _OWN_END_ALLELES | {f"{v.ref}.", f".{v.ref}"}
@@ -1930,8 +1947,9 @@ def skipped_record_rows(
     route 116.2 shares with 115.2 (`start > end+1`) is reported; two records at one start
     whose alleles and Locations coincide, one skipped and one kept.
 
-    The SNP/indel comparator has no input VCF and applies the output-only rule
-    (`ReferenceRecordScope`): a Location with vep-rs structural rows and no reference row.
+    The SNP/indel comparator opens the input only to recognise gVCF variant sites and
+    judges this class by the output-only rule (`ReferenceRecordScope`): a Location with
+    vep-rs structural rows and no reference row.
 
     The gVCF variant site (`gvcf_variant_site`) is its own class,
     `GVCF_VARIANT_SITE_DROPPED_BUCKET`: its record is confirmed, so it explains its Location
@@ -2293,11 +2311,12 @@ def cnv_tr_rn_zero_dropped_direction(v: VcfVariant) -> str | None:
     The real allele's bases are its RN repeat sequences' units times their counts, read
     from the start of RUS and RUC (or RB), the empty allele having consumed none. None when
     the record is not that shape, or when the dropped allele's rows cannot be told apart: a
-    real allele that is a loss shares its direction term with the `RN=0` allele's rows; an
-    unchanged real allele is read as a gain by vep-rs (crates/vep-effects/src/sv/mod.rs takes
-    the deletion path only below the run's length) and is the dropped allele when the empty
-    part leads, while with the empty part trailing the reference writes nothing for the
-    record (`cnv_tr_expansion_is_empty`)."""
+    real allele that is a loss shares its direction term with the `RN=0` allele's rows (vep-rs
+    reads every symbolic `<CNV:TR>` allele as a gain, so the shared term is
+    `feature_elongation` and the `feature_truncation` of a trailing `RN=0` names no row of a
+    current run); an unchanged real allele is read as a gain by vep-rs and is the dropped
+    allele when the empty part leads, while with the empty part trailing the reference writes
+    nothing for the record (`cnv_tr_expansion_is_empty`)."""
     if perl_split(v.alt.upper(), ",") != ["<CNV:TR>", "<CNV:TR>"]:
         return None
     rus, ruc, rb, rn = (_info_written(v.info, key) for key in ("RUS", "RUC", "RB", "RN"))
@@ -2328,28 +2347,66 @@ def cnv_tr_rn_zero_dropped_direction(v: VcfVariant) -> str | None:
 def filter_cnv_tr_rn_zero_allele_dropped(
     perl_tuples: set[AnnotTuple], rust_tuples: set[AnnotTuple], input_variants: list[VcfVariant]
 ) -> set[AnnotTuple]:
-    """vep-rs's `tandem_repeat` tuples of the allele the reference dropped from a two-ALT
-    `<CNV:TR>` record of which one allele has `RN=0` (`cnv_tr_rn_zero_dropped_direction`),
-    the tuples carrying the dropped allele's direction term at the run, when the reference
-    expanded the record: a row at or beside the run under an allele other than
-    `tandem_repeat`, which only a run with a FASTA writes
-    (`CNV_TR_RN_ZERO_ALLELE_DROPPED_BUCKET`). Without a FASTA both alleles are symbolic rows
-    on both sides and nothing is set aside."""
+    """vep-rs's tuples of the allele the reference dropped from a two-ALT `<CNV:TR>` record
+    of which one allele has `RN=0`, when the reference expanded the record: a row at or
+    beside the run under an allele other than `tandem_repeat`, which only a run with a FASTA
+    writes (`CNV_TR_RN_ZERO_ALLELE_DROPPED_BUCKET`). A vep-rs run without a FASTA writes the
+    dropped allele as the `tandem_repeat` tuples carrying its direction term at the run
+    (`cnv_tr_rn_zero_dropped_direction`). A run with one writes the real allele dropped
+    behind a leading `RN=0`, a gain, a loss or the run itself, as its literal reading over
+    the run: the allele's repeat sequences, each unit repeated by its count (`$seq x $num`,
+    Parser/VCF.pm:414, 419) with `.` read as `N` (`:413`), joined and upper-cased
+    (Parser.pm:554), untrimmed because vep-rs reads the record's allele string as
+    multi-allelic; behind a trailing `RN=0` both engines lose the empty allele to `split`
+    and such a run writes what the reference writes. When the reference ran without a
+    FASTA, both alleles are symbolic rows on both sides and nothing is set aside."""
+
+    def dropped_literal(v: VcfVariant) -> str | None:
+        """The real allele behind a leading `RN=0` as the parser expands it; None for a
+        record of another shape, a trailing `RN=0` included."""
+        if perl_split(v.alt.upper(), ",") != ["<CNV:TR>", "<CNV:TR>"]:
+            return None
+        rus, ruc, rb, rn = (_info_written(v.info, key) for key in ("RUS", "RUC", "RB", "RN"))
+        if not perl_true(rus) or not (perl_true(ruc) or perl_true(rb)) or not perl_true(rn):
+            return None
+        counts_rn = perl_split(rn, ",")
+        if len(counts_rn) != 2 or "." in counts_rn:
+            return None
+        empty, sequences = (int(perl_numeric_value(count)) for count in counts_rn)
+        if empty > 0 or sequences <= 0:
+            return None
+        units = ["N" if unit == "." else unit for unit in rus.split(",")[:sequences]]
+        by_ruc = perl_true(ruc)
+        counts = (ruc if by_ruc else rb).split(",")[:sequences]
+        if len(units) < sequences or len(counts) < sequences or ("" in units and not by_ruc):
+            return None
+        repeats: list[str] = []
+        for unit, count in zip(units, counts):
+            # `_repeat_bases` is the unit's length times its copies; a unit of no bases adds none.
+            if unit:
+                repeats.append(unit * (_repeat_bases(len(unit), count, by_ruc) // len(unit)))
+        return "".join(repeats).upper()
+
     excluded: set[AnnotTuple] = set()
+    rust_only = rust_tuples - perl_tuples
     expanded = [s for t in perl_tuples if t[1] != _CNV_TR_RUST_ALLELE and (s := _location_span(t[0])) is not None]
     for v in input_variants:
         dropped = cnv_tr_rn_zero_dropped_direction(v)
-        if dropped is None:
+        literal = dropped_literal(v)
+        if dropped is None and literal is None:
             continue
         chrom, start, end = record_location(v)
         if not _reference_row_beside(expanded, chrom, start, end):
             continue
         location = _span_location(chrom, start, end)
-        term = _CNV_TR_DIRECTION_TERM[dropped]
-        excluded.update(
-            t for t in rust_tuples - perl_tuples
-            if t[0] == location and t[1] == _CNV_TR_RUST_ALLELE and term in t[4].split(",")
-        )
+        term = _CNV_TR_DIRECTION_TERM.get(dropped)
+        for t in rust_only:
+            if t[0] != location:
+                continue
+            symbolic_row = term is not None and t[1] == _CNV_TR_RUST_ALLELE and term in t[4].split(",")
+            literal_row = literal is not None and t[1] == literal
+            if symbolic_row or literal_row:
+                excluded.add(t)
     return excluded
 
 
@@ -2446,11 +2503,10 @@ def filter_bnd_synonym_mate_rows(
     takes the other route: on another chromosome the overlap test resolves it
     (InputBuffer.pm 116.2:348-357, `get_source_chr_name`) and the slice test then compares
     the raw name, `chr` stripped, with the cache's (AnnotationType/Transcript.pm 116.2:134),
-    so the reference writes no mate row. vep-rs does not resolve the accession and writes
-    no mate row either, so on real output nothing is set aside; a vep-rs row under such a
-    mate off the record's own chromosome, which only a constructed input produces, is set
-    aside by the predicate below. On the record's own chromosome the reference keeps the
-    mate rows and vep-rs lacks them, a vep-rs under-annotation that stays charged.
+    so the reference writes no mate row. vep-rs resolves the accession through the synonym
+    table, as it resolves the record's own chromosome, and writes the mate rows, which the
+    predicate below sets aside. An accession on the record's own chromosome keeps the mate
+    rows in both engines.
 
     THE PREDICATE, on a Location with a bracket allele whose mate name, read as the
     reference reads it (`reference_mate_chromosome`: `chr` as written stripped, any other
@@ -3382,9 +3438,8 @@ def main() -> None:
         # The tuple key carries no source filename, so a tuple emitted from two
         # different VCFs of the same assembly collapses to one member of these
         # unions, while `total_input` (a list extend) keeps summing; an aggregate
-        # row built from both mixes two incompatible aggregations, and the
-        # cross-file duplicates move raw F1 at the sixth decimal on GRCh37 and the
-        # third on GRCh38.
+        # row built from both mixes two incompatible aggregations, and every
+        # cross-file duplicate moves its raw F1.
         #
         # The unions stay as-is because every mask predicate consumes bare 5-tuples;
         # the file-scoped counts below are what BOTH aggregate rows use, so the two

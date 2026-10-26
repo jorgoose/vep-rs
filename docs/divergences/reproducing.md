@@ -70,7 +70,7 @@ Flags that do change an outcome are named in the sections that use them:
 - `--fasta`, which the reference protocol passes, decides whether Ensembl VEP expands a `<CNV:TR>` record (classes 12, [19](defect-l.md#19-an-empty-or-unchanged-cnvtr-expansion-dropped-without-a-row) and [22](defect-o.md#22-a-real-cnvtr-allele-dropped-beside-an-rn0-allele));
 - `--distance` moves the coordinate at which class 14's turn happens ([14.6](defect-g.md#146-try-it-yourself)).
 
-Ensembl VEP's warnings are in `vep.txt_warnings.txt`; vep-rs's are on standard error.
+Both engines write their warnings to `<output>_warnings.txt` beside the output (`vep.txt_warnings.txt` for the reference runs), and vep-rs echoes each on standard error unless `--quiet`.
 
 ## The comparators
 

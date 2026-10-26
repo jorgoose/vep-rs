@@ -1,59 +1,24 @@
 # Allele frequencies and co-located variants
 
-These flags add population allele frequencies, PubMed identifiers and gene-phenotype associations to the output. All of them are switched on by `--everything`. `--check_existing`, which reports the co-located known variants themselves, is described under [Output control](output-control.md#opt_check_existing).
+These flags report the population allele frequencies, PubMed identifiers and gene-phenotype associations of co-located known variants, and filter the input by frequency. `--check_existing`, which reports the co-located variants themselves, is listed under [Output control](output-control.md); the frequency flags `--everything` switches on are listed under [option sets](../cli-reference.md#option-sets-configpm351-593).
 
-## Summary
+## Flags
 
-| Flag | Default | What it does |
-| --- | --- | --- |
-| [`--af`](#opt_af) | off | Global allele frequency from 1000 Genomes Phase 3 |
-| [`--af_1kg`](#opt_af_1kg) | off | Continental frequencies: AFR, AMR, EAS, EUR, SAS |
-| [`--af_gnomade`](#opt_af_gnomade) | off | gnomAD exome frequencies |
-| [`--af_gnomadg`](#opt_af_gnomadg) | off | gnomAD genome frequencies |
-| [`--max_af`](#opt_max_af) | off | Highest frequency across all populations |
-| [`--pubmed`](#opt_pubmed) | off | PubMed IDs for co-located variants |
-| [`--gene_phenotype`](#opt_gene_phenotype) | off | Gene-phenotype associations |
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--af` | bool | false | Add global allele frequency from 1000 Genomes Phase 3 |
+| `--af_1kg` | bool | false | Add continental allele frequencies from 1000 Genomes |
+| `--af_gnomade` | bool | false | Add gnomAD exome allele frequencies |
+| `--af_gnomad` | bool | false | Add gnomAD exome allele frequencies under the older spelling of `--af_gnomade`; the two spellings cannot be combined, and this one alone fails on a cache without gnomAD exome data |
+| `--af_gnomadg` | bool | false | Add gnomAD genome allele frequencies |
+| `--max_af` | bool | false | Add highest allele frequency across populations |
+| `--pubmed` | bool | false | Add PubMed IDs for co-located variants |
+| `--old_maf` | bool | false | Rewrite the AFR, AMR, ASN and EUR frequency values of each co-located variant as a bare minor-allele frequency: the allele is stripped, the first value kept and a value above 0.5 inverted; the allele-keyed frequency columns then find no allele in them and print empty |
+| `--check_frequency` | bool | false | Filter the input by the frequency of co-located known variants in the population `--freq_pop` names, against the threshold `--freq_freq` on the side `--freq_gt_lt` gives, dropping the alleles that pass or keeping the records whose alleles all pass as `--freq_filter` says; switches on `--check_existing` and adds the FREQS field (the frequencies the filter read, NA where an allele has none) |
+| `--freq_pop` | String | `1KG_ALL` | The population `--check_frequency` reads: 1KG\_ALL (the 1000 Genomes AF column of the cache), a frequency column of the cache in any case (AF, AFR, gnomADe\_NFE; the gnomAD genome columns are refused, as Ensembl VEP refuses them), or 1KG\_ followed by such a column |
+| `--freq_freq` | f64 | 0.01 | The frequency `--check_frequency` compares against |
+| `--freq_gt_lt` | `gt`, `lt` | `gt` | Whether an allele passes `--check_frequency` with a frequency at or above (gt) or at or below (lt) `--freq_freq` |
+| `--freq_filter` | `exclude`, `include` | `exclude` | Whether `--check_frequency` drops the alleles that pass (exclude) or keeps a record only when every allele passes (include) |
+| `--filter_common` | bool | false | Drop the alleles with a 1000 Genomes frequency of 0.01 or more: `--check_frequency` with `--freq_pop` 1KG\_ALL `--freq_freq` 0.01 `--freq_gt_lt` gt `--freq_filter` exclude |
+| `--gene_phenotype` | bool | false | Add the GENE\_PHENO column: 1 on a transcript whose gene the cache associates with a phenotype, disease or trait, empty otherwise |
 
-## Options
-
-### `--af` {#opt_af}
-
-**`--af`**, boolean, default off. Ensembl VEP: same flag and default.
-
-Adds the global allele frequency from 1000 Genomes Phase 3.
-
-### `--af_1kg` {#opt_af_1kg}
-
-**`--af_1kg`**, boolean, default off. Ensembl VEP: same flag and default.
-
-Adds the continental frequencies: AFR, AMR, EAS, EUR and SAS.
-
-### `--af_gnomade` {#opt_af_gnomade}
-
-**`--af_gnomade`**, boolean, default off. Ensembl VEP: same flag and default.
-
-Adds the gnomAD exome frequencies.
-
-### `--af_gnomadg` {#opt_af_gnomadg}
-
-**`--af_gnomadg`**, boolean, default off. Ensembl VEP: same flag and default.
-
-Adds the gnomAD genome frequencies.
-
-### `--max_af` {#opt_max_af}
-
-**`--max_af`**, boolean, default off. Ensembl VEP: same flag and default.
-
-Adds the highest frequency across all populations.
-
-### `--pubmed` {#opt_pubmed}
-
-**`--pubmed`**, boolean, default off. Ensembl VEP: same flag and default.
-
-Adds the PubMed IDs for co-located variants.
-
-### `--gene_phenotype` {#opt_gene_phenotype}
-
-**`--gene_phenotype`**, boolean, default off. Ensembl VEP: same flag and default.
-
-Adds the gene-phenotype associations.

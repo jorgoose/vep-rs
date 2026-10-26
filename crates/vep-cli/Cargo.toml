@@ -35,13 +35,13 @@ flate2 = { workspace = true }
 rayon = { workspace = true }
 rustc-hash = { workspace = true }
 bstr = { workspace = true }
-coitrees = { workspace = true }
 smallvec = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 base64 = { workspace = true }
+regex = { workspace = true }
 mimalloc = { workspace = true, optional = true }
 
 [dev-dependencies]

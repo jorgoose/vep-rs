@@ -34,11 +34,11 @@ target/release/vep-cache-builder \
   --output-dir $HOME/.vep/json_cache/homo_sapiens/116_GRCh38
 ```
 
-Or convert an existing Perl VEP cache with `scripts/data/storable_to_json.pl` ([scripts/README.md](../../scripts/README.md)).
+Or convert an existing Ensembl VEP cache with `scripts/data/storable_to_json.pl` ([scripts/README.md](../../scripts/README.md)).
 
 ## 3. Annotate
 
-Run the same VEP command you run today, with `--json_cache` naming the cache directory. That is the directory holding `info.json` and `transcripts/`, so `116_GRCh38` itself, not its parent:
+Run the same VEP command you run, with `--json_cache` naming the cache directory. That is the directory holding `info.json` and `transcripts/`, so `116_GRCh38` itself, not its parent:
 
 ```bash
 target/release/vep \
@@ -68,10 +68,10 @@ target/release/vep \
   -i input.vcf -o output.json
 ```
 
-**Output formats.** VEP default (the tab-delimited text format with the `Extra` column), `--vcf` (annotations in the `CSQ` INFO field), `--json` (one object per variant) and `--tab` match Perl VEP's layouts. `--parquet` is a vep-rs extension written through the `duckdb` CLI (1.2 or newer on PATH). Field-level specs are in [Output formats](../output-formats.md).
+**Output formats.** VEP default (the tab-delimited text format with the `Extra` column), `--vcf` (annotations in the `CSQ` INFO field), `--json` (one object per variant) and `--tab` match Ensembl VEP's layouts. `--output_format parquet` is vep-rs's own, written through the `duckdb` CLI (1.3.2 or newer on PATH). Field-level specs are in [Output formats](../output-formats.md).
 
 **Plugins.** `--plugin <Name>,<params>` resolves one of the eleven built-in plugins first (ten with supported data), and otherwise loads a C-ABI dynamic library from `--dir_plugins`. Support is per reference genome: `--assembly` selects the right column and refuses a data file whose own assembly contradicts it. The support matrix, the data files and how to write a plugin are in [Plugins](../plugins.md).
 
-**HGVS.** `--fasta` takes an uncompressed, `faidx`-indexed genome and gives `--hgvs` the reference context for the 3' shifting of indels.
+**HGVS.** `--fasta` takes a `samtools faidx`-indexed genome, plain or compressed with `bgzip` (Ensembl's `dna_index` files), and gives `--hgvs` the reference context for the 3' shifting of indels; `--hgvs` without a FASTA is refused, as Ensembl VEP refuses it offline.
 
-**All flags.** The [CLI reference](../cli-reference.md) is the complete flag reference, including the flags accepted for Perl VEP compatibility but not implemented.
+**All flags.** The [CLI reference](../cli-reference.md) is the complete flag reference, including the flags accepted for Ensembl VEP compatibility but not implemented.

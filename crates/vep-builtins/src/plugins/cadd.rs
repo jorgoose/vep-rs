@@ -68,7 +68,7 @@ impl CaddPlugin {
     /// Reject a data file whose own assembly marker contradicts `--assembly`.
     ///
     /// CADD's first line is a provenance comment naming the build
-    /// (`##CADD GRCh38-v1.7 (c) University of Washington...`). Perl VEP's
+    /// (`##CADD GRCh38-v1.7 (c) University of Washington...`). Ensembl VEP's
     /// `CADD.pm` greps for the requested assembly and dies on a mismatch; without
     /// the guard a GRCh37 file in a GRCh38 run yields nothing or wrong-genome
     /// scores. A file with no marker is accepted: absence of evidence is not a
@@ -393,7 +393,7 @@ mod tests {
         write_tabix_fixture(dir, name, &lines, IndexSpec::standard())
     }
 
-    /// A GRCh37 CADD file in a GRCh38 run must be refused: Perl VEP's CADD.pm
+    /// A GRCh37 CADD file in a GRCh38 run must be refused: Ensembl VEP's CADD.pm
     /// greps the header for the assembly and dies.
     #[test]
     fn rejects_a_data_file_from_the_other_assembly() {
@@ -474,6 +474,58 @@ mod tests {
         plugin
             .init(&[format!("snv={}", path.display())])
             .expect("an unmarked file must not be rejected");
+    }
+
+    /// A record given on the reverse strand scores the row of its forward-strand
+    /// alleles: `get_matched_variant_alleles` (CADD.pm:239) reverse-complements
+    /// them, so `T/C -1` at 43774726 takes the `A G` row's 25.0 and 2.5, as
+    /// Ensembl VEP 116.2 with CADD.pm prints for this record over these two rows,
+    /// and not the `T C` row's 88.0.
+    #[test]
+    fn reverse_strand_record_scores_the_complemented_row() {
+        use crate::test_fixtures::{write_tabix_fixture, IndexSpec};
+        use vep_core::coordinate::Strand;
+        let dir = tempfile::tempdir().unwrap();
+        let lines = [
+            "##CADD GRCh38-v1.7 (c) University of Washington 2013-2020",
+            "#Chrom\tPos\tRef\tAlt\tRawScore\tPHRED",
+            "21\t43774726\tA\tG\t2.5\t25.0",
+            "21\t43774726\tT\tC\t8.0\t88.0",
+        ];
+        let path = write_tabix_fixture(
+            dir.path(),
+            "cadd_strand.tsv.gz",
+            &lines,
+            IndexSpec::standard(),
+        );
+        let mut plugin = CaddPlugin::new();
+        plugin.init(&[format!("snv={}", path.display())]).unwrap();
+
+        let scores = |strand: Strand| {
+            let mut variant = InputVariant::new(
+                "21".into(),
+                43774726,
+                43774726,
+                b"T".to_vec(),
+                b"C".to_vec(),
+            );
+            variant.strand = strand;
+            let mut variants = vec![variant];
+            plugin.run_batch(&mut variants).unwrap();
+            let data = &variants[0].plugin_data;
+            (
+                data.get("CADD_PHRED").cloned(),
+                data.get("CADD_RAW").cloned(),
+            )
+        };
+        assert_eq!(
+            scores(Strand::Reverse),
+            (Some("25.0".to_string()), Some("2.5".to_string()))
+        );
+        assert_eq!(
+            scores(Strand::Forward),
+            (Some("88.0".to_string()), Some("8.0".to_string()))
+        );
     }
 
     /// Without `--assembly` there is nothing to contradict, so any file loads.

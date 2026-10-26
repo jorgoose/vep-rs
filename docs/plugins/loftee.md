@@ -8,7 +8,7 @@ two upstream data bundles and what the port leaves out.
 LoFTEE targets parity with the upstream LoFTEE `grch38` branch defaults, with
 the splice-prediction layer off. On GRCh37 the matching Perl run is the
 `master` branch with `run_splice_predictions:0`, because `master` turns that
-layer on by default. Built-in names are matched exactly as written: Perl VEP
+layer on by default. Built-in names are matched exactly as written: Ensembl VEP
 loads LoFTEE as `--plugin LoF,...` and vep-rs as `--plugin LoFTEE,...`.
 
 ## Parameters and data {#loftee}
@@ -25,7 +25,7 @@ form is accepted alongside.
 
 | Parameter                | Meaning                                                                                                                                                                                                      |
 | ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `human_ancestor_fa`      | Plain (uncompressed) indexed FASTA (`.fa` + `.fai`). Enables the `ANC_ALLELE` filter (SNP-only). Decompress the upstream `human_ancestor.fa.gz` first; vep-rs does not read bgzip here.                       |
+| `human_ancestor_fa`      | Indexed FASTA, plain (`.fa` + `.fai`) or bgzipped (`.fa.gz` + `.fai` + `.gzi`, the form the upstream bundle ships). Enables the `ANC_ALLELE` filter (SNP-only).                                               |
 | `gerp_bigwig`            | GERP conservation bigWig, as shipped in the upstream `grch38` bundle. Enables the default GERP-weighted `END_TRUNC` filter.                                                                                   |
 | `gerp_tabix`             | GERP as a tabix-indexed per-base TSV, as shipped in the upstream `master`/GRCh37 bundle (`GERP_scores.final.sorted.txt.gz` + `.tbi`). Same filter, different on-disk format. Alias `gerp_scores`.           |
 | `gerp`                   | Assembly-agnostic spelling of the GERP source; classifies the file by its extension.                                                                                                                         |
@@ -59,11 +59,28 @@ gerp_bigwig=$LOFTEE/gerp_conservation_scores.homo_sapiens.GRCh38.bw
 gerp_tabix=$LOFTEE/GERP_scores.final.sorted.txt.gz
 ```
 
-**Preparing the data.** Download the bundle for the run's assembly from
-[LoFTEE data](https://personal.broadinstitute.org/konradk/loftee_data/). vep-rs
-reads the plain `human_ancestor.fa`, so decompress the upstream bgzipped file
-and re-index it (`bgzip -d`, then `samtools faidx`). The GERP file is used as
-shipped: the bigWig on GRCh38, the tabix-indexed TSV with its `.tbi` on GRCh37.
+**Data files.** Both LoFTEE bundles are published under
+<https://personal.broadinstitute.org/konradk/loftee_data/>, one directory per
+assembly; the files below are what each assembly needs.
+
+| Assembly | Directory | Files                                                                                                | Parameters                           |
+| -------- | --------- | ---------------------------------------------------------------------------------------------------- | ------------------------------------ |
+| GRCh38   | `GRCh38/` | `human_ancestor.fa.gz` with its `.fai` and `.gzi`; `gerp_conservation_scores.homo_sapiens.GRCh38.bw` | `human_ancestor_fa=`, `gerp_bigwig=` |
+| GRCh37   | `GRCh37/` | `human_ancestor.fa.gz` with its `.fai` and `.gzi`; `GERP_scores.final.sorted.txt.gz` with its `.tbi` | `human_ancestor_fa=`, `gerp_tabix=`  |
+
+Every file is used as shipped: vep-rs reads the bgzipped `human_ancestor.fa.gz`
+through the `.fai` and `.gzi` beside it, the GERP bigWig on GRCh38 and the
+tabix-indexed GERP TSV with its `.tbi` on GRCh37. The PhyloCSF databases of the
+same directories (`loftee.sql.gz` on GRCh38, `phylocsf_gerp.sql.gz` on GRCh37)
+feed the layer vep-rs does not implement and are not needed.
+
+A plain `human_ancestor.fa` with its own `.fai` works the same (the bundle's
+`.gzi` belongs to the compressed file alone):
+
+```bash
+gzip -dc human_ancestor.fa.gz > human_ancestor.fa
+samtools faidx human_ancestor.fa
+```
 
 ## What LoFTEE annotates
 

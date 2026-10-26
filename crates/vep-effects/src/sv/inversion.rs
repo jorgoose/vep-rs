@@ -3,9 +3,9 @@
 
 //! Structural inversion (`<INV>`) consequence calculation.
 //!
-//! Mirrors Perl VEP's `StructuralVariationOverlapAllele` logic for inversions.
+//! Mirrors Ensembl VEP's `StructuralVariationOverlapAllele` logic for inversions.
 //! Inversions disrupt the reading frame by reversing the strand of the affected
-//! region but do not remove or add sequence. Perl VEP consequently never assigns
+//! region but do not remove or add sequence. Ensembl VEP consequently never assigns
 //! `transcript_ablation` for inversions, even when the INV fully contains the
 //! transcript, and reports `coding_transcript_variant` for fully-contained
 //! protein-coding transcripts instead.
@@ -19,16 +19,14 @@ use super::{
     overlaps_polypyrimidine_tract, overlaps_three_prime_utr,
 };
 use smallvec::{smallvec, SmallVec};
-use vep_core::consequence::{
-    Consequence, ConsequenceList, FeatureType, Impact, TranscriptConsequence,
-};
+use vep_core::consequence::{Consequence, ConsequenceList, Impact, TranscriptConsequence};
 use vep_core::coordinate::Strand;
 use vep_core::transcript::Transcript;
 use vep_core::variant::InputVariant;
 
 /// Calculate consequences for a structural inversion against a transcript.
 ///
-/// Inversions produce region-based overlap consequences identical to Perl VEP:
+/// Inversions produce region-based overlap consequences identical to Ensembl VEP:
 /// - `coding_sequence_variant`, `5_prime_UTR_variant`, `3_prime_UTR_variant`,
 ///   `intron_variant` when the INV overlaps those regions
 /// - `coding_transcript_variant` for protein-coding transcripts fully contained
@@ -50,7 +48,7 @@ pub fn calculate(
     let tx_end = transcript.end;
 
     if sv_end < tx_start.saturating_sub(upstream_distance.max(downstream_distance))
-        || sv_start > tx_end + upstream_distance.max(downstream_distance)
+        || sv_start > tx_end.saturating_add(upstream_distance.max(downstream_distance))
     {
         return None;
     }
@@ -67,20 +65,9 @@ pub fn calculate(
         );
     }
 
-    // Overlap metrics (OverlapBP/OverlapPC) use nominal coordinates.
-    let overlap_start = sv_start.max(tx_start);
-    let overlap_end = sv_end.min(tx_end);
-    let overlap_bp = overlap_end - overlap_start + 1;
-    let tx_length = tx_end - tx_start + 1;
-    let overlap_pc = if tx_length > 0 {
-        (overlap_bp as f64 / tx_length as f64) * 100.0
-    } else {
-        0.0
-    };
-
     let mut consequences: ConsequenceList = SmallVec::new();
 
-    // Perl VEP `coding_transcript_variant` predicate:
+    // Ensembl VEP `coding_transcript_variant` predicate:
     //   (not coding_unknown) AND complete_overlap_feature AND within_coding_gene
     // An inversion (neither gain nor loss) fully containing the transcript gets
     // the context term as the sole consequence, with no regional breakdown.
@@ -99,8 +86,6 @@ pub fn calculate(
             transcript,
             smallvec![Consequence::MatureMirnaVariant],
             Impact::MODIFIER,
-            overlap_bp,
-            overlap_pc,
             None,
         ));
     }
@@ -121,9 +106,7 @@ pub fn calculate(
         }
 
         // NMD context: always add alongside other consequences.
-        if transcript.is_nmd_transcript()
-            && !consequences.contains(&Consequence::NmdTranscriptVariant)
-        {
+        if transcript.facts().is_nmd && !consequences.contains(&Consequence::NmdTranscriptVariant) {
             consequences.push(Consequence::NmdTranscriptVariant);
         }
 
@@ -149,8 +132,6 @@ pub fn calculate(
         transcript,
         consequences,
         impact,
-        overlap_bp,
-        overlap_pc,
         None,
     ))
 }
@@ -202,9 +183,9 @@ fn calculate_non_coding_consequences(
     if overlaps_intron {
         push_unique(consequences, Consequence::IntronVariant);
     }
-    // Perl VEP adds non_coding_transcript_variant to a non-coding transcript when
+    // Ensembl VEP adds non_coding_transcript_variant to a non-coding transcript when
     // there is NO exon overlap and not mature_miRNA.
-    if !overlaps_exon && !transcript.is_nmd_transcript() {
+    if !overlaps_exon && !transcript.facts().is_nmd {
         push_unique(consequences, Consequence::NonCodingTranscriptVariant);
     }
 }
@@ -239,8 +220,6 @@ fn calculate_distance_consequence(
             transcript,
             smallvec![Consequence::UpstreamGeneVariant],
             Impact::MODIFIER,
-            0,
-            0.0,
             Some(distance),
         ))
     } else if !is_upstream && distance <= downstream_distance {
@@ -248,8 +227,6 @@ fn calculate_distance_consequence(
             transcript,
             smallvec![Consequence::DownstreamGeneVariant],
             Impact::MODIFIER,
-            0,
-            0.0,
             Some(distance),
         ))
     } else {
@@ -262,39 +239,13 @@ fn build_transcript_consequence(
     transcript: &Transcript,
     consequences: ConsequenceList,
     impact: Impact,
-    _overlap_bp: u64,
-    _overlap_pc: f64,
     distance: Option<u64>,
 ) -> TranscriptConsequence {
     TranscriptConsequence {
-        transcript_id: transcript.stable_id.clone(),
-        feature_start: transcript.start,
-        feature_end: transcript.end,
-        gene_id: transcript.gene_stable_id.clone(),
-        gene_symbol: transcript.gene_symbol.clone(),
-        gene_symbol_source: transcript.gene_symbol_source.clone(),
-        hgnc_id: transcript.hgnc_id.clone(),
         consequences,
         impact,
-        biotype: Some(transcript.biotype.clone()),
-        canonical: transcript.canonical,
-        strand: match transcript.strand {
-            Strand::Forward => 1,
-            Strand::Reverse => -1,
-        },
         distance,
-        feature_type: FeatureType::Transcript,
-        flags: transcript.flags.clone(),
-        tsl: transcript.tsl,
-        mane_select: transcript.mane_select.clone(),
-        mane_plus_clinical: transcript.mane_plus_clinical.clone(),
-        appris: transcript.appris.clone(),
-        ccds: transcript.ccds.clone(),
-        protein_id: transcript.protein_id.clone(),
-        swissprot: transcript.swissprot.clone(),
-        trembl: transcript.trembl.clone(),
-        refseq: transcript.refseq.clone(),
-        ..TranscriptConsequence::default()
+        ..TranscriptConsequence::for_transcript(transcript)
     }
 }
 
@@ -312,6 +263,7 @@ mod tests {
     use crate::sv::tests::make_mature_mirna_transcript;
     use crate::test_helpers::{make_test_transcript, make_test_transcript_with_flags};
 
+    use vep_core::consequence::FeatureType;
     use vep_core::variant::VariantClass;
 
     /// Helper: build a structural inversion variant.
@@ -368,6 +320,17 @@ mod tests {
             "exonic CDS overlap must still be reported, got: {:?}",
             csq.consequences
         );
+    }
+
+    /// The row carries the transcript lengths the pick family ranks by
+    /// (OutputFactory.pm:743-748 at release/116.2), as every other row does.
+    #[test]
+    fn inversion_rows_carry_the_transcript_lengths() {
+        let tx = make_test_transcript();
+        let csq = calculate(&make_inversion(25_000_200, 25_000_301), &tx, 5000, 5000).unwrap();
+        assert_eq!(csq.cds_length, tx.cds_length());
+        assert_eq!(csq.cdna_length, tx.spliced_length());
+        assert!(csq.cds_length.is_some_and(|n| n > 0) && csq.cdna_length > 0);
     }
 
     /// Non-coding counterpart of the donor-dinucleotide test above.
@@ -465,7 +428,7 @@ mod tests {
 
     #[test]
     fn test_inv_spanning_entire_transcript() {
-        // INV fully contains the transcript: Perl VEP assigns coding_transcript_variant
+        // INV fully contains the transcript: Ensembl VEP assigns coding_transcript_variant
         // as the sole consequence (not transcript_ablation, no regional breakdown).
         let tx = make_test_transcript();
         let v = make_inversion(24_999_000, 25_007_000);
@@ -695,7 +658,7 @@ mod tests {
     #[test]
     fn test_inv_non_coding_intron_only() {
         // Non-coding transcript with intron-only overlap.
-        // Perl VEP adds both intron_variant and non_coding_transcript_variant.
+        // Ensembl VEP adds both intron_variant and non_coding_transcript_variant.
         let mut tx = make_test_transcript();
         tx.biotype = "lncRNA".into();
         tx.coding_region_start = None;
@@ -722,7 +685,7 @@ mod tests {
 
     #[test]
     fn test_inv_non_coding_fully_contained() {
-        // Non-coding transcript fully within INV: Perl VEP assigns
+        // Non-coding transcript fully within INV: Ensembl VEP assigns
         // non_coding_transcript_variant as the sole consequence.
         let mut tx = make_test_transcript();
         tx.biotype = "lncRNA".into();

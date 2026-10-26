@@ -13,7 +13,9 @@
 //! `tmp/concordance/cache_json/` under the workspace root. `$VEP_BENCH_CHR`
 //! (default `21`) names the chromosome the per-chromosome benchmark parses,
 //! which is the unit `LazyTranscriptIndexes::prewarm` loads at run time.
-//! Benchmarks are silently skipped if the cache is not available.
+//! Without the cache, the per-chromosome benchmark prints a `SKIP:` line on
+//! stderr and the other two return without one; a cache lacking the chromosome
+//! or a `variations/` directory also prints a `SKIP:` line.
 
 use std::path::Path;
 use std::time::Duration;
@@ -21,6 +23,8 @@ use std::time::Duration;
 use criterion::{criterion_group, criterion_main, Criterion};
 
 use vep_cli::json_cache;
+use vep_cli::variation_source::VariationSource;
+use vep_core::cache_manifest::CacheManifest;
 
 /// Root of the JSON cache (relative to workspace root).
 const CACHE_DIR: &str = "tmp/concordance/cache_json";
@@ -54,13 +58,15 @@ fn bench_load_transcripts_for_chr(c: &mut Criterion) {
         eprintln!("SKIP: chromosome {chr} not in cache {dir}");
         return;
     };
+    let manifest = CacheManifest::load(&dir).expect("manifest read failed");
 
     let mut group = c.benchmark_group("cache_loading");
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(20));
     group.bench_function(format!("transcripts_chr{chr}"), |b| {
         b.iter(|| {
-            json_cache::load_transcripts_for_chr(&chr, paths).expect("transcript loading failed");
+            json_cache::load_transcripts_for_chr(&chr, paths, &manifest)
+                .expect("transcript loading failed");
         });
     });
     group.finish();
@@ -94,7 +100,7 @@ fn bench_load_variations(c: &mut Criterion) {
 
     c.bench_function("cache_loading/variations", |b| {
         b.iter(|| {
-            json_cache::load_all_variations(&dir).expect("variation loading failed");
+            VariationSource::open_json_cache(&dir, false).expect("variation source failed");
         });
     });
 }

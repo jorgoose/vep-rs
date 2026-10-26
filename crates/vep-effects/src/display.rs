@@ -35,7 +35,7 @@
 //! `OutputFactory.pm` (ensembl-vep release/115, `Bio/EnsEMBL/VEP/`).
 
 use smallvec::SmallVec;
-use vep_core::consequence::TranscriptConsequence;
+use vep_core::consequence::{OwnSpanPositions, TranscriptConsequence};
 use vep_core::transcript::{ExonCoordMapper, MapperPair, SeqEdit, Transcript, TranscriptMapper};
 use vep_core::variant::InputVariant;
 
@@ -340,14 +340,19 @@ fn overlap(a_start: i64, a_end: i64, b_start: i64, b_end: i64) -> bool {
     a_end >= b_start && a_start <= b_end
 }
 
-/// Whether the variant overlaps an exon, each exon stretched by 12 bases on
-/// a transcript with a frameshift intron.
-fn overlaps_an_exon(transcript: &Transcript, min_vf: i64, max_vf: i64) -> bool {
-    let stretch = if transcript.facts().has_frameshift_intron {
+/// The bases each exon stretches by when the transcript has a frameshift
+/// intron: a variant in such an intron, up to 12 bases long, counts as exonic.
+fn exon_stretch(transcript: &Transcript) -> i64 {
+    if transcript.facts().has_frameshift_intron {
         12
     } else {
         0
-    };
+    }
+}
+
+/// Whether the variant overlaps an exon, each stretched by [`exon_stretch`].
+fn overlaps_an_exon(transcript: &Transcript, min_vf: i64, max_vf: i64) -> bool {
+    let stretch = exon_stretch(transcript);
     transcript.exons.iter().any(|e| {
         overlap(
             min_vf,
@@ -358,13 +363,17 @@ fn overlaps_an_exon(transcript: &Transcript, min_vf: i64, max_vf: i64) -> bool {
     })
 }
 
-/// `a-b/total` for the 1-based ordinals of the features the variant strictly
-/// overlaps, or `None` when it overlaps none.
-fn number_string(features: &[(i64, i64)], vf_start: i64, vf_end: i64) -> Option<String> {
+/// `a-b/total` for the 1-based ordinals of the features that `fetched` admits
+/// and the placed span strictly overlaps, or `None` when there is none.
+fn number_string(
+    features: &[(i64, i64)],
+    fetched: impl Fn(i64, i64) -> bool,
+    placed: (i64, i64),
+) -> Option<String> {
     let mut numbers = features
         .iter()
         .enumerate()
-        .filter(|(_, (s, e))| overlap(vf_start, vf_end, *s, *e))
+        .filter(|(_, (s, e))| fetched(*s, *e) && overlap(placed.0, placed.1, *s, *e))
         .map(|(i, _)| i + 1);
     let first = numbers.next()?;
     let last = numbers.next_back().unwrap_or(first);
@@ -376,13 +385,21 @@ fn number_string(features: &[(i64, i64)], vf_start: i64, vf_end: i64) -> Option<
 }
 
 /// `EXON` and `INTRON` of a row as VEP prints them with `--numbers`
-/// (`BaseTranscriptVariation::exon_number`, `intron_number`): the ordinals of
-/// the exons, then introns, that the variant's span strictly overlaps, as a
-/// range over the total, once the variant lies within the transcript. An
-/// intron counts as touched when the span reaches within three bases of it,
-/// but only strictly overlapped introns are numbered.
+/// (`BaseTranscriptVariation::exon_number`, `intron_number`), as a range of
+/// ordinals over the total, once `variant` lies within the transcript.
+///
+/// `variant` is the span the consequences were called on and `placed` the span
+/// the input gave; they differ only under `--shift_3prime 1`. VEP fetches the
+/// overlapped exons and introns while it evaluates the predicates, at the
+/// shifted span (`_bvfo_preds`, BaseVariationFeatureOverlapAllele.pm:454-516),
+/// each exon stretched by 12 bases on a transcript with a frameshift intron
+/// and each intron reaching 3 bases past its ends, and keeps that list on the
+/// overlap; `exon_number` and `intron_number` then number the fetched features
+/// the placed span strictly overlaps (BaseTranscriptVariation.pm:679-760), so
+/// a shift across an exon boundary leaves both columns empty.
 pub fn exon_intron_numbers(
     variant: &InputVariant,
+    placed: &InputVariant,
     transcript: &Transcript,
 ) -> (Option<String>, Option<String>) {
     let (vf_start, vf_end) = (variant.start as i64, variant.end as i64);
@@ -398,21 +415,19 @@ pub fn exon_intron_numbers(
     if variant.is_structural && vf_start <= tx_start && vf_end >= tx_end {
         return (None, None);
     }
+    let stretch = exon_stretch(transcript);
+    let placed = (placed.start as i64, placed.end as i64);
     let ordinals = transcript.feature_ordinals();
-    let exon = if overlaps_an_exon(transcript, min_vf, max_vf) {
-        number_string(&ordinals.exons, vf_start, vf_end)
-    } else {
-        None
-    };
-    let intron = if ordinals
-        .introns
-        .iter()
-        .any(|(s, e)| overlap(min_vf, max_vf, s - 3, e + 3))
-    {
-        number_string(&ordinals.introns, vf_start, vf_end)
-    } else {
-        None
-    };
+    let exon = number_string(
+        &ordinals.exons,
+        |s, e| overlap(min_vf, max_vf, s - stretch, e + stretch),
+        placed,
+    );
+    let intron = number_string(
+        &ordinals.introns,
+        |s, e| overlap(min_vf, max_vf, s - 3, e + 3),
+        placed,
+    );
     (exon, intron)
 }
 
@@ -421,13 +436,6 @@ pub fn exon_intron_numbers(
 
 /// A codon window or peptide: a handful of bases, inline.
 type Bases = SmallVec<[u8; 16]>;
-
-fn is_dna(seq: &[u8]) -> bool {
-    !seq.is_empty()
-        && seq
-            .iter()
-            .all(|b| b"ACGTUMRWSYKVHDBXN-".contains(&b.to_ascii_uppercase()))
-}
 
 fn is_unambiguous_dna(seq: &[u8]) -> bool {
     !seq.is_empty()
@@ -516,7 +524,7 @@ fn codon(ctx: &CodingContext, allele: &Allele) -> Option<Bases> {
     let (Some(tr_start), Some(tr_end)) = (ctx.pep_start, ctx.pep_end) else {
         return None;
     };
-    if tr_start == 0 || tr_end == 0 || !is_dna(allele.vf_seq) {
+    if tr_start == 0 || tr_end == 0 || !vep_core::codon::seq_is_dna(allele.vf_seq) {
         return None;
     }
     let codon_cds_start = tr_start * 3 - 2;
@@ -550,6 +558,9 @@ fn codon(ctx: &CodingContext, allele: &Allele) -> Option<Bases> {
     if let Some(i) = alt.iter().position(|b| *b == b'-') {
         alt.remove(i);
     }
+    // An allele given on the strand opposite the transcript's is read
+    // reverse-complemented, IUPAC letters included (`_get_alternate_cds`,
+    // TranscriptVariationAllele.pm:2413-2417, through Ensembl's `reverse_comp`).
     if !alt.is_empty() && ctx.reverse {
         alt.reverse();
         for b in &mut alt {
@@ -741,20 +752,127 @@ impl AlleleWindows {
 // ---------------------------------------------------------------------------
 // Row assembly.
 
-/// The five display columns of one row; `None` prints as `-`.
+/// The five display columns of one row; `None` prints as `-`. The three
+/// totals are the lengths `--total_length` appends to the positions
+/// (`OutputFactory.pm` `TranscriptVariationAllele_to_output_hash`): the
+/// transcript's exon length sum whenever the variant overlaps an exon, the
+/// cached coding sequence's length and the cached peptide's length whenever the
+/// variant lies in the coding region and the sequence is present; each is set
+/// whether or not its position is, so the writers print `-/<total>` where
+/// Ensembl VEP appends to its placeholder.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct DisplayFields {
     pub cdna_position: Option<String>,
     pub cds_position: Option<String>,
     pub protein_position: Option<String>,
+    pub cdna_total: Option<u32>,
+    pub cds_total: Option<u32>,
+    pub protein_total: Option<u32>,
     pub amino_acids: Option<String>,
     pub codons: Option<String>,
+    /// The residues the variant maps to, as `BaseTranscriptVariation`'s
+    /// `translation_start` and `translation_end` give them before the column
+    /// orders them: an insertion's start is one past its end. `None` when
+    /// either end is unmapped.
+    pub translation_span: Option<(i64, i64)>,
+    /// The span's own positions once [`Self::record_span_positions`] has put
+    /// another span's in the three position columns; `None` while the columns
+    /// are the span's own.
+    pub own_span_positions: Option<Box<OwnSpanPositions>>,
+    /// [`TranscriptConsequence::record_span_in_cds`]: whether the record's span
+    /// maps to a CDS coordinate once [`Self::record_span_positions`] has mapped
+    /// it.
+    pub record_span_in_cds: bool,
+    /// The span's `exon` predicate (`_bvfo_preds`,
+    /// BaseVariationFeatureOverlapAllele.pm:511-516), which admits
+    /// `cDNA_position`.
+    exon: bool,
+    /// The span's `coding` predicate (:540-557), which admits `CDS_position`
+    /// and `Protein_position`.
+    coding: bool,
+    /// Whether the span's `cds_coords` hold a Coordinate, the test `within_cds`
+    /// makes (VariationEffect.pm:645-651); false for a span `coding` admits on
+    /// Gaps alone.
+    has_cds_coordinate: bool,
 }
 
-/// Computes the display columns for `variant` against `transcript`.
-pub fn display_fields(variant: &InputVariant, transcript: &Transcript) -> DisplayFields {
+impl DisplayFields {
+    /// Writes the five columns, the three totals and the own-span positions
+    /// onto `tc`.
+    pub(crate) fn write_to(self, tc: &mut TranscriptConsequence) {
+        tc.cdna_position = self.cdna_position;
+        tc.cds_position = self.cds_position;
+        tc.protein_position = self.protein_position;
+        tc.cdna_total = self.cdna_total;
+        tc.cds_total = self.cds_total;
+        tc.protein_total = self.protein_total;
+        tc.amino_acids = self.amino_acids;
+        tc.codons = self.codons;
+        tc.own_span_positions = self.own_span_positions;
+        tc.record_span_in_cds = self.record_span_in_cds;
+    }
+
+    /// An allele of a `--minimal` split prints the positions of the record's
+    /// span ([`InputVariant::original_start`] to `original_end`) in the columns
+    /// its own span admits: Ensembl VEP clears every merged allele's cached
+    /// positions (`clear_shifting_variables`, TranscriptVariationAllele.pm:502-517)
+    /// and recomputes them from the feature the rejoin pointed it at, the record
+    /// (OutputFactory.pm:2291-2293, 2315), while the `exon` and `coding`
+    /// predicates that gate the columns (OutputFactory.pm:1724-1741) were cached
+    /// on the allele before the rejoin (BaseVariationFeatureOverlapAllele.pm:340,
+    /// 394), as its codons and consequences were; the allele's own positions
+    /// move to `own_span_positions` for the VCF and JSON formats, which clear the
+    /// cached positions before the rejoin (OutputFactory/VCF.pm:305-308,
+    /// OutputFactory/JSON.pm:217-220). Whether the record span maps to a CDS
+    /// coordinate is kept as [`Self::record_span_in_cds`], the `within_cds` the
+    /// `--coding_only` filter asks of the rejoined row
+    /// (`Utils/VariationEffect.pm:642-652`). Any other allele keeps the
+    /// positions of its own span.
+    pub fn record_span_positions(&mut self, variant: &InputVariant, transcript: &Transcript) {
+        let (Some(start), Some(end)) = (variant.original_start, variant.original_end) else {
+            return;
+        };
+        let (record, _) =
+            span_positions(variant.is_structural, transcript, start as i64, end as i64);
+        self.record_span_in_cds = record.has_cds_coordinate;
+        let own = OwnSpanPositions {
+            cdna: self.cdna_position.take(),
+            cds: self.cds_position.take(),
+            protein: self.protein_position.take(),
+        };
+        if self.exon {
+            self.cdna_position = record.cdna_position;
+        }
+        if self.coding {
+            self.cds_position = record.cds_position;
+            self.protein_position = record.protein_position;
+        }
+        self.own_span_positions = Some(Box::new(own));
+    }
+}
+
+/// What the coding part of the display columns reads once the span's positions
+/// are mapped: the span's cDNA coordinates and its CDS and peptide bounds.
+struct CodingSpan {
+    cdna: Segments,
+    cds_start: Option<i64>,
+    cds_end: Option<i64>,
+    pep_start: Option<i64>,
+    pep_end: Option<i64>,
+}
+
+/// The position columns and totals of the span `vf_start..=vf_end` against
+/// `transcript` (`cDNA_position`, `CDS_position`, `Protein_position`), with the
+/// coding coordinates the codon columns read when the span reaches the coding
+/// sequence. `is_structural` is the variant's class: a structural variant
+/// covering the whole transcript carries no exon predicate and so no positions.
+fn span_positions(
+    is_structural: bool,
+    transcript: &Transcript,
+    vf_start: i64,
+    vf_end: i64,
+) -> (DisplayFields, Option<CodingSpan>) {
     let mut out = DisplayFields::default();
-    let (vf_start, vf_end) = (variant.start as i64, variant.end as i64);
     let (tx_start, tx_end) = (transcript.start as i64, transcript.end as i64);
     let (min_vf, max_vf) = if vf_start > vf_end {
         (vf_end, vf_start)
@@ -765,67 +883,100 @@ pub fn display_fields(variant: &InputVariant, transcript: &Transcript) -> Displa
     // within_feature; a structural variant covering the whole transcript
     // carries no exon predicate and so no positions.
     if !overlap(vf_start, vf_end, tx_start, tx_end) {
-        return out;
+        return (out, None);
     }
-    if variant.is_structural && vf_start <= tx_start && vf_end >= tx_end {
-        return out;
+    if is_structural && vf_start <= tx_start && vf_end >= tx_end {
+        return (out, None);
     }
     if !overlaps_an_exon(transcript, min_vf, max_vf) {
-        return out;
+        return (out, None);
     }
     let Some(mapper) = transcript.vefc.as_ref().and_then(|v| v.mapper.as_ref()) else {
-        return out;
+        return (out, None);
     };
     let strand = transcript.strand.as_i8();
     let cdna = genomic2cdna(mapper, vf_start, vf_end, strand);
+    out.exon = true;
     out.cdna_position = coords_column(first_start(&cdna), last_end(&cdna));
+    out.cdna_total = Some(transcript.spliced_length());
 
     // coding
     let (Some(coding_start), Some(coding_end)) =
         (transcript.coding_region_start, transcript.coding_region_end)
     else {
-        return out;
+        return (out, None);
     };
     if coding_start == 0 || coding_end == 0 {
-        return out;
+        return (out, None);
     }
     if !overlap(min_vf, max_vf, coding_start as i64, coding_end as i64) {
-        return out;
+        return (out, None);
     }
     let cds = cds_from_cdna(mapper, &cdna, vf_start, vf_end);
-    let coding = match cds.as_slice() {
-        [] => false,
-        [single] => !single.is_gap(),
-        _ => true,
-    };
-    if !coding {
-        return out;
+    // The `coding` predicate holds for any non-empty `cds_coords`, a lone Gap
+    // included (BaseVariationFeatureOverlapAllele.pm:543-557), so an insertion
+    // between a UTR and the CDS prints `-/<total>` in the CDS and protein
+    // columns; `within_cds` asks for a Coordinate (VariationEffect.pm:645-651).
+    if cds.is_empty() {
+        return (out, None);
     }
+    out.has_cds_coordinate = cds.iter().any(|segment| !segment.is_gap());
     let phase_offset = transcript.facts().start_phase_offset as i64;
     let cds_start = first_start(&cds).map(|s| s + phase_offset);
     let cds_end = last_end(&cds).map(|e| e + phase_offset);
+    let vefc = transcript.vefc.as_ref();
+    let cached_length =
+        |sequence: Option<&str>| sequence.filter(|s| !s.is_empty()).map(|s| s.len() as u32);
+    out.coding = true;
     out.cds_position = coords_column(cds_start, cds_end);
+    out.cds_total = cached_length(vefc.and_then(|v| v.translateable_seq.as_deref()));
     let pep = pep_from_cds(mapper, &cds);
     let (pep_start, pep_end) = (first_start(&pep), last_end(&pep));
     out.protein_position = coords_column(pep_start, pep_end);
+    out.protein_total = cached_length(vefc.and_then(|v| v.peptide.as_deref()));
+    out.translation_span = pep_start.zip(pep_end);
+    (
+        out,
+        Some(CodingSpan {
+            cdna,
+            cds_start,
+            cds_end,
+            pep_start,
+            pep_end,
+        }),
+    )
+}
 
+/// Computes the display columns for `variant` against `transcript`.
+pub fn display_fields(variant: &InputVariant, transcript: &Transcript) -> DisplayFields {
+    let (mut out, coding) = span_positions(
+        variant.is_structural,
+        transcript,
+        variant.start as i64,
+        variant.end as i64,
+    );
+    let Some(coding) = coding else {
+        return out;
+    };
     if variant.is_structural {
         return out;
     }
+    let strand = transcript.strand.as_i8();
     let vefc = transcript.vefc.as_ref();
     let cds_seq = vefc
         .and_then(|v| v.translateable_seq.as_deref())
-        .unwrap_or("")
-        .as_bytes();
-    let utr3 = vefc
-        .and_then(|v| v.three_prime_utr.as_deref())
         .unwrap_or("")
         .as_bytes();
     let pep_seq = vefc
         .and_then(|v| v.peptide.as_deref())
         .unwrap_or("")
         .as_bytes();
+    let utr3 = vefc
+        .and_then(|v| v.three_prime_utr.as_deref())
+        .unwrap_or("")
+        .as_bytes();
     let seq_edits: &[SeqEdit] = vefc.map_or(&[], |v| v.seq_edits.as_slice());
+    let phase_offset = transcript.facts().start_phase_offset as i64;
     let ctx = CodingContext {
         cds: cds_seq,
         utr3,
@@ -837,20 +988,24 @@ pub fn display_fields(variant: &InputVariant, transcript: &Transcript) -> Displa
             .filter(|s| *s > 0)
             .map(|s| s as i64),
         phase_offset,
-        cdna_start: first_start(&cdna),
-        cds_start,
-        cds_end,
-        pep_start,
-        pep_end,
+        cdna_start: first_start(&coding.cdna),
+        cds_start: coding.cds_start,
+        cds_end: coding.cds_end,
+        pep_start: coding.pep_start,
+        pep_end: coding.pep_end,
         reverse: variant.strand.as_i8() != strand,
     };
     let reference = Allele {
         vf_seq: &variant.ref_allele,
         is_reference: true,
     };
+    // The reference row of `--process_ref_homs` is Ensembl VEP's reference
+    // allele object itself, whose codon and peptide are read as the reference's
+    // (TranscriptVariationAllele.pm:716, 742-770, 868), so its two alleles print
+    // the one edited peptide.
     let alt = Allele {
         vf_seq: variant.alt_allele(),
-        is_reference: false,
+        is_reference: variant.reference_allele_row,
     };
     let windows = AlleleWindows::new(&ctx, &reference, &alt);
     out.amino_acids = windows.pep_allele_string(&ctx, &reference, &alt);
@@ -866,14 +1021,11 @@ pub fn apply_display_fields(
     transcript: &Transcript,
     numbers: bool,
 ) {
-    let d = display_fields(variant, transcript);
-    tc.cdna_position = d.cdna_position;
-    tc.cds_position = d.cds_position;
-    tc.protein_position = d.protein_position;
-    tc.amino_acids = d.amino_acids;
-    tc.codons = d.codons;
+    let mut fields = display_fields(variant, transcript);
+    fields.record_span_positions(variant, transcript);
+    fields.write_to(tc);
     let (exon, intron) = if numbers {
-        exon_intron_numbers(variant, transcript)
+        exon_intron_numbers(variant, variant, transcript)
     } else {
         (None, None)
     };
@@ -1063,6 +1215,22 @@ mod tests {
         assert_eq!(d.codons.as_deref(), Some("gcT/gcC"));
     }
 
+    /// An allele given on the strand opposite the transcript's enters the
+    /// alternate coding sequence through Ensembl's `reverse_comp`
+    /// (`_get_alternate_cds`, TranscriptVariationAllele.pm:2413-2417), so an
+    /// IUPAC letter is complemented too: `A/R` written on the reverse strand at
+    /// the T of the first GCT reads `T/Y`. The peptide stays undefined for an
+    /// ambiguous allele (`peptide`, :701).
+    #[test]
+    fn opposite_strand_allele_is_read_through_the_iupac_complement() {
+        let tx = forward_transcript();
+        let mut given = snv(1055, "A", "R");
+        given.strand = vep_core::coordinate::Strand::Reverse;
+        let d = display_fields(&given, &tx);
+        assert_eq!(d.codons.as_deref(), Some("gcT/gcY"));
+        assert_eq!(d.amino_acids, None);
+    }
+
     #[test]
     fn deletion_spans_print_ranges_and_whole_codon_deletion_gives_dash_peptide() {
         let tx = forward_transcript();
@@ -1136,6 +1304,87 @@ mod tests {
         assert_eq!(d.amino_acids, None);
     }
 
+    /// The totals `--total_length` appends (`OutputFactory.pm`
+    /// `TranscriptVariationAllele_to_output_hash`): the transcript's length (the
+    /// exon sum, `Transcript::length`) beside the cDNA position of a variant
+    /// overlapping an exon, the length of the cached `translateable_seq` beside
+    /// the CDS position and the length of the cached `peptide` beside the protein
+    /// position of a coding variant, the sequence totals only when the cache
+    /// carries the sequence; the positions themselves stay numeric. On the
+    /// fixture the exons sum to 500, the CDS is 300 bases and the peptide 99
+    /// residues.
+    #[test]
+    fn total_length_appends_cdna_cds_and_peptide_lengths() {
+        let mut tx = forward_transcript();
+        let mut vefc = tx.vefc.take().unwrap();
+        vefc.peptide = Some("M".to_string() + &"A".repeat(98));
+        tx.vefc = Some(vefc);
+        let d = display_fields(&snv(1052, "G", "A"), &tx);
+        assert_eq!(d.cdna_position.as_deref(), Some("53"));
+        assert_eq!(d.cds_position.as_deref(), Some("3"));
+        assert_eq!(d.protein_position.as_deref(), Some("1"));
+        assert_eq!(
+            (d.cdna_total, d.cds_total, d.protein_total),
+            (Some(500), Some(300), Some(99))
+        );
+        assert_eq!(d.amino_acids.as_deref(), Some("M/I"));
+        let d = display_fields(&deletion(1053, 1055, "GCT"), &tx);
+        assert_eq!(d.cdna_position.as_deref(), Some("54-56"));
+        assert_eq!(
+            (d.cdna_total, d.cds_total, d.protein_total),
+            (Some(500), Some(300), Some(99))
+        );
+        let d = display_fields(&snv(1010, "A", "G"), &tx);
+        assert_eq!(d.cdna_position.as_deref(), Some("11"));
+        assert_eq!(d.cdna_total, Some(500));
+        assert_eq!((d.cds_position, d.cds_total), (None, None));
+        assert_eq!((d.protein_position, d.protein_total), (None, None));
+        assert_eq!(
+            display_fields(&snv(1300, "A", "G"), &tx),
+            DisplayFields::default()
+        );
+        // Without a cached peptide the protein position gets no total.
+        let d = display_fields(&snv(1052, "G", "A"), &forward_transcript());
+        assert_eq!((d.cds_total, d.protein_total), (Some(300), None));
+    }
+
+    /// An insertion between the 5' UTR and the first coding base maps to one
+    /// CDS Gap, which the `coding` predicate admits as "partly in coding region"
+    /// (BaseVariationFeatureOverlapAllele.pm:555-556), so the CDS and protein
+    /// columns carry their totals behind the `-` of their unmapped positions
+    /// (OutputFactory.pm:1737-1743) and no codon or peptide: Ensembl VEP 116.2
+    /// prints `26-27/1648 -/765 -/254` for `21 31655250 T TG` against
+    /// ENST00000340345 on GRCh37, a `5_prime_UTR_variant`. On the fixture the
+    /// insertion after 1049 maps to cDNA 50-51 and CDS Gap alone. The span holds
+    /// no CDS coordinate, so a `--minimal` split over it is not within the CDS
+    /// (`within_cds`, VariationEffect.pm:645-651).
+    #[test]
+    fn utr_to_cds_boundary_insertion_prints_totals_behind_the_dash() {
+        let mut tx = forward_transcript();
+        let mut vefc = tx.vefc.take().unwrap();
+        vefc.peptide = Some("M".to_string() + &"A".repeat(98));
+        tx.vefc = Some(vefc);
+        let boundary = insertion(1049, "G");
+        let d = display_fields(&boundary, &tx);
+        assert_eq!(d.cdna_position.as_deref(), Some("50-51"));
+        assert_eq!(d.cdna_total, Some(500));
+        assert_eq!((d.cds_position, d.cds_total), (None, Some(300)));
+        assert_eq!((d.protein_position, d.protein_total), (None, Some(99)));
+        assert_eq!((d.amino_acids, d.codons), (None, None));
+        assert_eq!(d.translation_span, None);
+        let mut split = boundary.clone();
+        split.original_start = Some(1050);
+        split.original_end = Some(1049);
+        let mut fields = display_fields(&split, &tx);
+        fields.record_span_positions(&split, &tx);
+        assert!(!fields.record_span_in_cds);
+        // An insertion wholly inside the UTR admits the cDNA column alone.
+        let d = display_fields(&insertion(1040, "G"), &tx);
+        assert_eq!(d.cdna_position.as_deref(), Some("41-42"));
+        assert_eq!((d.cds_position, d.cds_total), (None, None));
+        assert_eq!((d.protein_position, d.protein_total), (None, None));
+    }
+
     #[test]
     fn intronic_and_upstream_variants_have_no_positions() {
         let tx = forward_transcript();
@@ -1147,6 +1396,68 @@ mod tests {
             display_fields(&snv(900, "A", "G"), &tx),
             DisplayFields::default()
         );
+    }
+
+    /// A `--minimal` split allele's columns print the record's span where its own
+    /// span admits the column, the own positions kept aside: Ensembl VEP 116.2
+    /// prints `?-418`, `?-66` and `?-22` for the exonic allele of a record over an
+    /// intron-exon boundary and `-` three times for its intronic allele, whose
+    /// cached `exon` predicate is false. On the fixture a record 1198-1200 (the
+    /// last two coding bases of exon 1 and the first intronic base) maps to cDNA
+    /// `199-?`, CDS `149-?` and protein `50-?`; an allele in the 5' UTR of a
+    /// record reaching the CDS prints the record's cDNA span alone.
+    #[test]
+    fn a_split_allele_prints_the_record_span_in_the_columns_its_own_span_admits() {
+        let tx = forward_transcript();
+        let split = |pos: u64, original: (u64, u64)| {
+            let mut variant = snv(pos, "G", "A");
+            variant.original_start = Some(original.0);
+            variant.original_end = Some(original.1);
+            let mut fields = display_fields(&variant, &tx);
+            fields.record_span_positions(&variant, &tx);
+            fields
+        };
+        let exonic = split(1198, (1198, 1200));
+        assert_eq!(
+            (
+                exonic.cdna_position.as_deref(),
+                exonic.cds_position.as_deref(),
+                exonic.protein_position.as_deref()
+            ),
+            (Some("199-?"), Some("149-?"), Some("50-?"))
+        );
+        assert_eq!(
+            exonic.own_span_positions.as_deref(),
+            Some(&OwnSpanPositions {
+                cdna: Some("199".into()),
+                cds: Some("149".into()),
+                protein: Some("50".into()),
+            })
+        );
+        let intronic = split(1200, (1198, 1200));
+        assert_eq!(
+            (
+                intronic.cdna_position,
+                intronic.cds_position,
+                intronic.protein_position
+            ),
+            (None, None, None)
+        );
+        assert_eq!(
+            intronic.own_span_positions.as_deref(),
+            Some(&OwnSpanPositions {
+                cdna: None,
+                cds: None,
+                protein: None,
+            })
+        );
+        let utr = split(1049, (1049, 1051));
+        assert_eq!(utr.cdna_position.as_deref(), Some("50-52"));
+        assert_eq!((utr.cds_position, utr.protein_position), (None, None));
+        let mut unsplit = display_fields(&snv(1198, "G", "A"), &tx);
+        unsplit.record_span_positions(&snv(1198, "G", "A"), &tx);
+        assert_eq!(unsplit.cdna_position.as_deref(), Some("199"));
+        assert_eq!(unsplit.own_span_positions, None);
     }
 
     #[test]
@@ -1215,29 +1526,52 @@ mod tests {
         let tx = forward_transcript();
         // Exonic SNV: exon 1 of 3, no intron.
         assert_eq!(
-            exon_intron_numbers(&snv(1052, "G", "A"), &tx),
+            exon_intron_numbers(&snv(1052, "G", "A"), &snv(1052, "G", "A"), &tx),
             (Some("1/3".to_string()), None)
         );
         // Intronic SNV deep in intron 1.
         assert_eq!(
-            exon_intron_numbers(&snv(1300, "A", "G"), &tx),
+            exon_intron_numbers(&snv(1300, "A", "G"), &snv(1300, "A", "G"), &tx),
             (None, Some("1/2".to_string()))
         );
         // A deletion from exon 1 across intron 1 into exon 2 numbers both.
         let big = deletion(1190, 1510, "A");
         assert_eq!(
-            exon_intron_numbers(&big, &tx),
+            exon_intron_numbers(&big, &big, &tx),
             (Some("1-2/3".to_string()), Some("1/2".to_string()))
         );
         // Two bases into the intron: the intron predicate fires (3-base reach)
         // and the intron is strictly overlapped; the exon is not.
         assert_eq!(
-            exon_intron_numbers(&snv(1201, "A", "G"), &tx),
+            exon_intron_numbers(&snv(1201, "A", "G"), &snv(1201, "A", "G"), &tx),
             (None, Some("1/2".to_string()))
         );
         // An insertion exactly at the exon/intron boundary touches neither.
         assert_eq!(
-            exon_intron_numbers(&insertion(1199, "T"), &tx),
+            exon_intron_numbers(&insertion(1199, "T"), &insertion(1199, "T"), &tx),
+            (None, None)
+        );
+    }
+
+    /// Under `--shift_3prime 1` the fetch runs at the shifted span and the
+    /// numbering at the placed span: a deletion placed at the last base of exon
+    /// 1 and shifted two bases into intron 1 fetches the intron alone, which the
+    /// placed span never overlaps, so both columns stay empty; shifted within
+    /// the exon it keeps its number; shifted past the transcript it has none.
+    #[test]
+    fn exon_and_intron_numbers_fetch_at_the_shifted_span_and_number_at_the_placed_one() {
+        let tx = forward_transcript();
+        let placed = deletion(1199, 1199, "A");
+        assert_eq!(
+            exon_intron_numbers(&deletion(1201, 1201, "A"), &placed, &tx),
+            (None, None)
+        );
+        assert_eq!(
+            exon_intron_numbers(&deletion(1198, 1198, "A"), &deletion(1196, 1196, "A"), &tx),
+            (Some("1/3".to_string()), None)
+        );
+        assert_eq!(
+            exon_intron_numbers(&deletion(2001, 2001, "A"), &deletion(1999, 1999, "A"), &tx),
             (None, None)
         );
     }

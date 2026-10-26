@@ -48,7 +48,7 @@ impl PrefetchData {
     /// Downcast the inner data to a concrete type.
     ///
     /// Returns `Err(PluginError::Run)` if the downcast fails, which indicates
-    /// a bug in the plugin (prefetch/annotate type mismatch).
+    /// a defect in the plugin (prefetch/annotate type mismatch).
     pub fn downcast<T: 'static>(self) -> Result<T, PluginError> {
         self.0
             .downcast::<T>()
@@ -76,6 +76,8 @@ impl PrefetchData {
 ///
 /// [`prefetch`]: BuiltinPlugin::prefetch
 /// [`annotate`]: BuiltinPlugin::annotate
+/// [`run_batch`]: BuiltinPlugin::run_batch
+/// [`run`]: BuiltinPlugin::run
 pub trait BuiltinPlugin: Send + Sync {
     /// Plugin name matching the `--plugin` CLI argument (e.g., "CADD").
     fn name(&self) -> &str;
@@ -158,10 +160,10 @@ pub trait BuiltinPlugin: Send + Sync {
 
     /// Batch-annotate a buffer of variants (single-phase fallback).
     ///
-    /// Called once per buffer (typically 5000 variants) when the plugin does
-    /// not implement the two-phase prefetch/annotate protocol. Tabix plugins
-    /// should prefer implementing [`prefetch`](BuiltinPlugin::prefetch) +
-    /// [`annotate`](BuiltinPlugin::annotate) instead.
+    /// Called once per buffer when the plugin does not implement the two-phase
+    /// prefetch/annotate protocol. Tabix plugins should prefer implementing
+    /// [`prefetch`](BuiltinPlugin::prefetch) + [`annotate`](BuiltinPlugin::annotate)
+    /// instead.
     ///
     /// Default implementation calls [`run`](BuiltinPlugin::run) for each
     /// variant/consequence pair.

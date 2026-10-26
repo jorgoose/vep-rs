@@ -1,27 +1,41 @@
 #!/usr/bin/perl
-# Storable-to-JSON converter that produces clean JSON matching vep-rs json_cache.rs.
-# Whitelists ONLY the fields the Rust parser expects, stripping all Perl internals.
+# Converts an Ensembl VEP Storable transcript cache into the JSON cache vep-rs
+# reads: transcripts/<chr>/<start>-<end>.json for every chromosome directory,
+# the variation files copied as they are into variations/<chr>/ (all_vars.gz with
+# its index, or the <start>-<end>_var.gz region files of a cache dumped without
+# the tabix conversion), info.json from the cache's info.txt, and its
+# chr_synonyms.txt copied beside them. Every field the cache dumper keeps on a
+# transcript is written under its own or a renamed key, flattened (a UTR object
+# to its sequence, a protein feature's analysis to its display label) or dropped
+# under a rule the parity audit names (the DROPPED table of
+# scripts/concordance/cache_parity_audit.pl).
 use strict;
 use warnings;
 use Storable qw(fd_retrieve);
 use JSON;
+use File::Copy qw(copy);
 use File::Path qw(make_path);
-use Scalar::Util qw(blessed reftype refaddr);
+use MIME::Base64 qw(encode_base64);
+use Scalar::Util qw(blessed reftype);
 
 my $cache_dir = $ARGV[0] or die "Usage: $0 cache_dir output_dir [chr1,chr2,...]\n";
 my $output_dir = $ARGV[1] or die "Usage: $0 cache_dir output_dir [chr1,chr2,...]\n";
 my @chrs = $ARGV[2] ? split(/,/, $ARGV[2]) : ();
 
-# --- Field whitelists (matching json_cache.rs structs) ---
+sub fail {
+    my ($message) = @_;
+    print STDERR "ERROR: [storable_to_json] $message\n";
+    exit 1;
+}
 
+# Transcript keys copied under their own name.
 my %TRANSCRIPT_FIELDS = map { $_ => 1 } qw(
-    stable_id version dbID start end strand biotype source description
-    gene_symbol gene_symbol_source gene_hgnc_id gene_phenotype gene_stable_id
-    is_canonical mane_select mane_plus_clinical tsl appris ccds
-    protein refseq swissprot trembl uniparc chr
-    cdna_coding_start cdna_coding_end coding_region_start coding_region_end
+    stable_id version dbID start end strand biotype source is_canonical
+    cdna_coding_start cdna_coding_end
 );
-# These also map to transcript fields with underscored Perl names
+# The identifiers VEP sets on the transcript under underscore-prefixed keys
+# (AnnotationSource/Database/Transcript.pm:272-284 and its prefetch_*_ids subs),
+# written unprefixed.
 my %TRANSCRIPT_RENAME = (
     '_gene_stable_id'    => 'gene_stable_id',
     '_gene_symbol'       => 'gene_symbol',
@@ -31,12 +45,14 @@ my %TRANSCRIPT_RENAME = (
     '_ccds'              => 'ccds',
     '_refseq'            => 'refseq',
     '_gene_version'      => 'gene_version',
-    # Protein-database cross-refs are stored on the Perl transcript with
-    # underscore-prefixed keys. Map them to the unprefixed name vep-rs expects.
     '_protein'           => 'protein',
     '_swissprot'         => 'swissprot',
     '_trembl'            => 'trembl',
     '_uniparc'           => 'uniparc',
+    '_uniprot_isoform'   => 'uniprot_isoform',
+    '_source_cache'      => 'source_cache',
+    '_gene_symbol_id'    => 'gene_symbol_id',
+    '_bam_edit_status'   => 'bam_edit_status',
 );
 
 # Special compound fields handled by dedicated functions
@@ -99,10 +115,12 @@ sub extract_protein_feature {
     for my $k (qw(start end hseqname)) {
         $out{$k} = $pf->{$k} if defined $pf->{$k};
     }
-    # analysis: extract display_label if it's an object
+    # The dumper keeps one key of the feature's analysis object, _display_label
+    # (AnnotationSource/Database/Transcript.pm:474-477); it becomes the string
+    # the DOMAINS column prints before the feature's own identifier.
     my $analysis = $pf->{analysis};
-    if (ref $analysis eq 'HASH' || (ref $analysis && eval { $analysis->{display_label} })) {
-        $out{analysis} = $analysis->{display_label};
+    if ((reftype($analysis) // '') eq 'HASH') {
+        $out{analysis} = $analysis->{_display_label} if defined $analysis->{_display_label};
     } elsif (defined $analysis && !ref $analysis) {
         $out{analysis} = $analysis;
     }
@@ -161,12 +179,28 @@ sub extract_mapper {
     return \%out;
 }
 
+my %matrices_written;
+
 sub extract_prediction_matrix {
-    my ($pm) = @_;
+    my ($pm, $tool) = @_;
     return undef unless ref $pm;
     my %out;
-    for my $k (qw(analysis sub_analysis peptide_length predictions_data)) {
+    for my $k (qw(analysis sub_analysis peptide_length translation_md5)) {
         $out{$k} = $pm->{$k} if defined $pm->{$k};
+    }
+    # A Bio::EnsEMBL::Variation::ProteinFunctionPredictionMatrix holds its
+    # predictions in `matrix`, the gzip blob the variation database stores
+    # (a `VEP` header, then one little-endian short per position and amino
+    # acid), and prediction_from_matrix gunzips it in place, so a matrix read
+    # before the dump is the expanded bytes and is gzipped again here.
+    if (defined $pm->{matrix}) {
+        my $blob = $pm->{matrix};
+        if (substr($blob, 0, 2) ne "\x1f\x8b") {
+            require Compress::Zlib;
+            $blob = Compress::Zlib::memGzip($blob) or die "gzip of a prediction matrix failed\n";
+        }
+        $out{predictions_data} = encode_base64($blob, '');
+        $matrices_written{$tool}++;
     }
     return \%out;
 }
@@ -198,12 +232,13 @@ sub extract_seq_string {
     # with a {seq} or {primary_seq}{seq} field. Returns undef when no string
     # can be recovered.
     #
-    # Perl VEP's _variation_effect_feature_cache->{three_prime_utr} stores a
-    # Bio::EnsEMBL::Slice ref blessed object whose ->seq() reads from the
-    # cache's primary_seq region. Without this extraction, JSON encoding emits
-    # null and vep-rs falls back to the clamped-peptide path, which emits
-    # `stop_lost` where Perl emits a 3'UTR term. Extracting the seq string keeps
-    # vep-rs offline+cache-only mode self-contained (no FASTA dependency).
+    # Ensembl VEP's _variation_effect_feature_cache->{three_prime_utr} stores a
+    # Bio::Seq (BaseTranscriptVariation.pm:1111 caches the transcript's
+    # three_prime_utr()), a blessed hash whose ->seq() reads its primary_seq.
+    # Without this extraction, JSON encoding emits null and vep-rs falls back to
+    # the clamped-peptide path, which emits `stop_lost` where Perl emits a 3'UTR
+    # term. Extracting the seq string keeps vep-rs offline+cache-only mode
+    # self-contained (no FASTA dependency).
     my ($val) = @_;
     return undef unless defined $val;
     return $val unless ref $val;
@@ -235,7 +270,7 @@ sub extract_vefc {
 
     my %out;
     $out{codon_table} = $vefc->{codon_table} if defined $vefc->{codon_table};
-    # five/three_prime_utr are blessed Bio::EnsEMBL::Slice objects in Storable;
+    # five/three_prime_utr are blessed Bio::Seq objects in Storable;
     # extract the underlying sequence string so vep-rs can use cache-only mode
     # without --fasta. See extract_seq_string above for rationale.
     if (defined $vefc->{five_prime_utr}) {
@@ -248,6 +283,8 @@ sub extract_vefc {
     }
     $out{translateable_seq} = $vefc->{translateable_seq} if defined $vefc->{translateable_seq};
     $out{peptide} = $vefc->{peptide} if defined $vefc->{peptide};
+    # Only a BAM-edited cache stores the spliced cDNA (AnnotationType/Transcript.pm:617).
+    $out{spliced_seq} = $vefc->{spliced_seq} if defined $vefc->{spliced_seq};
     # The translation's SeqEdits (initial_met, _selenocysteine, amino_acid_sub,
     # _stop_codon_rt), which VEP applies to the reference allele's peptide at
     # runtime (TranscriptVariationAllele::peptide). The cached peptide has them
@@ -285,7 +322,8 @@ sub extract_vefc {
         my %pfp_out;
         for my $key (qw(sift polyphen_humvar polyphen_humdiv)) {
             if (ref $pfp->{$key}) {
-                $pfp_out{$key} = extract_prediction_matrix($pfp->{$key});
+                my ($tool) = split /_/, $key;
+                $pfp_out{$key} = extract_prediction_matrix($pfp->{$key}, $tool);
             }
         }
         $out{protein_function_predictions} = \%pfp_out if keys %pfp_out;
@@ -299,14 +337,11 @@ sub extract_transcript {
     return undef unless ref $t;
     my %out;
 
-    # Direct fields
     for my $k (keys %TRANSCRIPT_FIELDS) {
         $out{$k} = $t->{$k} if defined $t->{$k};
     }
-    # Renamed fields (underscore-prefixed Perl internals)
     for my $pk (keys %TRANSCRIPT_RENAME) {
-        my $rk = $TRANSCRIPT_RENAME{$pk};
-        $out{$rk} = $t->{$pk} if defined $t->{$pk} && !defined $out{$rk};
+        $out{ $TRANSCRIPT_RENAME{$pk} } = $t->{$pk} if defined $t->{$pk};
     }
 
     # exons: from _trans_exon_array or exons
@@ -334,31 +369,43 @@ sub extract_transcript {
 
 my $json = JSON->new->utf8->canonical->allow_blessed->convert_blessed;
 
-opendir(my $dh, $cache_dir) or die "Cannot open $cache_dir: $!\n";
+my $info = read_info_txt("$cache_dir/info.txt");
+fail("$cache_dir uses the sereal serialiser; only a Storable cache converts")
+    if ($info->{serialiser_type} // '') eq 'sereal';
+
+opendir(my $dh, $cache_dir) or fail("cannot open $cache_dir: $!");
+# Every directory is a chromosome, as VEP lists them (CacheDir.pm:431): the
+# assembled chromosomes, patches, alternate loci, scaffolds and LRG regions.
 my @chr_dirs = sort grep { -d "$cache_dir/$_" && $_ !~ /^\./ } readdir($dh);
 closedir($dh);
-
-# Only standard chromosomes
-@chr_dirs = grep { /^(\d+|X|Y|MT)$/ } @chr_dirs;
 if (@chrs) {
+    my %present = map { $_ => 1 } @chr_dirs;
+    my @absent = grep { !$present{$_} } @chrs;
+    fail("no chromosome directory named @absent under $cache_dir") if @absent;
     my %wanted = map { $_ => 1 } @chrs;
     @chr_dirs = grep { $wanted{$_} } @chr_dirs;
 }
 
 print "Processing " . scalar(@chr_dirs) . " chromosomes\n";
+# A run that stops early leaves neither file, whatever an earlier run left there.
+unlink "$output_dir/info.json", "$output_dir/chr_synonyms.txt";
 
 my $total = 0;
 my $ok = 0;
 my $transcripts_total = 0;
+my $variation_files_total = 0;
 
 foreach my $chr (@chr_dirs) {
     my $chr_path = "$cache_dir/$chr";
     my $out_chr = "$output_dir/transcripts/$chr";
-    make_path($out_chr);
 
-    opendir(my $ch, $chr_path) or next;
-    my @files = sort grep { /^\d+-\d+\.gz$/ } readdir($ch);
+    opendir(my $ch, $chr_path) or fail("cannot open $chr_path: $!");
+    my @entries = readdir($ch);
     closedir($ch);
+    my @files = sort grep { /^\d+-\d+\.gz$/ } @entries;
+    fail("$chr_path holds sereal shards; only a Storable cache converts")
+        if !@files && grep { /^\d+-\d+\.sereal$/ } @entries;
+    make_path($out_chr);
 
     $total += scalar @files;
     my $chr_tx = 0;
@@ -369,9 +416,12 @@ foreach my $chr (@chr_dirs) {
         my $out = "$out_chr/$base";
 
         eval {
-            open my $fh, "gzip -dc $in |" or die "gzip pipe failed: $!";
+            open my $fh, '-|', 'gzip', '-dc', $in or die "gzip pipe failed: $!";
             my $data = fd_retrieve($fh);
-            close($fh);
+            # close on a piped open is false when gzip exited non-zero, and
+            # fd_retrieve returns undef, not an exception, when the image ends early.
+            close($fh) or die "gzip -dc failed (wait status $?)\n";
+            die "fd_retrieve returned no data (truncated Storable image)\n" unless defined $data;
 
             my @transcripts;
             if (ref($data) && (reftype($data) eq 'HASH' || blessed($data))) {
@@ -397,26 +447,77 @@ foreach my $chr (@chr_dirs) {
             $chr_tx += scalar @transcripts;
             open(my $ofh, ">", $out) or die "write failed: $!";
             print $ofh $json->encode(\@transcripts);
-            close($ofh);
+            close($ofh) or die "write failed: $!";
             $ok++;
         };
         if ($@) {
+            unlink $out;
             warn "WARN: $in: $@\n";
         }
     }
     $transcripts_total += $chr_tx;
-    print "  chr$chr: " . scalar(@files) . " files, $chr_tx transcripts\n";
+    my $variation_files = copy_variation_files($chr_path, "$output_dir/variations/$chr", \@entries);
+    $variation_files_total += $variation_files;
+    print "  chr$chr: " . scalar(@files) . " files, $chr_tx transcripts, $variation_files variation files\n";
 }
-# info.json: the cache metadata vep-rs prints in its output headers, translated
-# from the VEP cache's info.txt the way VEP's own reader does (CacheDir.pm
+fail("no transcript shards (<start>-<end>.gz) under $cache_dir") unless $total;
+my $failed_shards = $total - $ok;
+# A failed shard stops the run here, before chr_synonyms.txt and info.json are
+# written, so a partial output lacks both.
+fail("$failed_shards of $total shards failed to convert (see the WARN lines above)") if $failed_shards;
+
+# VEP reads the cache's chr_synonyms.txt when --synonyms is not given (CacheDir.pm:254).
+my $synonyms_in  = "$cache_dir/chr_synonyms.txt";
+my $synonyms_out = "$output_dir/chr_synonyms.txt";
+if (-e $synonyms_in) {
+    copy($synonyms_in, $synonyms_out) or fail("copy of chr_synonyms.txt failed: $!");
+    print "Wrote $synonyms_out\n";
+} else {
+    warn "WARN: no $synonyms_in; the cache carries no chromosome synonyms\n";
+}
+
+$info->{contig_order} = [sort by_contig_order @chr_dirs];
+# The dumper's `sift b` and `polyphen b` lines say the cache was dumped with
+# predictions. VEP reads a tool's availability from its `source_<tool>` line
+# alone (Cache/Transcript.pm:155 over the version data CacheDir.pm:468-470
+# collects), so a marker whose version line info.txt lacks is dropped, as is
+# one whose matrices this conversion did not write.
+for my $tool (qw(sift polyphen)) {
+    delete $info->{$tool} unless $matrices_written{$tool} && $info->{source_versions}{$tool};
+}
+write_info_json($info, "$output_dir/info.json");
+
+print "\nDone. Converted: $ok / $total files, $transcripts_total total transcripts, $variation_files_total variation files copied\n";
+
+# The variation files are read by vep-rs in the dumper's own format
+# (Pipeline/DumpVEP/Dumper/Variation.pm): all_vars.gz with the .csi or .tbi
+# tabix built on it, else every <start>-<end>_var.gz region file. Copied byte
+# for byte, never re-encoded. An all_vars.gz without its index stops the run:
+# the reader queries the index and never scans the file.
+sub copy_variation_files {
+    my ($chr_path, $out_chr, $entries) = @_;
+    my %present = map { $_ => 1 } @{$entries};
+    my @names_to_copy;
+    if ($present{'all_vars.gz'}) {
+        my ($index) = grep { $present{$_} } ('all_vars.gz.csi', 'all_vars.gz.tbi');
+        fail("$chr_path/all_vars.gz has no all_vars.gz.csi or all_vars.gz.tbi beside it") unless $index;
+        @names_to_copy = ('all_vars.gz', $index);
+    } else {
+        @names_to_copy = sort grep { /^\d+-\d+_var\.gz$/ } @{$entries};
+    }
+    return 0 unless @names_to_copy;
+    make_path($out_chr);
+    for my $name (@names_to_copy) {
+        copy("$chr_path/$name", "$out_chr/$name") or fail("copy of $chr_path/$name failed: $!");
+    }
+    return scalar @names_to_copy;
+}
+
+# info.txt is translated the way VEP's own reader does (CacheDir.pm
 # read_cache_info_file): every `source_<key>` line becomes a source version,
 # `variation_cols` becomes a list, `-` means unset, `cell_types` is not carried.
-write_info_json("$cache_dir/info.txt", "$output_dir/info.json");
-
-print "\nDone. Converted: $ok / $total files, $transcripts_total total transcripts\n";
-
-sub write_info_json {
-    my ($info_txt, $out_path) = @_;
+sub read_info_txt {
+    my ($info_txt) = @_;
     my %info = (source_versions => {});
     if (open my $ifh, "<", $info_txt) {
         while (my $line = <$ifh>) {
@@ -443,8 +544,37 @@ sub write_info_json {
     if ($cache_dir =~ m{/(\d+)(?:_[^/]+)?/?$}) {
         $info{cache_version} = $1 + 0;
     }
-    open(my $ofh, ">", $out_path) or die "write failed: $!";
-    print $ofh JSON->new->canonical->pretty->encode(\%info);
-    close($ofh);
+    return \%info;
+}
+
+# Autosomes by number, then X, Y and MT, then every other contig by name. The
+# numeric comparison runs on the copies contig_sort_key returns: sort aliases
+# its two operands to the contig list's own elements, and a `<=>` on those
+# marks them as numbers, which JSON::PP then writes unquoted in contig_order.
+sub contig_sort_key {
+    my ($contig) = @_;
+    return (0, $contig) if $contig =~ /^\d+$/;
+    return (1, $contig) if $contig eq 'X';
+    return (2, $contig) if $contig eq 'Y';
+    return (3, $contig) if $contig eq 'MT';
+    return (4, $contig);
+}
+
+sub by_contig_order {
+    my ($tier_a, $key_a) = contig_sort_key($a);
+    my ($tier_b, $key_b) = contig_sort_key($b);
+    return $tier_a <=> $tier_b if $tier_a != $tier_b;
+    return $tier_a == 0 ? $key_a <=> $key_b : $key_a cmp $key_b;
+}
+
+sub write_info_json {
+    my ($info, $out_path) = @_;
+    open(my $ofh, ">", $out_path) or fail("cannot write $out_path: $!");
+    print $ofh JSON->new->canonical->pretty->encode($info);
+    unless (close($ofh)) {
+        my $error = $!;
+        unlink $out_path;
+        fail("write of $out_path failed: $error");
+    }
     print "Wrote $out_path\n";
 }

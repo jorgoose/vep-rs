@@ -10,11 +10,24 @@ pub enum IoError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
-    /// A VCF parsing error.
-    #[error("VCF parse error: {0}")]
+    /// A record a parser cannot read, or a value a writer cannot serialise, the
+    /// reason as the whole message: it names the field refused, and a refused
+    /// line is skipped with it under every input format.
+    #[error("{0}")]
     VcfParse(String),
 
-    /// An unimplemented format.
-    #[error("format not implemented: {0}")]
-    NotImplemented(String),
+    /// Input refused by design, with the reason as the whole message.
+    #[error("{0}")]
+    Unsupported(String),
+
+    /// A transcript cache an input names a record in but a lookup cannot read,
+    /// the cache's own refusal as the whole message; the run stops and prints
+    /// it under the `cache` component, since the input itself is sound.
+    #[error("{0}")]
+    CacheUnreadable(String),
+
+    /// A line Ensembl VEP's parser warns about and reads past, the warning's
+    /// text as the whole message.
+    #[error("{0}")]
+    SkippedLine(String),
 }

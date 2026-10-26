@@ -1,0 +1,230 @@
+{
+ "vep_image": "ensemblorg/ensembl-vep@sha256:5c57abdc40b637cac198370b4c114777fa24de3336141fdf09d2b0c43cd4b8da",
+ "vep_image_tag": "ensemblorg/ensembl-vep:release_116.2",
+ "vep_version_reported": "ensembl-vep          : 116.2",
+ "cache_version": 116,
+ "vep_command": "vep -i variants.vcf -o <out> --offline --cache --dir_cache <cache> --cache_version 116 --species homo_sapiens --assembly GRCh38 --format vcf --buffer_size 5000 --fork 1 --no_stats --quiet --force_overwrite [--tab|--vcf|--json]",
+ "perl_cache": "homo_sapiens/116_GRCh38",
+ "fasta": "none on either side",
+ "input": "variants.vcf: 12 records of the suite reference's exemplars and two multi-allelic records at one of their loci (21:5047000 T/TG,A and T/A,TG), whose alleles trim to different spans under --minimal, the insertion's past the end of nsv6146554",
+ "sha256": {
+  "default.txt": "6f897762076c02d8d03cec0e833aac02d42a063c094e179fa08a5e3ab1427a1b",
+  "tab.txt": "116fee33f6695095aff3918ee8ee69c58584eadef8ce041c891a7aeb3ac4ba39",
+  "vcf.vcf": "dc629d588cb49bfcaccebea3a950e3e1512d4f4fa0f6447b0dd110811e6d3648",
+  "json.jsonl": "99354e4623dd60e11d33b1b61496a18dde08788e2a42b2b3f55a3e6da12c9f7e"
+ },
+ "variants_vcf_sha256": "33bda167d7dd0f8f9b8bba7ce1f9e053209f6fb893e78dc16359751fa87a0da3",
+ "generator": "scripts/golden/build_golden_corpus.py select; scripts/golden/prune_json_cache.py --gzip --drop sorted_exons --drop protein_features --drop protein_function_predictions --perl-info <cache>/info.txt --cache-version 116; scripts/concordance/generate_reference_output.sh --corpus (the default run); the check-svs and check-svs-minimal flag sets' outputs from the vep command recorded under each flag_sets entry, run in the same image with a connection to Ensembl's public database, since Ensembl VEP refuses --check_svs offline; scripts/golden/build_golden_corpus.py flag-set; scripts/golden/build_golden_corpus.py classify",
+ "flag_sets": {
+  "check-svs": {
+   "flags": [
+    "--check_svs",
+    "structural_variants.vcf.gz"
+   ],
+   "input": "variants.vcf",
+   "expected_dir": "expected_check-svs",
+   "vep_command": "vep -i variants.vcf -o <out> --cache --dir_cache <cache> --cache_version 116 --db_version 116 --check_svs --species homo_sapiens --assembly GRCh38 --format vcf --buffer_size 5000 --fork 1 --no_stats --quiet --force_overwrite [--tab|--vcf|--json]",
+   "vep_mode": "transcripts from the release-116 cache, structural variants from homo_sapiens_variation_116_38 on ensembldb.ensembl.org:3306 (Config.pm:287-289 defaults), the database structural_variant_slice.source is dumped from; the output headers name the connection and the DB version, which the golden comparators set aside",
+   "sha256": {
+    "default.txt": "756e1d8874f7d77519bfdddf791d5e5097f289d7f7e71d71d7d059f7daccf090",
+    "tab.txt": "9771c2da41cb57e1b134a02ee490456ee05cc06d53a4dea2a1c250da2cc21161",
+    "vcf.vcf": "660a245eea779e814f54d51e5c9020406dc40548efd18eef73821226a25d0ec5",
+    "json.jsonl": "c651d05815566992b2379c260508e667a12174ca9586db6f7f5f350fe75ac47b"
+   }
+  },
+  "check-svs-minimal": {
+   "flags": [
+    "--minimal",
+    "--check_svs",
+    "structural_variants.vcf.gz"
+   ],
+   "input": "variants.vcf",
+   "expected_dir": "expected_check-svs-minimal",
+   "vep_command": "vep -i variants.vcf -o <out> --cache --dir_cache <cache> --cache_version 116 --db_version 116 --minimal --check_svs --species homo_sapiens --assembly GRCh38 --format vcf --buffer_size 5000 --fork 1 --no_stats --quiet --force_overwrite [--tab|--vcf|--json]",
+   "vep_mode": "transcripts from the release-116 cache, structural variants from homo_sapiens_variation_116_38 on ensembldb.ensembl.org:3306 (Config.pm:287-289 defaults), the database structural_variant_slice.source is dumped from; the output headers name the connection and the DB version, which the golden comparators set aside",
+   "sha256": {
+    "default.txt": "bd12f68a33e03b202ea84b689af42948e067ac5ba131ad123bd244546d45e1cc",
+    "tab.txt": "de296d827d01bf7999d0725b76243febffbab971db9e39746a5d787c624d317e",
+    "vcf.vcf": "83f955fc851bc5c8af736143eb531c75f665459b42b8350de4c19603449ff22d",
+    "json.jsonl": "d01cb59b41b3c9dee475d710116c3b0d42266d389f92e88fd7b72baf9e83433a"
+   }
+  }
+ },
+ "structural_variant_slice": {
+  "source": "homo_sapiens_structural_variations.vcf.gz of Ensembl release 116, GRCh38 (ftp.ensembl.org/pub/release-116/variation/vcf/homo_sapiens/; 252,904,995 bytes, fileDate 20260404), with its .csi",
+  "source_sha256": {
+   "homo_sapiens_structural_variations.vcf.gz": "130b601e4ee043939ddff3c350c430c23cc24d346e998f75aaa40d143d12942e",
+   "homo_sapiens_structural_variations.vcf.gz.csi": "98e6af0907d9c40a953007b7ff4b1ea3a07de0b875704d249d627f2b38e0ec61"
+  },
+  "window": "every record whose span (POS + 1 to END) meets the span of an input record, supporting-evidence (Parent) records included so the reader's exclusion is exercised",
+  "records_kept": 987,
+  "top_level": 268,
+  "parent": 719,
+  "index": "bgzip and tabix -C -p vcf (htslib 1.9) in the image",
+  "sha256": {
+   "structural_variants.vcf.gz": "91266584372ddf15c7a5e792f1dfa2dd7b10a355795f43dae03478f428ecf0b1",
+   "structural_variants.vcf.gz.csi": "b5520a3c2da65bf7684d4fbad714617e4574fc07b37dc6568e535b56a0d18931"
+  },
+  "source_scan": {
+   "records": 32901086,
+   "reference_sequences": "the index names the 25 chromosomes (1 to 22, X, Y, MT) and no scaffold or patch; homo_sapiens_variation_116_38 holds 27,305 top-level features on 360 other seq_regions, 4,903 of them on 75 GL and KI scaffolds, which the dump lacks",
+   "parent": 26176437,
+   "top_level": 6724649,
+   "probe_class": 0,
+   "records_at_pos_1": 0,
+   "records_at_pos_1_note": "a record at POS 1 would be a feature starting at base 1 or 2 (POS = start - 1, floored at 1); the dump has none because its export drops a feature starting at the first base of a slice piece and no feature of the dumped chromosomes starts at base 2; the database holds six top-level features starting at base 1 on the chromosomes 4 (nsv5673565, nsv7148161), 9 (nsv4684191), 12 (nsv3971839), X (nsv3872609, the whole chromosome) and Y (nsv3882985, the whole chromosome)",
+   "records_without_END": 0,
+   "records_with_END_below_POS_plus_1": 0,
+   "imprecise": 2840495,
+   "svtype": {
+    "Alu_deletion": {
+     "records": 44342,
+     "top_level": 0,
+     "parent": 44342
+    },
+    "Alu_insertion": {
+     "records": 2362631,
+     "top_level": 0,
+     "parent": 2362631
+    },
+    "HERV_deletion": {
+     "records": 548,
+     "top_level": 0,
+     "parent": 548
+    },
+    "HERV_insertion": {
+     "records": 475,
+     "top_level": 0,
+     "parent": 475
+    },
+    "LINE1_deletion": {
+     "records": 8322,
+     "top_level": 0,
+     "parent": 8322
+    },
+    "LINE1_insertion": {
+     "records": 16395,
+     "top_level": 0,
+     "parent": 16395
+    },
+    "SVA_deletion": {
+     "records": 3066,
+     "top_level": 0,
+     "parent": 3066
+    },
+    "SVA_insertion": {
+     "records": 13563,
+     "top_level": 0,
+     "parent": 13563
+    },
+    "complex_chromosomal_rearrangement": {
+     "records": 661,
+     "top_level": 661,
+     "parent": 0
+    },
+    "complex_structural_alteration": {
+     "records": 1000,
+     "top_level": 758,
+     "parent": 242
+    },
+    "complex_substitution": {
+     "records": 35250,
+     "top_level": 15340,
+     "parent": 19910
+    },
+    "copy_number_gain": {
+     "records": 1122846,
+     "top_level": 0,
+     "parent": 1122846
+    },
+    "copy_number_loss": {
+     "records": 2283699,
+     "top_level": 0,
+     "parent": 2283699
+    },
+    "copy_number_variation": {
+     "records": 4538801,
+     "top_level": 3531949,
+     "parent": 1006852
+    },
+    "deletion": {
+     "records": 10077486,
+     "top_level": 0,
+     "parent": 10077486
+    },
+    "duplication": {
+     "records": 1029198,
+     "top_level": 0,
+     "parent": 1029198
+    },
+    "indel": {
+     "records": 1105939,
+     "top_level": 3630,
+     "parent": 1102309
+    },
+    "insertion": {
+     "records": 3178593,
+     "top_level": 1461802,
+     "parent": 1716791
+    },
+    "interchromosomal_translocation": {
+     "records": 13284,
+     "top_level": 0,
+     "parent": 13284
+    },
+    "intrachromosomal_translocation": {
+     "records": 51312,
+     "top_level": 0,
+     "parent": 51312
+    },
+    "inversion": {
+     "records": 160865,
+     "top_level": 65433,
+     "parent": 95432
+    },
+    "loss_of_heterozygosity": {
+     "records": 50,
+     "top_level": 25,
+     "parent": 25
+    },
+    "mobile_element_deletion": {
+     "records": 30774,
+     "top_level": 24478,
+     "parent": 6296
+    },
+    "mobile_element_insertion": {
+     "records": 966397,
+     "top_level": 195867,
+     "parent": 770530
+    },
+    "novel_sequence_insertion": {
+     "records": 18272,
+     "top_level": 9111,
+     "parent": 9161
+    },
+    "sequence_alteration": {
+     "records": 34956,
+     "top_level": 19947,
+     "parent": 15009
+    },
+    "short_tandem_repeat_variation": {
+     "records": 5721884,
+     "top_level": 1328291,
+     "parent": 4393593
+    },
+    "tandem_duplication": {
+     "records": 15489,
+     "top_level": 4029,
+     "parent": 11460
+    },
+    "translocation": {
+     "records": 64988,
+     "top_level": 63328,
+     "parent": 1660
+    }
+   }
+  },
+  "database_check": "chromosome 21 of homo_sapiens_variation_116_38: every one of the file's 96,903 top-level records has an identical (name, POS + 1, END) row among the 97,616 germline, non-evidence, non-probe, non-failed features; the other 713 database rows are further mappings of names the file carries (708 of a name it carries once, 5 of a name it carries twice), so the file and the database name the same 96,869 variants, and the further mappings lie under the same name's file mapping except at 590 of the chromosome's 46,709,983 positions (586 runs), where the database names a feature the file lacks; no feature has start > end; failed_structural_variation holds none of them; the 2,470 somatic features are absent from the dump",
+  "slice_check": "Ensembl VEP 116.2 with --check_svs against the database and vep-rs with --check_svs on this slice name the same structural variants for every record (the expected_check-svs outputs); every input span's name set is the same in the file and in the database"
+ }
+}

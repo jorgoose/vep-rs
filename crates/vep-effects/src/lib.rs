@@ -11,11 +11,13 @@ pub mod coding;
 pub mod consequences;
 pub mod display;
 pub mod hgvs;
+pub mod hgvsg;
 pub mod mapper;
 pub mod overlap;
+pub mod spdi;
 pub mod sv;
 
-pub use consequences::{calculate_consequences, EffectsConfig};
+pub use consequences::{calculate_consequences, shift_indel_3prime, shift_motif, EffectsConfig};
 pub use overlap::find_overlapping_transcripts;
 
 /// Test helpers for building mock transcripts. Available in tests only.
@@ -145,13 +147,13 @@ pub(crate) mod test_helpers {
             version: Some(1),
             db_id: None,
             gene_stable_id: "ENSG00000000001".into(),
+            gene_version: None,
             chr: "21".into(),
             start: 25_000_000,
             end: 25_006_000,
             strand: Strand::Forward,
             biotype: "protein_coding".into(),
             source: "Ensembl".into(),
-            description: None,
             gene_symbol: Some("TEST1".into()),
             gene_symbol_source: Some("HGNC".into()),
             hgnc_id: Some("HGNC:0001".into()),
@@ -167,6 +169,7 @@ pub(crate) mod test_helpers {
             swissprot: None,
             trembl: None,
             uniparc: None,
+            uniprot_isoform: None,
             exons: exons.clone(),
             introns,
             cdna_coding_start: Some(51),
@@ -188,10 +191,12 @@ pub(crate) mod test_helpers {
             cdna_sequence: None,
             protein_sequence: None,
             flags: Arc::from([]),
+            gencode_basic: false,
             gencode_primary: false,
             attributes: vec![],
             vefc: Some(vefc),
             derived: Default::default(),
+            id_rank: 0,
         }
     }
 
@@ -258,13 +263,13 @@ pub(crate) mod test_helpers {
             version: Some(1),
             db_id: None,
             gene_stable_id: "ENSG00000000001".into(),
+            gene_version: None,
             chr: "21".into(),
             start: START,
             end,
             strand,
             biotype: "protein_coding".into(),
             source: "Ensembl".into(),
-            description: None,
             gene_symbol: Some("TEST1".into()),
             gene_symbol_source: Some("HGNC".into()),
             hgnc_id: Some("HGNC:0001".into()),
@@ -280,6 +285,7 @@ pub(crate) mod test_helpers {
             swissprot: None,
             trembl: None,
             uniparc: None,
+            uniprot_isoform: None,
             exons,
             introns: vec![],
             cdna_coding_start: Some(SINGLE_EXON_UTR5 + 1),
@@ -301,10 +307,12 @@ pub(crate) mod test_helpers {
             cdna_sequence: None,
             protein_sequence: None,
             flags: Arc::from([]),
+            gencode_basic: false,
             gencode_primary: false,
             attributes: vec![],
             vefc: Some(vefc),
             derived: Default::default(),
+            id_rank: 0,
         }
     }
 

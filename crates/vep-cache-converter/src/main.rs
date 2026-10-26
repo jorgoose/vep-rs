@@ -5,16 +5,23 @@
 //!
 //! Two conversion modes:
 //! - **cache** (default): Copy and validate a flat JSON cache directory whose
-//!   region files are named `{chr}_{start}-{end}.json` directly under
-//!   `transcripts/` and `variations/`, writing the per-chromosome runtime layout
+//!   transcript region files are named `{chr}_{start}-{end}.json` directly under
+//!   `transcripts/`, writing the per-chromosome runtime layout
 //!   `transcripts/<chr>/<start>-<end>.json` consumed by vep-cli, plus `info.json`.
+//!   The variation files are the Ensembl VEP dumper's own, copied unchanged to
+//!   `variations/<chr>/`: `all_vars.gz` with its `.csi` or `.tbi`, or
+//!   `{start}-{end}_var.gz`, read from `variations/<chr>/`, or with a `{chr}_`
+//!   prefix from directly under `variations/`. The checksum manifest
+//!   `CHECKSUMS.sha256` is written last, over every file then under the output
+//!   directory: the files this conversion wrote and any an earlier use of the
+//!   same `--output-dir` left there.
 //! - **convert-plugin-data**: Convert tabix-indexed plugin data files
 //!   (`.tsv.gz`) to the binary annotation store format (`.vpd` + `.vpdi`)
 //!   for mmap-backed zero-copy lookups.
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -22,6 +29,9 @@ use std::time::Instant;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use tracing::{info, warn};
+use vep_builtins::PluginError;
+use vep_core::cache_manifest::CacheManifest;
+use vep_core::coordinate::is_cache_path_component;
 
 #[derive(Parser)]
 #[command(
@@ -34,7 +44,7 @@ struct Cli {
 
     // Top-level args serve the invocation with no subcommand.
     /// Path to a flat JSON cache directory (`{chr}_{start}-{end}.json` region
-    /// files under `transcripts/` and `variations/`).
+    /// files under `transcripts/`, the dumper's variation files under `variations/`).
     #[arg(long)]
     json_dir: Option<String>,
 
@@ -234,7 +244,10 @@ fn convert_plugin_data(
     Ok(())
 }
 
-/// Read all records from a tabix file, grouped by chromosome and sorted by position.
+/// Read all records from a tabix file, grouped by chromosome and sorted by
+/// position. The file is read with the length of a line capped
+/// ([`vep_builtins::tabix::BoundedLines`]): a line past the cap fails the
+/// conversion, naming the file and the line.
 fn read_tabix_records(path: &Path, cfg: &TabixConvertConfig) -> Result<GroupedRecords> {
     use noodles::bgzf;
 
@@ -248,8 +261,12 @@ fn read_tabix_records(path: &Path, cfg: &TabixConvertConfig) -> Result<GroupedRe
     let mut records_by_chr: BTreeMap<String, Vec<vep_builtins::tabix::TabixRecord>> =
         BTreeMap::new();
 
-    for line_result in buf_reader.lines() {
-        let line = line_result.context("failed to read line from bgzf")?;
+    for line_result in vep_builtins::tabix::BoundedLines::new(buf_reader, path) {
+        // The reader's errors name a plugin; the file is the conversion's input.
+        let line = line_result.map_err(|error| match error {
+            PluginError::Init(message) | PluginError::Run(message) => anyhow::anyhow!(message),
+            PluginError::Io(error) => anyhow::Error::from(error),
+        })?;
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -272,7 +289,9 @@ fn read_tabix_records(path: &Path, cfg: &TabixConvertConfig) -> Result<GroupedRe
             .parse()
             .with_context(|| format!("invalid start position: {}", columns[cfg.start_col]))?;
         let start = if cfg.zero_based {
-            start_raw + 1
+            start_raw
+                .checked_add(1)
+                .with_context(|| format!("invalid start position: {start_raw}"))?
         } else {
             start_raw
         };
@@ -435,22 +454,24 @@ fn convert_cache(json_dir: &Path, output_dir: &str, _region_size: u64) -> Result
         "transcripts",
     )?;
 
-    let (variation_regions, variation_entries) = convert_data_files(
+    let (variation_chromosomes, variation_files) = copy_variation_files(
         &json_dir.join("variations"),
         &output_path.join("variations"),
-        "variations",
     )?;
+
+    let listed = CacheManifest::write(output_path).context("Failed to write CHECKSUMS.sha256")?;
 
     info!(
         "Conversion complete: {} transcript regions ({} transcripts), \
-         {} variation regions ({} variations)",
-        transcript_regions, transcript_entries, variation_regions, variation_entries
+         {} variation files on {} chromosomes, {} files in the checksum manifest",
+        transcript_regions, transcript_entries, variation_files, variation_chromosomes, listed
     );
 
     Ok(())
 }
 
-/// Copy and validate info.json.
+/// Copy `info.json`, and `chr_synonyms.txt` when the source has one, once
+/// [`validate_info`] accepts the metadata.
 fn copy_info_json(json_dir: &Path, output_path: &Path) -> Result<()> {
     let src = json_dir.join("info.json");
     let dst = output_path.join("info.json");
@@ -460,26 +481,188 @@ fn copy_info_json(json_dir: &Path, output_path: &Path) -> Result<()> {
 
     let value: serde_json::Value = serde_json::from_str(&content)
         .with_context(|| format!("Failed to parse info.json at {}", src.display()))?;
-
-    if let Some(obj) = value.as_object() {
-        let species = obj
-            .get("species")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-        let assembly = obj
-            .get("assembly")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-        info!("Cache info: species={}, assembly={}", species, assembly);
-    }
+    validate_info(&value).with_context(|| format!("{} is not a cache's info", src.display()))?;
+    let species = value["species"].as_str().unwrap_or_default();
+    let assembly = value["assembly"].as_str().unwrap_or_default();
+    info!("Cache info: species={}, assembly={}", species, assembly);
 
     fs::write(&dst, &content).with_context(|| format!("Failed to write {}", dst.display()))?;
-
     info!("Copied info.json");
+
+    let synonyms = json_dir.join("chr_synonyms.txt");
+    if synonyms.is_file() {
+        fs::copy(&synonyms, output_path.join("chr_synonyms.txt"))
+            .with_context(|| format!("Failed to copy {}", synonyms.display()))?;
+        info!("Copied chr_synonyms.txt");
+    }
     Ok(())
 }
 
-/// Convert all JSON files in a data subdirectory (transcripts or variations).
+/// The metadata every cache carries and the runtime reads: an object with a
+/// non-empty `species` and `assembly`, the two lines Ensembl VEP's dumper
+/// writes first (`Pipeline/DumpVEP/Dumper/Core.pm:95`; the resolution compares
+/// the assembly with `--assembly` and the cache directory's name), a
+/// `contig_order` that is a list of strings when present, and a
+/// `variation_cols` that is a list of strings when present; any other shape is
+/// an error.
+fn validate_info(value: &serde_json::Value) -> Result<()> {
+    let Some(obj) = value.as_object() else {
+        bail!("info.json is not a JSON object");
+    };
+    for key in ["species", "assembly"] {
+        match obj.get(key).and_then(|v| v.as_str()) {
+            Some(text) if !text.is_empty() => {}
+            _ => bail!("info.json lacks a non-empty {key} string"),
+        }
+    }
+    for key in ["contig_order", "variation_cols"] {
+        if let Some(list) = obj.get(key) {
+            let is_string_list = list
+                .as_array()
+                .is_some_and(|items| items.iter().all(|item| item.is_string()));
+            if !is_string_list {
+                bail!("info.json {key} is not a list of strings");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Copy the variation files into the runtime layout `variations/<chr>/`.
+///
+/// Copies, byte for byte, `all_vars.gz` with its `.csi` or `.tbi` and
+/// `{start}-{end}_var.gz` from `src_dir/<chr>/`, and the same names prefixed
+/// `{chr}_` from directly under `src_dir`. Two inputs are refused: a `.json`
+/// file, because the variation source reads the dumper's files only, and an
+/// `all_vars.gz` without its index.
+///
+/// Returns (chromosome_count, file_count).
+fn copy_variation_files(src_dir: &Path, dst_dir: &Path) -> Result<(usize, usize)> {
+    if !src_dir.exists() {
+        warn!("variations directory not found: {}", src_dir.display());
+        return Ok((0, 0));
+    }
+    let mut entries: Vec<_> = fs::read_dir(src_dir)
+        .context("Failed to read variations directory")?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|e| e.file_name());
+
+    let mut planned: Vec<(String, String, PathBuf)> = Vec::new();
+    for entry in &entries {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if path.is_dir() {
+            if !is_cache_path_component(&name) {
+                warn!("Skipping directory with unexpected name: {}", name);
+                continue;
+            }
+            let mut files: Vec<_> = fs::read_dir(&path)
+                .with_context(|| format!("Failed to read {}", path.display()))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            files.sort_by_key(|e| e.file_name());
+            for file in files {
+                let file_name = file.file_name().to_string_lossy().into_owned();
+                if variation_file_kind(&file_name).is_some() {
+                    planned.push((name.clone(), file_name, file.path()));
+                } else if file_name.ends_with(".json") {
+                    return Err(json_shard_error(&file.path()));
+                } else {
+                    warn!("Skipping file with unexpected name: {}/{}", name, file_name);
+                }
+            }
+        } else if name.ends_with(".json") {
+            return Err(json_shard_error(&path));
+        } else if let Some((chr, file_name)) = split_flat_variation_name(&name) {
+            planned.push((chr, file_name, path));
+        } else {
+            warn!("Skipping file with unexpected name: {}", name);
+        }
+    }
+
+    // Checked before anything is copied, so a refused source leaves no partial output.
+    let chromosomes: std::collections::BTreeSet<&str> =
+        planned.iter().map(|(chr, _, _)| chr.as_str()).collect();
+    for chr in &chromosomes {
+        let kinds: Vec<VariationFileKind> = planned
+            .iter()
+            .filter(|(planned_chr, _, _)| planned_chr == chr)
+            .filter_map(|(_, file_name, _)| variation_file_kind(file_name))
+            .collect();
+        let has_all_vars = kinds.contains(&VariationFileKind::AllVars);
+        let has_index = kinds.contains(&VariationFileKind::Index);
+        if has_all_vars && !has_index {
+            bail!("variations: chr {chr} has all_vars.gz without its .csi or .tbi index");
+        }
+    }
+    for (chr, file_name, src) in &planned {
+        let chr_dir = dst_dir.join(chr);
+        fs::create_dir_all(&chr_dir)
+            .with_context(|| format!("Failed to create directory {}", chr_dir.display()))?;
+        let dst = chr_dir.join(file_name);
+        fs::copy(src, &dst)
+            .with_context(|| format!("Failed to copy {} to {}", src.display(), dst.display()))?;
+        info!("variations: chr {} {}", chr, file_name);
+    }
+    info!(
+        "Total variations: {} files on {} chromosomes",
+        planned.len(),
+        chromosomes.len()
+    );
+    Ok((chromosomes.len(), planned.len()))
+}
+
+/// The error refusing a `.json` file under `variations/`.
+fn json_shard_error(path: &Path) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{} is a JSON variation shard; the variation source reads all_vars.gz or \
+         <start>-<end>_var.gz files only",
+        path.display()
+    )
+}
+
+/// One of the dumper's variation files, told from its name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VariationFileKind {
+    /// `all_vars.gz`.
+    AllVars,
+    /// `all_vars.gz.csi` or `all_vars.gz.tbi`.
+    Index,
+    /// `<start>-<end>_var.gz`.
+    Region,
+}
+
+/// The kind of dumper variation file `name` is, or `None` for any other name.
+fn variation_file_kind(name: &str) -> Option<VariationFileKind> {
+    match name {
+        "all_vars.gz" => Some(VariationFileKind::AllVars),
+        "all_vars.gz.csi" | "all_vars.gz.tbi" => Some(VariationFileKind::Index),
+        _ => {
+            let span = name.strip_suffix("_var.gz")?;
+            let (start, end) = span.split_once('-')?;
+            (start.parse::<u64>().is_ok() && end.parse::<u64>().is_ok())
+                .then_some(VariationFileKind::Region)
+        }
+    }
+}
+
+/// Split a flat variation file name `{chr}_all_vars.gz[.csi|.tbi]` or
+/// `{chr}_{start}-{end}_var.gz` into the chromosome and the file's name under
+/// `variations/<chr>/`. The chromosome may itself carry underscores, so each
+/// `_` is tried as the split until what follows it is a variation file name;
+/// a chromosome that cannot name a directory of the output
+/// ([`is_cache_path_component`]) is no split.
+fn split_flat_variation_name(name: &str) -> Option<(String, String)> {
+    for (underscore, _) in name.match_indices('_') {
+        let chr = &name[..underscore];
+        let file_name = &name[underscore + 1..];
+        if is_cache_path_component(chr) && variation_file_kind(file_name).is_some() {
+            return Some((chr.to_string(), file_name.to_string()));
+        }
+    }
+    None
+}
+
+/// Convert all JSON files in a data subdirectory (transcripts).
 ///
 /// Reads each `{chr}_{start}-{end}.json` file, validates the JSON, and writes
 /// it to `output_dir/{chr}/{start}-{end}.json`.
@@ -563,13 +746,15 @@ fn convert_data_files(src_dir: &Path, dst_dir: &Path, label: &str) -> Result<(us
 
 /// Parse a region filename like `21_25000001-26000000` or `LRG_485_1-1000000`.
 ///
-/// Returns `(chromosome, start, end)` or `None` if the format does not match.
+/// Returns `(chromosome, start, end)`, or `None` if the format does not match
+/// or the chromosome cannot name a directory of the output
+/// ([`is_cache_path_component`]).
 fn parse_region_filename(filename: &str) -> Option<(String, u64, u64)> {
     // Split from the right on '_' to separate chr from the range part.
     // This handles chromosome names that contain underscores (e.g., "LRG_485").
     let (chr, range_str) = filename.rsplit_once('_')?;
 
-    if chr.is_empty() {
+    if !is_cache_path_component(chr) {
         return None;
     }
 
@@ -607,5 +792,337 @@ mod tests {
         assert_eq!(parse_region_filename("invalid"), None);
         assert_eq!(parse_region_filename("_1-2"), None);
         assert_eq!(parse_region_filename("chr_abc-def"), None);
+    }
+
+    /// A file name whose chromosome part is `.` or `..` names no region or
+    /// variation file: joined onto the output directory it would name the
+    /// directory itself or its parent, so the file is skipped with the warning
+    /// every unexpected name gets.
+    #[test]
+    fn a_chromosome_of_dots_names_no_file() {
+        for chr in [".", ".."] {
+            assert_eq!(parse_region_filename(&format!("{chr}_1-1000000")), None);
+            assert_eq!(
+                split_flat_variation_name(&format!("{chr}_all_vars.gz")),
+                None
+            );
+            assert_eq!(
+                split_flat_variation_name(&format!("{chr}_all_vars.gz.tbi")),
+                None
+            );
+        }
+        assert_eq!(
+            parse_region_filename("HSCHR6_MHC_COX_1-1000000"),
+            Some(("HSCHR6_MHC_COX".to_string(), 1, 1000000))
+        );
+    }
+
+    /// Region and variation files named for the parent directory are skipped and
+    /// nothing is written beside the transcripts and variations directories.
+    #[test]
+    fn files_named_for_the_parent_directory_write_nothing_outside_their_directory() {
+        let tmp = Scratch::new();
+        let src = tmp.path().join("json");
+        fs::create_dir_all(src.join("transcripts")).unwrap();
+        fs::create_dir_all(src.join("variations")).unwrap();
+        fs::write(src.join("transcripts/.._1-1000000.json"), b"[]").unwrap();
+        fs::write(src.join("transcripts/21_1-1000000.json"), b"[]").unwrap();
+        fs::write(src.join("variations/.._all_vars.gz"), b"gz").unwrap();
+        fs::write(src.join("variations/.._all_vars.gz.tbi"), b"tbi").unwrap();
+        let out = tmp.path().join("out");
+        let transcripts = out.join("transcripts");
+        assert_eq!(
+            convert_data_files(&src.join("transcripts"), &transcripts, "transcripts").unwrap(),
+            (1, 0)
+        );
+        assert_eq!(
+            copy_variation_files(&src.join("variations"), &out.join("variations")).unwrap(),
+            (0, 0)
+        );
+        assert_eq!(entries(&out), ["transcripts"]);
+        assert_eq!(entries(&transcripts), ["21"]);
+        assert!(!tmp.path().join("1-1000000.json").exists());
+    }
+
+    /// A variation directory whose name holds a separator (`21\22`, one
+    /// directory on Unix) is skipped with its files: joined onto the output
+    /// directory on a platform that reads the backslash as a separator it would
+    /// name a directory below `21`. The directory beside it is copied.
+    #[cfg(unix)]
+    #[test]
+    fn a_variation_directory_whose_name_holds_a_separator_is_skipped() {
+        let tmp = Scratch::new();
+        let src = tmp.path().join("variations");
+        for dir in ["21\\22", "21"] {
+            let chr_dir = src.join(dir);
+            fs::create_dir_all(&chr_dir).unwrap();
+            fs::write(chr_dir.join("all_vars.gz"), b"gz").unwrap();
+            fs::write(chr_dir.join("all_vars.gz.csi"), b"csi").unwrap();
+        }
+        let out = tmp.path().join("out");
+        assert_eq!(copy_variation_files(&src, &out).unwrap(), (1, 2));
+        assert_eq!(entries(&out), ["21"]);
+        assert_eq!(entries(&out.join("21")), ["all_vars.gz", "all_vars.gz.csi"]);
+    }
+
+    #[test]
+    fn flat_variation_names_split_into_chromosome_and_file() {
+        assert_eq!(
+            split_flat_variation_name("21_all_vars.gz"),
+            Some(("21".to_string(), "all_vars.gz".to_string()))
+        );
+        assert_eq!(
+            split_flat_variation_name("LRG_485_all_vars.gz.csi"),
+            Some(("LRG_485".to_string(), "all_vars.gz.csi".to_string()))
+        );
+        assert_eq!(
+            split_flat_variation_name("X_1000001-2000000_var.gz"),
+            Some(("X".to_string(), "1000001-2000000_var.gz".to_string()))
+        );
+        assert_eq!(split_flat_variation_name("_all_vars.gz"), None);
+        assert_eq!(split_flat_variation_name("21_1-2.json"), None);
+        assert_eq!(
+            variation_file_kind("all_vars.gz.tbi"),
+            Some(VariationFileKind::Index)
+        );
+        assert_eq!(
+            variation_file_kind("1-1000000_var.gz"),
+            Some(VariationFileKind::Region)
+        );
+        assert_eq!(variation_file_kind("1-1000000.json"), None);
+    }
+
+    /// A scratch directory under the system temporary directory, removed on drop.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new() -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir = std::env::temp_dir().join(format!(
+                "vep-cache-converter-{}-{nanos}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The names of every entry directly under `dir`, sorted.
+    fn entries(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn variation_files_pass_through_and_json_shards_are_refused() {
+        let tmp = Scratch::new();
+        let src = tmp.path().join("variations");
+        fs::create_dir_all(src.join("22")).unwrap();
+        fs::write(src.join("21_all_vars.gz"), b"gz").unwrap();
+        fs::write(src.join("21_all_vars.gz.csi"), b"csi").unwrap();
+        fs::write(src.join("22").join("1-1000000_var.gz"), b"region").unwrap();
+        let dst = tmp.path().join("out");
+        assert_eq!(copy_variation_files(&src, &dst).unwrap(), (2, 3));
+        assert_eq!(fs::read(dst.join("21/all_vars.gz")).unwrap(), b"gz");
+        assert_eq!(fs::read(dst.join("21/all_vars.gz.csi")).unwrap(), b"csi");
+        assert_eq!(
+            fs::read(dst.join("22/1-1000000_var.gz")).unwrap(),
+            b"region"
+        );
+
+        let unindexed = tmp.path().join("unindexed");
+        fs::create_dir_all(&unindexed).unwrap();
+        fs::write(unindexed.join("21_all_vars.gz"), b"gz").unwrap();
+        let error = copy_variation_files(&unindexed, &tmp.path().join("out2")).unwrap_err();
+        assert!(error.to_string().contains("without its .csi or .tbi index"));
+        assert!(
+            !tmp.path().join("out2").exists(),
+            "a refused source leaves no partial output"
+        );
+
+        let shards = tmp.path().join("shards");
+        fs::create_dir_all(&shards).unwrap();
+        fs::write(shards.join("21_1-1000000.json"), b"[]").unwrap();
+        let error = copy_variation_files(&shards, &tmp.path().join("out3")).unwrap_err();
+        assert!(error.to_string().contains("JSON variation shard"));
+    }
+
+    /// A conversion ends with `CHECKSUMS.sha256` in the output directory: one
+    /// entry per written file, the manifest itself excepted, each the digest
+    /// of the file's bytes, so the runtime's check of every file passes and
+    /// `sha256sum --check` accepts the file where the tool is installed.
+    #[test]
+    fn conversion_writes_the_checksum_manifest_last() {
+        let tmp = Scratch::new();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(src.join("transcripts")).unwrap();
+        fs::create_dir_all(src.join("variations")).unwrap();
+        fs::write(
+            src.join("info.json"),
+            r#"{"species":"homo_sapiens","assembly":"GRCh38","cache_version":116}"#,
+        )
+        .unwrap();
+        fs::write(src.join("chr_synonyms.txt"), "21\tNC_000021.9\n").unwrap();
+        fs::write(src.join("transcripts/21_1-1000000.json"), b"[]").unwrap();
+        fs::write(src.join("variations/21_all_vars.gz"), b"gz").unwrap();
+        fs::write(src.join("variations/21_all_vars.gz.csi"), b"csi").unwrap();
+        let out = tmp.path().join("out");
+        convert_cache(&src, out.to_str().unwrap(), 1_000_000).unwrap();
+
+        let manifest = CacheManifest::load(&out).unwrap();
+        assert!(manifest.is_present());
+        let listed = [
+            "chr_synonyms.txt",
+            "info.json",
+            "transcripts/21/1-1000000.json",
+            "variations/21/all_vars.gz",
+            "variations/21/all_vars.gz.csi",
+        ];
+        assert_eq!(manifest.len(), listed.len());
+        for relative in listed {
+            let path = out.join(relative);
+            manifest
+                .verify_bytes(&path, &fs::read(&path).unwrap())
+                .unwrap_or_else(|error| panic!("{relative}: {error}"));
+        }
+        let text = fs::read_to_string(out.join("CHECKSUMS.sha256")).unwrap();
+        let paths_in_file: Vec<&str> = text
+            .lines()
+            .map(|line| {
+                let (_digest, relative) = line.split_once("  ").unwrap();
+                relative
+            })
+            .collect();
+        assert_eq!(paths_in_file, listed);
+        if let Ok(check) = std::process::Command::new("sha256sum")
+            .args(["--check", "--strict", "--quiet", "CHECKSUMS.sha256"])
+            .current_dir(&out)
+            .output()
+        {
+            assert!(
+                check.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&check.stdout),
+                String::from_utf8_lossy(&check.stderr)
+            );
+        }
+    }
+
+    /// `info.json` is copied with `chr_synonyms.txt` beside it; a metadata set
+    /// the runtime could not resolve a cache from (no species or assembly, a
+    /// `contig_order` or `variation_cols` that is not a list of strings, a
+    /// non-object) is refused.
+    #[test]
+    fn info_json_is_validated_and_synonyms_travel_with_it() {
+        let tmp = Scratch::new();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        let good = r#"{"species":"homo_sapiens","assembly":"GRCh38","cache_version":116,
+            "contig_order":["1","X"],"source_versions":{}}"#;
+        fs::write(src.join("info.json"), good).unwrap();
+        fs::write(src.join("chr_synonyms.txt"), "21\tNC_000021.9\n").unwrap();
+        let dst = tmp.path().join("dst");
+        fs::create_dir_all(&dst).unwrap();
+        copy_info_json(&src, &dst).unwrap();
+        assert_eq!(fs::read_to_string(dst.join("info.json")).unwrap(), good);
+        assert_eq!(
+            fs::read_to_string(dst.join("chr_synonyms.txt")).unwrap(),
+            "21\tNC_000021.9\n"
+        );
+
+        let refused = [
+            (r#"{"species":"homo_sapiens"}"#, "non-empty assembly"),
+            (r#"{"species":"","assembly":"GRCh38"}"#, "non-empty species"),
+            (
+                r#"{"species":"homo_sapiens","assembly":"GRCh38","contig_order":"1,2"}"#,
+                "contig_order is not a list of strings",
+            ),
+            (
+                r#"{"species":"homo_sapiens","assembly":"GRCh38","variation_cols":[1]}"#,
+                "variation_cols is not a list of strings",
+            ),
+            ("[]", "not a JSON object"),
+        ];
+        for (text, reason) in refused {
+            let error = validate_info(&serde_json::from_str(text).unwrap()).unwrap_err();
+            assert!(
+                error.to_string().contains(reason),
+                "{text}: {error} should name {reason}"
+            );
+        }
+    }
+
+    /// A plugin data file whose second data line is one byte over the cap
+    /// fails the conversion, naming the file and the line, 3; the records read
+    /// before it are not kept.
+    #[test]
+    fn data_line_past_the_cap_fails_the_conversion() {
+        use std::io::Write;
+        let cap = vep_builtins::tabix::MAX_LINE_BYTES;
+        let tmp = Scratch::new();
+        let path = tmp.path().join("scores.tsv.gz");
+        let mut body = b"#chrom\tpos\tscore\n21\t100\t0.5\n".to_vec();
+        let mut long_line = b"21\t200\t".to_vec();
+        long_line.resize(cap + 1, b'x');
+        body.extend(long_line);
+        body.push(b'\n');
+        let mut writer = noodles::bgzf::io::Writer::new(fs::File::create(&path).unwrap());
+        writer.write_all(&body).unwrap();
+        writer.try_finish().unwrap();
+        let cfg = TabixConvertConfig {
+            chr_col: 0,
+            start_col: 1,
+            end_col: None,
+            zero_based: false,
+        };
+        let error = read_tabix_records(&path, &cfg).unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            format!(
+                "{}: line 3 is longer than the {cap}-byte limit for one line",
+                path.display()
+            )
+        );
+    }
+
+    /// A zero-based start position at the integer maximum has no one-based
+    /// form: the record is refused naming the position instead of wrapping.
+    #[test]
+    fn zero_based_start_at_the_maximum_fails_the_conversion() {
+        use std::io::Write;
+        let tmp = Scratch::new();
+        let path = tmp.path().join("scores.tsv.gz");
+        let body = format!("#chrom\tpos\tscore\n21\t{}\t0.5\n", u64::MAX);
+        let mut writer = noodles::bgzf::io::Writer::new(fs::File::create(&path).unwrap());
+        writer.write_all(body.as_bytes()).unwrap();
+        writer.try_finish().unwrap();
+        let cfg = TabixConvertConfig {
+            chr_col: 0,
+            start_col: 1,
+            end_col: None,
+            zero_based: true,
+        };
+        let error = read_tabix_records(&path, &cfg).unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            format!("invalid start position: {}", u64::MAX)
+        );
     }
 }

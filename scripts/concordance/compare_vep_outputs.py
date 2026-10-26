@@ -433,9 +433,12 @@ def _is_covered_splice_region_swap(perl_csq: str, rust_csq: str) -> bool:
 # against whatever regions its batch loaded, so the transcripts Perl names for it are a
 # property of the neighbouring records, while vep-rs names every overlapping transcript.
 # `<NON_REF>` takes the same route but is not listed: vep-rs writes no transcript tuple
-# for a gVCF reference block, so the arms below have nothing to reach there.
+# for a gVCF reference block, so the arms below have nothing to reach there. The Allele
+# of a record whose type has no term is Perl's type string (Parser/VCF.pm:469-475):
+# the ALT as written (`<CPX>`), or INFO/SVTYPE when that names the type (`CPX`, the
+# gnomAD-SV spelling).
 _MAX_SV_SIZE = 10_000_000
-_VEP_SKIP_UNSUPPORTED_ALLELES = frozenset({"CPX", "CTX"})
+_VEP_SKIP_UNSUPPORTED_ALLELES = frozenset({"CPX", "CTX", "<CPX>", "<CTX>"})
 SV_TRANSCRIPT_SELECTION_BUCKET = "sv_transcript_selection"
 
 
@@ -798,9 +801,9 @@ REFERENCE_116_2_ONE_SIDED_RULES: tuple[OneSidedRule, ...] = (
             "A bracket breakend whose mate's chromosome is spelled with a prefix the "
             "mate-allele test does not resolve, Chr21 for 21, loses its mate rows in the "
             "reference and keeps them in vep-rs; a mate named by an accession on another "
-            "chromosome loses them on both engines, so nothing is set aside, and one on the "
-            "record's own chromosome keeps them in the reference alone, a vep-rs "
-            "under-annotation charged to vep-rs."
+            "chromosome loses them in the reference alone too, vep-rs resolving the accession "
+            "through the synonym table, and one on the record's own chromosome keeps them in "
+            "both engines."
         ),
         excludes=False,
         excludes_with_cache=True,
@@ -933,13 +936,14 @@ REFERENCE_116_2_ONE_SIDED_RULES: tuple[OneSidedRule, ...] = (
         bucket=CNV_TR_EMPTY_EXPANSION_BUCKET,
         definition=(
             "With a FASTA, a <CNV:TR> whose expansion yields no alternate allele, or one "
-            "equal to the reference run (`RN=.`, a RUC that is not a positive number, a RUC "
-            "times unit length equal to SVLEN), is expanded to an allele string with no "
-            "alternate and the reference writes nothing for it, without a warning; vep-rs "
-            "writes the symbolic rows over the run, as the reference does without a FASTA. "
-            "vep-rs's rows are set aside by the structural-variant comparator when the "
-            "input record has the shape and the reference wrote nothing at or beside the "
-            "run; the SNP/indel comparator does not judge it."
+            "equal to the reference run (`RN=.`, a RUC Perl reads as true that gives zero or "
+            "fewer repeats, a RUC times unit length equal to SVLEN), is expanded to an allele "
+            "string with no alternate and the reference writes nothing for it, without a "
+            "warning; vep-rs with a FASTA writes nothing for it either, and without one "
+            "writes the symbolic rows over the run, as the reference does without one. "
+            "vep-rs's rows are set aside by the structural-variant comparator when the input "
+            "record has the shape and the reference wrote nothing at or beside the run; the "
+            "SNP/indel comparator does not judge it."
         ),
         excludes=False,
         excludes_with_cache=True,
@@ -984,10 +988,12 @@ REFERENCE_116_2_ONE_SIDED_RULES: tuple[OneSidedRule, ...] = (
             "allele: the empty expansion is an empty part of the allele string, which is "
             "not read as multi-allelic, so the first allele alone is kept when the empty "
             "part leads and the trailing empty part is dropped by the split; vep-rs writes "
-            "both alleles, and its rows of the dropped allele, told by their direction term "
-            "when the real allele is a gain, or when it is unchanged beside a leading empty "
-            "part (vep-rs reads an unchanged allele as a gain), are set aside by the "
-            "structural-variant comparator."
+            "both alleles when the empty part leads, and the structural-variant comparator "
+            "sets aside its rows of the "
+            "dropped allele: the symbolic rows told by their direction term when the real "
+            "allele is a gain, or unchanged beside a leading empty part (vep-rs reads every "
+            "symbolic <CNV:TR> allele as a gain), and the literal rows a run with a FASTA "
+            "writes for the real allele behind a leading empty part."
         ),
         excludes=False,
         excludes_with_cache=True,
@@ -1078,14 +1084,15 @@ class ReferenceRecordScope:
     outside the test (`_TANDEM_REPEAT_ALLELE`). Every vep-rs row at an absent Location is
     then set aside whatever its allele, a sequence allele beside the symbolic one of a
     mixed ALT list included, because the reference skips the line whole. This is the
-    output-only rule: this comparator reads no input VCF. The structural-variant
-    comparator reads the input and names the record from it (`skipped_record_rows`:
-    the reference's own skip routes over the ALT and INFO, confirmed by the reference's
-    absence under the record's own Location start and alleles), so a kept record
-    sharing a start or a Location string with a skipped one is told apart there. The
-    merge visits keys in sorted order and every key of one Location shares the prefix
-    ``Location<TAB>``, so a Location's rows from both streams are contiguous and the
-    group closes when the Location changes.
+    output-only rule: the ``absent`` test reads no input VCF, and this comparator opens
+    one only under `--input-dir` or `--input-vcf`, to recognise gVCF variant sites by
+    their shape (``gvcf_sites`` below). The structural-variant comparator reads the input
+    and names the record from it (`skipped_record_rows`: the reference's own skip routes
+    over the ALT and INFO, confirmed by the reference's absence under the record's own
+    Location start and alleles), so a kept record sharing a start or a Location string
+    with a skipped one is told apart there. The merge visits keys in sorted order and
+    every key of one Location shares the prefix ``Location<TAB>``, so a Location's rows
+    from both streams are contiguous and the group closes when the Location changes.
 
     ``breakends``: for every (file, Location) at which either engine wrote a breakend
     allele, the alleles each side wrote and the mate chromosomes its bracket alleles
@@ -1972,8 +1979,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=PER_CLASS_MIN_TUPLES,
         help=f"Pool mode: minimum pooled VEP tuples for a term to be eligible for the "
-        f"reported floor (default {PER_CLASS_MIN_TUPLES}, pre-committed). Terms below "
-        f"it are still written to the CSV with their counts.",
+        f"reported floor (default {PER_CLASS_MIN_TUPLES}, fixed independently of the "
+        f"data). Terms below it are still written to the CSV with their counts.",
     )
     parser.add_argument(
         "--per-term",
@@ -2522,9 +2529,9 @@ def pool_per_class_counts(rows: Iterable[PerClassCounts]) -> list[PerClassCounts
 
     Pooling is a micro-average over the union of the measured tuples, the same
     construction as a tuple-weighted micro-F1. It is the published grain for the
-    floor, pre-committed before the values existed: a minimum over up to 41x6
-    per-(term, dataset) cells is a worst-case outlier from a tiny denominator rather
-    than a property of the engine.
+    floor, fixed independently of the data: a minimum over per-(term, dataset) cells
+    is a worst-case outlier from a tiny denominator rather than a property of the
+    engine.
     """
     totals: dict[str, list[int]] = {}
     for row in rows:
@@ -3127,7 +3134,7 @@ def run_pool_consequence_class(args: argparse.Namespace) -> int:
         if floor.f1 is None:
             print(
                 f"{engine}: no term clears {args.min_tuples} pooled VEP tuples, so no "
-                f"floor can be reported under the pre-committed rule"
+                f"floor can be reported under the fixed threshold"
             )
             continue
         print(

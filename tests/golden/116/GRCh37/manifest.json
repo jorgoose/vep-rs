@@ -6,7 +6,49 @@
  "exemplars_per_combination": 3,
  "max_span": 1000000,
  "multi_allelic_per_suite": 4,
- "covers": [],
+ "covers": [
+  "flag_matrix_concordance",
+  "grch37",
+  "_gene_symbol",
+  "gene-stable-id-and-gene",
+  "transcript-biotype",
+  "transcript-coordinates",
+  "transcript-dbid",
+  "vefc-introns",
+  "vefc-peptide",
+  "vefc-runtime-only-keys",
+  "vefc-seq-edits",
+  "engine_identity_lines",
+  "symbol",
+  "biotype",
+  "prebuilt-binaries-glibc-floor",
+  "portable-cpu-baseline-builds"
+ ],
+ "reference_warnings": [
+  "could not fetch sequence for tandem repeats; consequence calculation for tandem repeats is less precise when using --offline without --fasta"
+ ],
+ "flags": [
+  "--grch37"
+ ],
+ "runs": [
+  {
+   "name": "grch37-over-explicit-assembly",
+   "argv": [
+    "{golden}",
+    "--assembly",
+    "GRCh38",
+    "--grch37",
+    "--json",
+    "-o",
+    "{out}"
+   ],
+   "expect": {
+    "exit": 0,
+    "output": "json.jsonl",
+    "format": "json"
+   }
+  }
+ ],
  "suites": {
   "GRCh37": {
    "reference": "default.txt",
@@ -47910,5 +47952,25 @@
  },
  "vep_rs_only_summary": {
   "reference_skipped_record": 2624
- }
+ },
+ "flag_sets": [
+  {
+   "name": "overlaps",
+   "flags": [
+    "--grch37",
+    "--overlaps"
+   ],
+   "input": "variants.vcf",
+   "stdin": false,
+   "formats": [
+    "tab",
+    "vcf"
+   ],
+   "expected_dir": "expected_overlaps",
+   "covers": [
+    "overlaps",
+    "overlapbp-overlappc-sv"
+   ]
+  }
+ ]
 }

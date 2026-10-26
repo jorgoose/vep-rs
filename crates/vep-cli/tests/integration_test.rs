@@ -8,13 +8,24 @@
 
 use std::process::Command;
 
+mod common;
+
 fn vep_binary() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_vep"))
+    common::isolated_vep_anywhere()
 }
 
 fn test_input_vcf() -> String {
     format!(
         "{}/../../tests/sv_validation/grch37/01_snv.vcf.gz",
+        env!("CARGO_MANIFEST_DIR")
+    )
+}
+
+/// The committed GRCh38 golden corpus cache, for runs whose assertion is not
+/// about the annotation: a run with no cache at all is refused.
+fn corpus_cache() -> String {
+    format!(
+        "{}/../../tests/golden/116/GRCh38-release116/json_cache",
         env!("CARGO_MANIFEST_DIR")
     )
 }
@@ -287,6 +298,7 @@ fn test_missing_input_file() {
     let result = vep_binary()
         .args(["-i", "/nonexistent/file.vcf"])
         .args(["-o", output_path.to_str().unwrap()])
+        .args(["--json_cache", &corpus_cache()])
         .args(["--offline", "--force", "--quiet"])
         .output()
         .unwrap();
@@ -294,6 +306,11 @@ fn test_missing_input_file() {
     assert!(
         !result.status.success(),
         "Expected VEP to fail with nonexistent input file"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("ERROR: [input] File \"/nonexistent/file.vcf\" does not exist"),
+        "{stderr}"
     );
 }
 
@@ -327,8 +344,9 @@ fn test_output_file_exists_without_force() {
     );
 }
 
-/// The three flags vep-rs declares but refuses exit with a usage error naming the
-/// feature they belong to, before any input is read.
+/// The three regulatory and custom-annotation flags vep-rs declares but refuses
+/// exit 1 with the contract's one line, naming the feature they belong to,
+/// before any input is read.
 #[test]
 fn refused_flags_exit_with_their_message() {
     for (flag, feature) in [
@@ -344,19 +362,118 @@ fn refused_flags_exit_with_their_message() {
             .args(["-i", "/nonexistent/file.vcf", "--quiet"])
             .output()
             .unwrap();
-        assert_eq!(result.status.code(), Some(2), "{flag:?}");
+        assert_eq!(result.status.code(), Some(1), "{flag:?}");
         let stderr = String::from_utf8_lossy(&result.stderr);
+        assert_eq!(stderr.lines().count(), 1, "{flag:?}: {stderr}");
         assert!(
-            stderr.contains(&format!("{} is not supported", flag[0])) && stderr.contains(feature),
+            stderr.starts_with(&format!("ERROR: [cli] {} is not supported: ", flag[0]))
+                && stderr.contains(feature),
             "{flag:?}: {stderr}"
         );
     }
 }
 
-/// Annotates one VCF record in the given format against the release 116 golden
-/// corpus's own pruned cache, which unlike `VEP_RS_TEST_CACHE` is always
-/// present, and returns the output's data lines.
-fn annotate_record(record: &str, format_flags: &[&str], extra: &[&str]) -> Vec<String> {
+/// A `--distance` value with a part that is not an integer is refused before any
+/// input is read: one line `ERROR: [config] <message>` naming the value on
+/// standard error, exit status 1. Ensembl VEP numifies the part to 0 under an
+/// `Argument "x" isn't numeric` warning and drops the rows of that direction.
+#[test]
+fn distance_non_numeric_exits_with_the_error_line() {
+    let result = vep_binary()
+        .args(["--distance", "5000,x"])
+        .args(["-i", "/nonexistent/file.vcf", "--quiet"])
+        .output()
+        .unwrap();
+    assert_eq!(result.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&result.stderr),
+        "ERROR: [config] --distance expects one or two integers (up[,down]); got \"5000,x\"\n"
+    );
+}
+
+/// A `--transcript_filter` Ensembl VEP would refuse ends the run before any
+/// input is read, with one `ERROR: [filter] <message>` line on stderr and exit
+/// status 1: Ensembl VEP's message for a missing list file and an unknown
+/// operator (`FilterSet.pm` 415 and 276), the pattern named for a regular
+/// expression outside the supported dialect.
+#[test]
+fn transcript_filter_refusal_is_one_error_line_and_exit_1() {
+    for (filter, message) in [
+        (
+            "biotype in no_such_list.txt",
+            "Could not find/parse list no_such_list.txt",
+        ),
+        (
+            "biotype equals protein_coding",
+            "No such operator \"equals\"",
+        ),
+        (
+            r"stable_id match ENST\Z",
+            r#"pattern "ENST\Z" is not supported: unrecognized escape sequence"#,
+        ),
+    ] {
+        let result = vep_binary()
+            .args(["--transcript_filter", filter])
+            .args(["--json_cache", &corpus_cache()])
+            .args(["-i", "/nonexistent/file.vcf", "--quiet"])
+            .output()
+            .unwrap();
+        assert_eq!(result.status.code(), Some(1), "{filter:?}");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert_eq!(
+            stderr.trim_end(),
+            format!("ERROR: [filter] {message}"),
+            "{filter:?}"
+        );
+    }
+}
+
+/// `gene_version` names the cache's `_gene_version` through the `_` prefix
+/// (`FilterSet.pm:562-564`), which the transcript loader fills from the gene's
+/// version, so `gene_version exists` passes every transcript of the
+/// transcript-filter corpus and the run writes the unfiltered rows, not an
+/// intergenic row per record.
+#[test]
+fn transcript_filter_reads_the_gene_version() {
+    let corpus = format!(
+        "{}/../../tests/golden/116/GRCh38-transcript-filter",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let run = |extra: &[&str]| {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("out");
+        let result = vep_binary()
+            .args(["-i", &format!("{corpus}/variants.vcf")])
+            .args(["-o", output.to_str().unwrap()])
+            .args(["--json_cache", &format!("{corpus}/json_cache")])
+            .args(["--offline", "--assembly", "GRCh38"])
+            .args(["--force_overwrite", "--no_stats", "--quiet"])
+            .args(extra)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{extra:?}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        data_lines(&std::fs::read(&output).unwrap())
+    };
+    let unfiltered = run(&[]);
+    let filtered = run(&["--transcript_filter", "gene_version exists"]);
+    assert!(unfiltered.iter().any(|l| l.contains("\tENST")));
+    assert_eq!(filtered, unfiltered);
+    let none_pass = run(&["--transcript_filter", "gene_version > 1000000"]);
+    assert!(!none_pass.is_empty());
+    assert!(none_pass
+        .iter()
+        .all(|l| l.contains("\tintergenic_variant\t")));
+}
+
+/// Annotates one VCF record against the release 116 golden corpus's own pruned
+/// cache, which unlike `VEP_RS_TEST_CACHE` is always present, and returns the
+/// output file's bytes. The format is named: a record whose POS is spelled `3e7`
+/// or `30425949.0` is of no shape `check_format` detects.
+fn annotate_record_bytes(record: &str, flags: &[&str]) -> Vec<u8> {
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("in.vcf");
     std::fs::write(
@@ -365,31 +482,93 @@ fn annotate_record(record: &str, format_flags: &[&str], extra: &[&str]) -> Vec<S
     )
     .unwrap();
     let output = dir.path().join("out");
-    let cache = format!(
-        "{}/../../tests/golden/116/GRCh38-release116/json_cache",
-        env!("CARGO_MANIFEST_DIR")
-    );
     let result = vep_binary()
-        .args(["-i", input.to_str().unwrap()])
+        .args(["-i", input.to_str().unwrap(), "--format", "vcf"])
         .args(["-o", output.to_str().unwrap()])
-        .args(["--json_cache", &cache])
+        .args(["--json_cache", &corpus_cache()])
         .args(["--offline", "--assembly", "GRCh38"])
         .args(["--force_overwrite", "--no_stats", "--quiet"])
-        .args(format_flags)
-        .args(extra)
+        .args(flags)
         .output()
         .unwrap();
     assert!(
         result.status.success(),
-        "{format_flags:?} {extra:?}: {}",
+        "{flags:?}: {}",
         String::from_utf8_lossy(&result.stderr)
     );
-    std::fs::read_to_string(&output)
+    std::fs::read(&output).unwrap()
+}
+
+/// The data lines of an output: every line not opening with `#`.
+fn data_lines(output: &[u8]) -> Vec<String> {
+    std::str::from_utf8(output)
         .unwrap()
         .lines()
         .filter(|l| !l.starts_with('#'))
         .map(str::to_string)
         .collect()
+}
+
+/// Annotates one VCF record in the given format and returns the output's data lines.
+fn annotate_record(record: &str, format_flags: &[&str], extra: &[&str]) -> Vec<String> {
+    let flags: Vec<&str> = format_flags.iter().chain(extra).copied().collect();
+    data_lines(&annotate_record_bytes(record, &flags))
+}
+
+/// A record of the release 116 corpus with transcript rows, for the output-flag tests.
+const CODING_RECORD: &str = "21\t30289183\tstop_ins1_lost_rev\tC\tCG\t.\t.\t.";
+
+/// `Runner.pm:run` 204-206 (release 116.2) prints the output factory's headers
+/// unless `--no_headers`, so under the flag the default, tab and VCF outputs open
+/// with their first data line; the data lines are those of the run with headers.
+#[test]
+fn no_headers_writes_no_hash_line_in_default_tab_and_vcf() {
+    for format in [&[][..], &["--tab"], &["--vcf"]] {
+        let with_headers = String::from_utf8(annotate_record_bytes(CODING_RECORD, format)).unwrap();
+        assert!(with_headers.starts_with('#'), "{format:?}: {with_headers}");
+        let flags: Vec<&str> = format.iter().copied().chain(["--no_headers"]).collect();
+        let bare = String::from_utf8(annotate_record_bytes(CODING_RECORD, &flags)).unwrap();
+        assert!(
+            !bare.lines().any(|l| l.starts_with('#')),
+            "{format:?}: {bare}"
+        );
+        let data = data_lines(with_headers.as_bytes());
+        assert_eq!(bare.lines().collect::<Vec<_>>(), data, "{format:?}");
+        assert!(!data.is_empty(), "{format:?}");
+    }
+}
+
+/// `BaseRunner.pm:get_output_file_handle` 207-219 (release 116.2) pipes the
+/// output through `gzip -c` or `bgzip -c` under `--compress_output`; the file
+/// written here is a gzip stream (one member) or a BGZF stream (gzip members
+/// ending in the empty end-of-file member) whose contents are the plain output.
+#[test]
+fn compress_output_writes_gzip_and_bgzip_streams_of_the_plain_output() {
+    use std::io::Read;
+    // The header's time and command-line lines differ between runs; the data
+    // lines are the comparison.
+    let plain = data_lines(&annotate_record_bytes(CODING_RECORD, &["--tab"]));
+    assert!(!plain.is_empty());
+    for kind in ["gzip", "bgzip"] {
+        let compressed =
+            annotate_record_bytes(CODING_RECORD, &["--tab", "--compress_output", kind]);
+        assert_eq!(&compressed[..2], &[0x1f, 0x8b], "{kind}");
+        let mut back = Vec::new();
+        flate2::read::MultiGzDecoder::new(&compressed[..])
+            .read_to_end(&mut back)
+            .unwrap();
+        assert_eq!(data_lines(&back), plain, "{kind}");
+        let extra_field = compressed[3] & 0x04 != 0;
+        assert_eq!(extra_field, kind == "bgzip", "{kind}: FEXTRA");
+        if kind == "bgzip" {
+            assert_eq!(&compressed[12..14], b"BC");
+            let mut back = Vec::new();
+            noodles_bgzf::io::Reader::new(&compressed[..])
+                .read_to_end(&mut back)
+                .unwrap();
+            assert_eq!(data_lines(&back), plain);
+        }
+    }
 }
 
 /// The Location, Allele and Consequence columns of the default-format rows that
@@ -525,13 +704,16 @@ fn bare_symbolic_bnd_prints_the_class_term() {
     }
 }
 
-/// `--max_sv_size` governs a `<CNV:TR>` record's expansion as it does Ensembl VEP
-/// 116.2's (`Parser/VCF.pm:403`, `:417-418`, `:428`): under the default a 200-base
-/// allele against a 300-base run is a 100-base contraction, `frameshift_variant`; under
-/// `-1`, and under a limit the 200-base allele exceeds, the record keeps the symbolic
-/// reading, a gain over the run, `feature_elongation`.
+/// Without a FASTA a `<CNV:TR>` record keeps Ensembl VEP's symbolic reading whatever
+/// `--max_sv_size` says (the expansion of `Parser/VCF.pm:382-431` needs the run's
+/// reference sequence, `:516-527`): a 200-base allele against a 300-base run is the
+/// gain over the run, `feature_elongation,coding_sequence_variant`, under the default
+/// and under `-1`, as Ensembl VEP 116.2 writes for a contraction read without a FASTA,
+/// and under a limit the run's 299-base span exceeds, where Ensembl VEP skips the
+/// record as oversize (`Parser.pm:491-501`) and vep-rs annotates it, the divergence
+/// `docs/intended-divergences.md` documents for a record Ensembl VEP drops.
 #[test]
-fn max_sv_size_governs_tandem_repeat_expansion() {
+fn a_tandem_repeat_without_a_fasta_keeps_the_symbolic_reading_under_every_max_sv_size() {
     let record = "21\t30425600\ttr\tN\t<CNV:TR>\t.\t.\tSVTYPE=CNV;END=30425899;SVLEN=300;RUS=AT;RUC=100;RB=300";
     let consequences = |extra: &[&str]| -> String {
         annotate_record(record, &[], extra)
@@ -540,12 +722,11 @@ fn max_sv_size_governs_tandem_repeat_expansion() {
             .map(|row| row.split('\t').nth(6).unwrap().to_string())
             .expect("the run overlaps ENST00000390690")
     };
-    assert_eq!(consequences(&[]), "frameshift_variant,feature_truncation");
-    for limit in ["-1", "100"] {
+    for extra in [&[][..], &["--max_sv_size", "-1"], &["--max_sv_size", "100"]] {
         assert_eq!(
-            consequences(&["--max_sv_size", limit]),
+            consequences(extra),
             "feature_elongation,coding_sequence_variant",
-            "--max_sv_size {limit}"
+            "{extra:?}"
         );
     }
 }
@@ -936,14 +1117,12 @@ fn a_star_only_record_is_carried_without_rows() {
     }
 }
 
-/// With a FASTA, Ensembl VEP 116.2 reads `21 30425587 x N <CNV:TR>,<CNV:TR> . .
-/// SVTYPE=CNV;END=30425596;SVLEN=9;RN=0,1;RUS=AGC;RUC=4` as `AGCAGCAGC//AGCAGCAGCAGC`,
-/// keeps the first minimised allele alone and writes `21:30425588-30425596 -
-/// ENST00000390690 inframe_deletion ALLELE_NUM=1`: the RN=0 allele as the run's loss, the
-/// real allele dropped. Both alleles are written here, the RN=0 allele as the loss of
-/// the run and the four-unit allele as the gain.
+/// Without a FASTA every allele of a `<CNV:TR>` record is the symbolic gain over the
+/// run, whatever its RN entry says (`RN=0,1`): two rows, numbered 1 and 2, each
+/// `feature_elongation,coding_sequence_variant`, as Ensembl VEP 116.2 writes a
+/// tandem repeat it could not read the sequence of.
 #[test]
-fn an_rn_zero_allele_is_the_loss_of_the_run_beside_its_sibling() {
+fn every_allele_of_a_tandem_repeat_without_a_fasta_is_the_symbolic_gain() {
     let rows: Vec<(String, String)> = annotate_record(
         "21\t30425587\trn0\tN\t<CNV:TR>,<CNV:TR>\t.\t.\tSVTYPE=CNV;END=30425596;SVLEN=9;RN=0,1;RUS=AGC;RUC=4",
         &[],
@@ -961,18 +1140,10 @@ fn an_rn_zero_allele_is_the_loss_of_the_run_beside_its_sibling() {
         (num, c[6].to_string())
     })
     .collect();
+    let gain = "feature_elongation,coding_sequence_variant".to_string();
     assert_eq!(
         rows,
-        [
-            (
-                "1".to_string(),
-                "feature_truncation,inframe_deletion".to_string()
-            ),
-            (
-                "2".to_string(),
-                "feature_elongation,coding_sequence_variant".to_string()
-            ),
-        ]
+        [("1".to_string(), gain.clone()), ("2".to_string(), gain)]
     );
 }
 
@@ -1169,10 +1340,6 @@ fn a_refused_record_is_skipped_with_a_visible_warning() {
     )
     .unwrap();
     let output = dir.path().join("out");
-    let cache = format!(
-        "{}/../../tests/golden/116/GRCh38-release116/json_cache",
-        env!("CARGO_MANIFEST_DIR")
-    );
     let result = vep_binary()
         .args([
             "-i",
@@ -1180,7 +1347,8 @@ fn a_refused_record_is_skipped_with_a_visible_warning() {
             "-o",
             output.to_str().unwrap(),
         ])
-        .args(["--json_cache", &cache, "--offline", "--assembly", "GRCh38"])
+        .args(["--json_cache", &corpus_cache()])
+        .args(["--offline", "--assembly", "GRCh38"])
         .args(["--force_overwrite", "--no_stats"])
         .output()
         .unwrap();
@@ -1203,19 +1371,20 @@ fn a_refused_record_is_skipped_with_a_visible_warning() {
     );
 }
 
-/// The `--max_sv_size` row of `docs/cli-reference.md` states the documented
-/// exclusion: Ensembl VEP 116 drops an oversize record and vep-rs annotates it.
+/// The `--max_sv_size` row of `docs/cli/cache-species-runtime.md` states the
+/// documented exclusion: Ensembl VEP 116 drops an oversize record and vep-rs
+/// annotates it.
 #[test]
 fn max_sv_size_exclusion_is_documented() {
     let page = std::fs::read_to_string(format!(
-        "{}/../../docs/cli-reference.md",
+        "{}/../../docs/cli/cache-species-runtime.md",
         env!("CARGO_MANIFEST_DIR")
     ))
     .unwrap();
     let row = page
         .lines()
         .find(|l| l.starts_with("| `--max_sv_size`"))
-        .expect("docs/cli-reference.md has a --max_sv_size row");
+        .expect("docs/cli/cache-species-runtime.md has a --max_sv_size row");
     for phrase in [
         "Ensembl VEP 116 drops an oversize record before annotation and writes nothing for it in any format",
         "vep-rs annotates it",
@@ -1225,27 +1394,53 @@ fn max_sv_size_exclusion_is_documented() {
     }
 }
 
+/// `--dont_skip` keeps a record that fails a check (Parser.pm:189: the feature
+/// is returned whatever `validate_vf` returned), and a line the parser cannot read
+/// at all is skipped with its warning rather than ending the run: there is no
+/// record to keep. The run exits 0 and the records around the line are written.
 #[test]
-fn test_dont_skip_fails_on_invalid_vcf_line() {
+fn test_dont_skip_skips_an_invalid_vcf_line() {
     let output_dir = tempfile::tempdir().unwrap();
     let input_path = output_dir.path().join("invalid.vcf");
     let output_path = output_dir.path().join("output.txt");
 
     let vcf = "##fileformat=VCFv4.3\n\
                #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n\
-               21\t100\t.\tA\n";
+               21\t30165801\tfirst\tA\tG\t.\t.\t.\n\
+               21\t100\t.\tA\n\
+               21\t30165811\tlast\tA\tG\t.\t.\t.\n";
     std::fs::write(&input_path, vcf).unwrap();
 
+    // The format is named: a four-column line is of no shape `check_format`
+    // detects.
     let result = vep_binary()
-        .args(["-i", input_path.to_str().unwrap()])
+        .args(["-i", input_path.to_str().unwrap(), "--format", "vcf"])
         .args(["-o", output_path.to_str().unwrap()])
+        .args(["--json_cache", &corpus_cache()])
         .args(["--dont_skip", "--quiet"])
         .output()
         .unwrap();
 
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert_eq!(result.status.code(), Some(0), "{stderr}");
+    assert!(!stderr.contains("ERROR"), "{stderr}");
+    // The number is the data record's ordinal, as Ensembl VEP counts its records
+    // (Parser/VCF.pm:228), not the file line.
+    let warnings =
+        std::fs::read_to_string(format!("{}_warnings.txt", output_path.display())).unwrap();
+    assert_eq!(
+        warnings.lines().collect::<Vec<_>>(),
+        ["WARNING: line 2 skipped (21 100 . A): VCF line has fewer than 5 fields"]
+    );
+    let ids: Vec<String> = std::fs::read_to_string(&output_path)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .map(|l| l.split('\t').next().unwrap().to_string())
+        .collect();
     assert!(
-        !result.status.success(),
-        "Expected VEP to fail with --dont_skip on invalid VCF line"
+        ids.contains(&"first".to_string()) && ids.contains(&"last".to_string()),
+        "{ids:?}"
     );
 }
 
@@ -1265,6 +1460,7 @@ fn test_allow_non_variant_passthrough_vcf() {
     let result = vep_binary()
         .args(["-i", input_path.to_str().unwrap()])
         .args(["-o", output_path.to_str().unwrap()])
+        .args(["--json_cache", &corpus_cache()])
         .args(["--vcf", "--allow_non_variant", "--force", "--quiet"])
         .output()
         .unwrap();
@@ -1291,6 +1487,7 @@ fn test_unknown_plugin_warns_but_does_not_fail() {
     let result = vep_binary()
         .args(["-i", &test_input_vcf()])
         .args(["-o", output_path.to_str().unwrap()])
+        .args(["--json_cache", &corpus_cache()])
         .args(["--force", "--quiet", "--offline"])
         .args(["--plugin", "NonExistentPlugin,param1"])
         .output()
@@ -1303,27 +1500,37 @@ fn test_unknown_plugin_warns_but_does_not_fail() {
     );
 }
 
+/// A built-in plugin name resolves without the unknown-plugin warning, on
+/// standard error or in the warnings file beside the output; with no data-file
+/// parameter its init fails, and the run goes on without it under the warning
+/// Ensembl VEP writes for a constructor that dies (Runner.pm:946-954).
 #[test]
 fn test_builtin_plugin_names_are_recognized() {
-    // A builtin plugin name resolves without an unknown-plugin warning; with no
-    // data-file params it fails at init with a plugin error instead.
     let dir = tempfile::tempdir().unwrap();
     let output_path = dir.path().join("output.txt");
 
     let result = vep_binary()
         .args(["-i", &test_input_vcf()])
         .args(["-o", output_path.to_str().unwrap()])
-        .args(["--force", "--quiet", "--offline"])
+        .args(["--json_cache", &corpus_cache()])
+        .args(["--force", "--offline"])
         .args(["--plugin", "CADD"])
         .output()
         .unwrap();
 
     let stderr = String::from_utf8_lossy(&result.stderr);
-    // CADD requires file params, so it should fail with an init error
-    // containing "CADD" (not "not found as a built-in").
+    let warnings =
+        std::fs::read_to_string(dir.path().join("output.txt_warnings.txt")).unwrap_or_default();
+    let unknown = "Failed to load plugin CADD";
     assert!(
-        !stderr.contains("not found as a built-in"),
-        "CADD should be recognized as a builtin plugin"
+        !stderr.contains(unknown) && !warnings.contains(unknown),
+        "CADD should be recognized as a builtin plugin:\n{stderr}\n{warnings}"
+    );
+    let dropped =
+        "Failed to instantiate plugin CADD: CADD requires at least one file path parameter";
+    assert!(
+        result.status.success() && stderr.contains(dropped) && warnings.contains(dropped),
+        "CADD without a data file is dropped with a warning:\n{stderr}\n{warnings}"
     );
 }
 

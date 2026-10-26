@@ -10,7 +10,8 @@
 //! by `/`, INFO/SVTYPE standing in for a string outside the VCF 4.4 forms, through
 //! `get_SO_term` (`Parser.pm` lines 663-727), whose abbreviation is looked up in
 //! `%SO_TERMS` (ensembl-variation `Utils/Config.pm`); a type with no entry is dropped
-//! as unsupported.
+//! as unsupported. [`perl_split`] reads any comma-separated value as Perl's `split`
+//! returns it, for the ALT list here and the `--plugin` argument ([`split_plugin_arg`]).
 
 use crate::variant::VariantClass;
 
@@ -31,6 +32,15 @@ pub fn perl_split<'a>(text: &'a str, separators: &'a [char]) -> impl Iterator<It
         .then(|| kept.split(separators))
         .into_iter()
         .flatten()
+}
+
+/// The plugin name or path and its parameters in a `--plugin` argument, split on every
+/// comma as Perl's `split /,/` splits it (ensembl-vep Runner.pm:928): a trailing empty
+/// field is no parameter, a middle one is kept, so `Name,` has none and `Name,a,,b` three.
+pub fn split_plugin_arg(arg: &str) -> (&str, Vec<String>) {
+    let mut fields = perl_split(arg, &[',']);
+    let name = fields.next().unwrap_or("");
+    (name, fields.map(String::from).collect())
 }
 
 /// The ALT column's fields with their written positions, read as Perl reads the list.
@@ -85,21 +95,21 @@ pub fn joined(alts: &[(usize, &str)], sep: &str) -> String {
 /// takes the record's class (one StructuralVariationFeature carries the record,
 /// Parser/VCF.pm:560-574); under a type the table lacks, each symbolic ALT keeps its own
 /// class under the `vep_skip` mark, INFO/SVTYPE naming the class of a mixed record whose
-/// joined ALTs open with a sequence allele (`:472-475`). `valid_alts` excludes `*` and `.`.
+/// joined ALTs open with a sequence allele (`:472-475`).
 pub fn per_alt_classes<'a>(
-    valid_alts: &[(usize, &'a str)],
+    alts: &[(usize, &'a str)],
     record_class: Option<VariantClass>,
     svtype: Option<&str>,
 ) -> Vec<(usize, &'a str, VariantClass)> {
     if let Some(class) = record_class {
-        return valid_alts.iter().map(|&(i, alt)| (i, alt, class)).collect();
+        return alts.iter().map(|&(i, alt)| (i, alt, class)).collect();
     }
-    let symbolic: Vec<(usize, &str)> = valid_alts
+    let symbolic: Vec<(usize, &str)> = alts
         .iter()
         .copied()
         .filter(|(_, alt)| is_symbolic_alt(alt))
         .collect();
-    let mixed = !symbolic.is_empty() && symbolic.len() < valid_alts.len();
+    let mixed = !symbolic.is_empty() && symbolic.len() < alts.len();
     symbolic
         .into_iter()
         .map(|(i, alt)| {
@@ -149,7 +159,7 @@ pub fn is_symbolic_alt(alt: &str) -> bool {
     if alt.is_empty() {
         return false;
     }
-    // Perl VEP's SV regex `[<\[\]][^\*]+[>\]\[]` excludes `<*>`: without INFO/SVTYPE
+    // Ensembl VEP's SV regex `[<\[\]][^\*]+[>\]\[]` excludes `<*>`: without INFO/SVTYPE
     // it is a non-SV allele at POS.
     if alt.starts_with('<') && alt.ends_with('>') && alt != "<*>" {
         return true;
@@ -187,20 +197,24 @@ pub fn classify_symbolic_alt(alt: &str, svtype: Option<&str>) -> VariantClass {
     if upper.starts_with("<CNV:TR") {
         return VariantClass::TandemRepeat;
     }
-    // Perl VEP maps CN0 -> DEL ("deletion"), CN2 -> DUP ("duplication")
-    if upper.starts_with("<CN") && !upper.starts_with("<CNV") {
-        let inner = &upper[3..upper.len().saturating_sub(1)]; // strip "<CN" and ">"
-        let num_str = inner.strip_prefix('=').unwrap_or(inner);
-        if let Ok(cn) = num_str.parse::<u32>() {
-            return match cn {
-                0 => VariantClass::StructuralDeletion,
-                2 => VariantClass::Duplication,
-                _ => VariantClass::CopyNumberVariation,
-            };
-        }
-    }
-    if upper.starts_with("<CNV") || upper.starts_with("<CN") {
+    if upper.starts_with("<CNV") {
         return VariantClass::CopyNumberVariation;
+    }
+    // Parser.pm:702-706: a type with /CN=?[0-9]/i is CNV, and /^<?CN=?0>?$/ and
+    // /^<?CN=?2>?$/, case-sensitive and anchored at both ends, make it DEL or DUP:
+    // the count is the one digit between an upper-case `<CN` or `<CN=` and the
+    // closing `>`, so `<CN00>`, `<cn0>`, `<CN+0>`, a `<CN` token closed by anything
+    // but `>` and a `<CN` token with no count all keep the CNV class.
+    if upper.starts_with("<CN") {
+        let count = alt
+            .strip_prefix("<CN")
+            .and_then(|rest| rest.strip_suffix('>'))
+            .map(|inner| inner.strip_prefix('=').unwrap_or(inner));
+        return match count {
+            Some("0") => VariantClass::StructuralDeletion,
+            Some("2") => VariantClass::Duplication,
+            _ => VariantClass::CopyNumberVariation,
+        };
     }
     if upper.starts_with("<CPX") {
         return VariantClass::ComplexStructural;
@@ -231,28 +245,33 @@ pub fn classify_symbolic_alt(alt: &str, svtype: Option<&str>) -> VariantClass {
     VariantClass::ComplexStructural
 }
 
+/// The type string `create_StructuralVariationFeatures` hands to `get_SO_term` and
+/// tests for a deletion when no term answers (Parser/VCF.pm:469-481): the ALTs joined
+/// by `/`, replaced by INFO/SVTYPE when that is true and the joined string does not
+/// open with a VCF 4.4 form, `/^<?(DEL|INS|DUP|INV|CNV|CN=?[0-9]+)/` without `/i`
+/// (`:473`), so a lowercase `<del>` is outside the forms and SVTYPE names its type.
+pub fn sv_type_string(joined_alts: &str, svtype: Option<&str>) -> String {
+    let bare = joined_alts.strip_prefix('<').unwrap_or(joined_alts);
+    let follows_vcf44 = ["DEL", "INS", "DUP", "INV", "CNV"]
+        .iter()
+        .any(|form| bare.starts_with(form))
+        || bare
+            .strip_prefix("CN")
+            .map(|rest| rest.strip_prefix('=').unwrap_or(rest))
+            .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()));
+    match svtype {
+        Some(svtype) if perl_true(svtype) && !follows_vcf44 => svtype.to_string(),
+        _ => joined_alts.to_string(),
+    }
+}
+
 /// The structural variant type abbreviation VEP derives for a record: the port of
 /// `Parser::get_SO_term` (ensembl-vep) applied to every ALT joined by `/`, with
 /// INFO/SVTYPE replacing a joined string that opens outside the VCF 4.4 forms
 /// (`Parser/VCF.pm`). Identical parts collapse to one (`<INS>/<INS>` reads `INS`),
 /// and a string naming both DEL and DUP, `<DEL>/<DUP:TANDEM>` included, is `CNV`.
 pub fn sv_type_abbreviation(joined_alts: &str, svtype: Option<&str>) -> String {
-    let svtype = svtype.filter(|v| perl_true(v));
-    // Parser/VCF.pm:473, `/^<?(DEL|INS|DUP|INV|CNV|CN=?[0-9]+)/` without `/i`: a
-    // lowercase `<del>` is outside the VCF 4.4 forms, so SVTYPE names its type.
-    let follows_vcf44 = {
-        let t = joined_alts.strip_prefix('<').unwrap_or(joined_alts);
-        ["DEL", "INS", "DUP", "INV", "CNV"]
-            .iter()
-            .any(|p| t.starts_with(p))
-            || t.strip_prefix("CN")
-                .map(|c| c.strip_prefix('=').unwrap_or(c))
-                .is_some_and(|c| c.starts_with(|ch: char| ch.is_ascii_digit()))
-    };
-    let mut kind = match svtype {
-        Some(st) if !follows_vcf44 => st.to_string(),
-        _ => joined_alts.to_string(),
-    };
+    let mut kind = sv_type_string(joined_alts, svtype);
     // Repeated parts collapse to the first as written (Parser.pm:668-681): each part is
     // trimmed, loses one leading `<` and one trailing `>` (`s/^\<|\>$//g`) and is
     // compared in upper case, so `<<DEL>>/<DEL>` stays a list; a trailing empty part is
@@ -387,6 +406,29 @@ pub fn sv_so_term_and_class(abbrev: &str) -> Option<(&'static str, VariantClass)
 mod tests {
     use super::*;
 
+    /// The type string Ensembl VEP tests for a deletion (Parser/VCF.pm:469-475): the
+    /// joined ALTs, replaced by a true INFO/SVTYPE unless they open with a VCF 4.4
+    /// form, which is read case-sensitively.
+    #[test]
+    fn sv_type_string_replaces_the_alts_with_svtype_outside_the_vcf44_forms() {
+        assert_eq!(sv_type_string("<FOO:DEL>", None), "<FOO:DEL>");
+        assert_eq!(sv_type_string("<FOO:DEL>", Some("BND")), "BND");
+        assert_eq!(sv_type_string("N/<DEL>", Some("XDEL")), "XDEL");
+        assert_eq!(sv_type_string("<del>", Some("BND")), "BND");
+        assert_eq!(sv_type_string("<del>", Some("0")), "<del>");
+        for vcf44 in [
+            "<DEL>",
+            "INS",
+            "<DUP:TANDEM>",
+            "<INV>",
+            "<CNV:TR>",
+            "<CN=3>",
+            "CN0",
+        ] {
+            assert_eq!(sv_type_string(vcf44, Some("BND")), vcf44);
+        }
+    }
+
     fn term(alts: &str, svtype: Option<&str>) -> Option<&'static str> {
         sv_so_term_and_class(&sv_type_abbreviation(alts, svtype)).map(|(term, _)| term)
     }
@@ -405,6 +447,39 @@ mod tests {
         assert_eq!(term("<CNX>/<CN3>", None), Some("copy_number_variation"));
         assert_eq!(term("<CN0>", None), Some("deletion"));
         assert_eq!(term("<CN=2>", None), Some("duplication"));
+    }
+
+    /// A `<CN` token closed by a bracket instead of `>` is a symbolic ALT (the
+    /// bracket makes it one) under a type `%SO_TERMS` lacks, so it reaches the
+    /// per-ALT classifier: it is a copy-number variation of no stated count, and a
+    /// multi-byte character at its end is read as a character, never split. A
+    /// signed count (`<CN+0>`, `<CN=+2>`, `<CN=-0>`), a count of two digits
+    /// (`<CN00>`, `<CN02>`, `<CN=02>`) and a lower-case `<cn0>` or `<cn2>` state no
+    /// count either, as Parser.pm's single-digit, case-sensitive regexes read them.
+    #[test]
+    fn an_unterminated_copy_number_token_is_a_copy_number_variation() {
+        for alt in [
+            "<CN]É", "<CNÉ>", "<CN=É", "<CN2]", "<CN", "<CN+0>", "<CN=+2>", "<CN=-0>", "<CN00>",
+            "<CN02>", "<CN=02>", "<cn0>", "<cn2>",
+        ] {
+            assert_eq!(
+                classify_symbolic_alt(alt, Some("XYZ")),
+                VariantClass::CopyNumberVariation,
+                "{alt}"
+            );
+        }
+        assert_eq!(
+            per_alt_classes(&[(0, "<CN]É")], None, Some("XYZ")),
+            [(0, "<CN]É", VariantClass::CopyNumberVariation)]
+        );
+        assert_eq!(
+            classify_symbolic_alt("<CN0>", Some("XYZ")),
+            VariantClass::StructuralDeletion
+        );
+        assert_eq!(
+            classify_symbolic_alt("<CN=2>", Some("XYZ")),
+            VariantClass::Duplication
+        );
     }
 
     /// The repeated-part normalisation strips one `<` and one `>` from each part
@@ -496,6 +571,19 @@ mod tests {
         assert_eq!(sv_type_abbreviation("DEL/", None), "DEL");
         assert_eq!(term("<DEL>/", Some("DEL")), Some("deletion"));
         assert_eq!(sv_type_abbreviation("/", None), "/");
+    }
+
+    /// `split /,/` (Runner.pm:928) reads a `--plugin` argument: the name first, a
+    /// trailing empty field no parameter, a middle one kept.
+    #[test]
+    fn plugin_arg_splits_as_perl_does() {
+        let params = |arg: &str| split_plugin_arg(arg).1;
+        assert_eq!(split_plugin_arg("Foo,").0, "Foo");
+        assert_eq!(params("Foo,"), Vec::<String>::new());
+        assert_eq!(params("Foo,a,"), ["a"]);
+        assert_eq!(params("Foo,a,,b"), ["a", "", "b"]);
+        assert_eq!(params("Foo"), Vec::<String>::new());
+        assert_eq!(split_plugin_arg(""), ("", Vec::new()));
     }
 
     /// Perl's string truth: the empty string and `0` are false, every other string is

@@ -937,10 +937,10 @@ class ExclusionBoundTests(unittest.TestCase):
     """Exclusions per side cannot exceed that side's discordant rows.
 
     Adjusted F1 subtracts these counts from the raw denominators, so an over-count
-    inflates F1 and nothing else in the pipeline would notice. A key omitting
-    `feature_type` while the scored tuple includes it, so two rows differing only by
-    feature type collapsed onto one key and the nested loop counted their cross
-    product: 4 exclusions from 2 real tuples.
+    inflates F1 and nothing else in the pipeline would notice. A key that omits
+    `feature_type` while the scored tuple includes it collapses two rows differing
+    only by feature type onto one key, and a nested loop over that key counts their
+    cross product: 4 exclusions from 2 real tuples.
     """
 
     HEADER = (
@@ -2256,6 +2256,16 @@ class SvTranscriptSelectionTests(unittest.TestCase):
             ("18:200-200", "CPX"): (set(), {"C1"}),
         }, "the giant record and the unsupported type are in scope, the 10 kb deletion and the SNV are not; the matched T1 counts on both sides")
 
+    def test_a_typeless_symbolic_alt_is_in_scope_under_either_spelling(self) -> None:
+        """A bare `<CPX>` or `<CTX>` prints its ALT as written and the same ALT under
+        `SVTYPE=CPX` prints `CPX` (Parser/VCF.pm:469-481); every spelling is the
+        `vep_skip` route, a `<DEL>` below the size limit is not."""
+        from compare_vep_outputs import _batch_dependent_annotation_scope
+
+        for allele in ("CPX", "CTX", "<CPX>", "<CTX>"):
+            self.assertTrue(_batch_dependent_annotation_scope("21:800-900", allele), allele)
+        self.assertFalse(_batch_dependent_annotation_scope("21:800-900", "deletion"))
+
 
 # The reference release selector (Ensembl VEP 115.2 or 116.2)
 
@@ -2306,9 +2316,10 @@ class ReferenceRegistryTests(unittest.TestCase):
         )
         self.assertEqual([r.excludes for r in rules],
                          [True, False, False, False, True, False, True, True, False, True, False, False, True, False],
-                         "this comparator reads no input and no cache: the lost-row breakend shapes, the "
-                         "missing ALT, the empty expansion, the `*`-only ALT and the dropped `RN=0` allele are "
-                         "judged only by the structural-variant comparator")
+                         "this comparator reads no cache and opens the input only to recognise gVCF variant "
+                         "sites: the lost-row breakend shapes, the missing ALT, the empty expansion, the "
+                         "`*`-only ALT and the dropped `RN=0` allele are judged only by the structural-variant "
+                         "comparator")
         self.assertEqual([r.excludes_with_cache for r in rules],
                          [True, True, True, False, True, False, True, True, True, True, True, True, True, True],
                          "the structural-variant comparator sets every class aside but the FASTA shape and the "

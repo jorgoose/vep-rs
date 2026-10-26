@@ -27,9 +27,9 @@ same residue yields `synonymous_variant`, a different one `missense_variant`, a 
 `stop_gained`, a change in the start codon `start_lost`. Whole-span passes then add what
 a single endpoint cannot see (a splice-region window in a neighbouring intron, an
 untranslated region (UTR) the span runs into) and the suppression rules remove the pairs
-Perl VEP never writes together. The list is sorted by severity rank, the impact is the
+Ensembl VEP never writes together. The list is sorted by severity rank, the impact is the
 most severe term's, and `hgvs::generate_hgvs` adds HGVSc and HGVSp when `compute_hgvs`
-is set. Back in `calculate_consequences`, `display::apply_display_fields` renders the
+is set. Back in `calculate_consequences`, `display::display_fields` renders the
 five display columns (`cDNA_position`, `CDS_position`, `Protein_position`,
 `Amino_acids`, `Codons`) and, under `compute_exon_intron_numbers`, the `EXON` and
 `INTRON` ordinals. The finished `TranscriptConsequence` returns to `vep-cli`, which
@@ -46,7 +46,7 @@ attaches it to the variant for the plugin phase and the output formatters.
 | `src/display.rs`           | The five display columns and the `EXON` and `INTRON` ordinals, rendered through the transcript mapper as Ensembl VEP renders them, apart from the term analysis                                                                                                       |
 | `src/hgvs.rs`              | HGVSc and HGVSp strings and the `HGVS_OFFSET` of an insertion or deletion shifted 3' along the transcript                                                                                                                                                             |
 | `src/overlap.rs`           | `find_overlapping_transcripts`: filters a transcript slice by chromosome and by the strand-aware extended region                                                                                                                                                      |
-| `src/sv/mod.rs`            | `calculate_sv_consequences`: dispatches a structural variant on its class, reads the `start = end + 1` insertion pair and the `<CNV:TR>` contraction or gain, and holds the shared overlap predicates (exon, CDS, UTR, intron, polypyrimidine tract, mature microRNA) |
+| `src/sv/mod.rs`            | `calculate_sv_consequences`: dispatches a structural variant on its class, reads the `start = end + 1` insertion pair and the symbolic `<CNV:TR>` gain, and holds the shared overlap predicates (exon, CDS, UTR, intron, polypyrimidine tract, mature microRNA) |
 | `src/sv/deletion.rs`       | `<DEL>` and mobile-element deletions: `transcript_ablation` when the deletion contains the transcript, otherwise `feature_truncation` with the region terms; `stop_lost` over a stop-codon base, `start_lost` over a start-codon base when both ends are exonic       |
 | `src/sv/duplication.rs`    | `<DUP>` and `<DUP:TANDEM>`: `transcript_amplification` when the duplication contains the transcript, `feature_elongation` when it lies inside the transcript and overlaps exonic sequence, the region terms otherwise                                                 |
 | `src/sv/insertion.rs`      | `<INS>`, `<INS:ME:*>` and the `<CNV:TR>` gain: ranged, point and pair forms; `feature_elongation` inside the transcript over exonic sequence, `start_lost` over a start-codon base                                                                                    |
@@ -69,7 +69,8 @@ in [docs/cli-reference.md](../../docs/cli-reference.md).
 | ----------------------------------------------------- | ------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
 | `upstream_distance`, `downstream_distance`            | 5000, 5000    | How far beyond the transcript span a variant still earns `upstream_gene_variant` or `downstream_gene_variant` (`--distance`)              |
 | `reference_fasta`                                     | `None`        | An indexed FASTA from [vep-fasta](../vep-fasta/README.md) for the sequence-aware steps, HGVS and indel 3' shifting among them (`--fasta`) |
-| `enable_indel_3prime_shift`, `max_indel_3prime_shift` | `false`, 2000 | Shift an insertion or deletion 3' along the transcript before classifying it, up to the given number of bases (`--shift_3prime`)          |
+| `enable_indel_3prime_shift`                           | `false`       | Shift an insertion or deletion 3' along the transcript before classifying it, over Ensembl VEP's 1,000-base search area (`--shift_3prime 1`) |
+| `hgvs`                                                | `HgvsOptions::default()` | The HGVSc and HGVSp flags: `shift_hgvs` (`true`; `--shift_hgvs 0` describes an insertion or deletion where the input placed it), `hgvsp_use_prediction` (`--hgvsp_use_prediction`, `p.(Arg97Ter)`) and `remove_hgvsp_version` (`--remove_hgvsp_version`, no translation version on the HGVSp name) |
 | `compute_hgvs`                                        | `false`       | Build HGVSc, HGVSp and `HGVS_OFFSET` (`--hgvs`; `vep-cli` also sets it for the Variant Call Format (VCF), JSON and Parquet outputs)       |
 | `compute_exon_intron_numbers`                         | `false`       | Fill the `EXON` and `INTRON` ordinals (`--numbers`, and whenever a plugin runs)                                                           |
 | `protein_version`                                     | `false`       | Append the translation version to the protein identifier (`--protein_version`)                                                            |
@@ -84,8 +85,8 @@ The other callables a caller reaches for, each one phrase:
 - `mapper::map_genomic_span_to_cds_bounds(start, end, transcript) -> Option<CdsSpanBounds>`: the CDS and peptide bounds of a span, intronic ends snapped to the nearest exon boundary.
 - `coding::get_codon_change(variant, transcript, cds_pos) -> Option<CodonChange>`: the reference and alternate codons and residues of one variant, the changed base in upper case.
 - `display::display_fields(variant, transcript) -> DisplayFields`: the five display columns on their own.
-- `hgvs::generate_hgvs(variant, transcript, fasta) -> HgvsNotation`: HGVSc, HGVSp and the shift offset in one call; `generate_hgvsc` and `generate_hgvsp` give each alone.
-- `consequences::shift_indel_3prime_coords(variant, transcript, fasta, max_shift) -> Option<(u64, u64)>`: the shifted span of an insertion or deletion.
+- `hgvs::generate_hgvs(variant, transcript, fasta, options) -> HgvsNotation`: HGVSc, HGVSp and the shift offset in one call under an `HgvsOptions` (the notations left where the input placed the allele when its `shift_hgvs` is false, HGVSp in the predicted form or without its version under the other two); `generate_hgvsc` and `generate_hgvsp` give each alone under the defaults.
+- `consequences::shift_indel_3prime_coords(variant, transcript, fasta) -> Option<(u64, u64)>`: the span an insertion or deletion reaches after the 3' shift along the transcript's strand, `None` when nothing moves.
 
 `cargo doc` renders the full item list:
 

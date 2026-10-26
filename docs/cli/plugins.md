@@ -2,38 +2,13 @@
 
 These flags load the built-in plugins and dynamic-library plugins, and name the directory the latter are searched in. The built-in plugins, their parameters and their data files are described under [Plugins](../plugins.md); the C ABI a dynamic-library plugin implements is described under [Writing a plugin](../developers/writing-a-plugin.md).
 
-## Summary
+## Flags
 
-| Flag | Default | What it does |
-| --- | --- | --- |
-| [`--plugin`](#opt_plugin) | none | Loads a plugin by built-in name, dylib path or dylib name; repeatable |
-| [`--custom`](#opt_custom) | none | No effect; custom annotation sources are not loaded |
-| [`--dir_plugins`](#opt_dir_plugins) | none | Directory searched for a dylib named by `--plugin` |
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--plugin` | String (repeatable) | none | Load plugin(s) - can be specified multiple times |
+| `--custom` | String (repeatable) | none | Custom annotation source(s) (accepted for VEP compatibility; not implemented, sources are not loaded) |
+| `--custom_suppress_filter` | bool | false | Refused with an error: `--custom_suppress_filter` is not supported: it would keep a `--custom` VCF source's FILTER column out of the output unless the `--custom` source's fields argument names it, and custom annotation is not supported |
+| `--dir_plugins` | String | none | Directory the plugin libraries are looked up in; default \<`--dir`\>/Plugins. A directory that does not exist is warned about when `--plugin` names a plugin (an error under `--safe`). A value holding a glob pattern (`*`, `?`, `[...]`, `{a,b}`) or a `~user` prefix is read as one literal path; Ensembl VEP expands it with `glob` |
+| `--safe` | bool | false | Make a plugin that cannot be loaded, or a missing plugins directory, an error instead of a warning, and skip the check of incompatible flag pairs |
 
-## Accepted for compatibility
-
-`--custom_suppress_filter` is refused with an error and is described under [Refused flags](compatibility.md#refused-flags).
-
-| Flag | What Ensembl VEP does with it |
-| --- | --- |
-| `--custom` | Adds annotation from a tabix-indexed or bigWig file |
-
-## Options
-
-### `--plugin` {#opt_plugin}
-
-**`--plugin <Name,param1,param2,...>`**, string, repeatable, no default. Ensembl VEP: same flag and default.
-
-Loads a plugin. `Name` is a built-in (the names under [Plugins](../plugins.md), matched case-sensitively), the path of a C-ABI dylib, or a dylib name resolved as `lib<Name>.so` or `lib<Name>.dylib` under `--dir_plugins`. A name that is none of these is warned about and skipped, which is Ensembl VEP's own default. A dylib that exists but fails to open, reports another ABI version or fails `init` aborts the run.
-
-### `--custom` {#opt_custom}
-
-**`--custom <spec>`**, string, repeatable, no default. Ensembl VEP: accepted, no effect.
-
-Not implemented: custom annotation sources are not loaded.
-
-### `--dir_plugins` {#opt_dir_plugins}
-
-**`--dir_plugins <dir>`**, string, no default. Ensembl VEP: same flag, vep-rs default differs: no directory is searched without the flag.
-
-Directory searched for `lib<Name>.so` or `lib<Name>.dylib` when `--plugin <Name>` is neither a built-in nor a path.

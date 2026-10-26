@@ -3,8 +3,8 @@
 
 //! Structural duplication (`<DUP>`, `<DUP:TANDEM>`) consequence calculation.
 //!
-//! Mirrors Perl VEP's `StructuralVariationOverlapAllele` logic for duplications.
-//! Consequence assignment follows the Perl VEP rules:
+//! Mirrors Ensembl VEP's `StructuralVariationOverlapAllele` logic for duplications.
+//! Consequence assignment follows the Ensembl VEP rules:
 //!
 //! - **transcript_amplification**: DUP fully contains the transcript (OverlapPC == 100%).
 //! - **feature_elongation**: DUP lies entirely within the transcript and overlaps
@@ -26,9 +26,7 @@ use super::{
     overlaps_five_prime_utr, overlaps_polypyrimidine_tract, overlaps_three_prime_utr,
 };
 use smallvec::SmallVec;
-use vep_core::consequence::{
-    Consequence, ConsequenceList, FeatureType, Impact, TranscriptConsequence,
-};
+use vep_core::consequence::{Consequence, ConsequenceList, Impact, TranscriptConsequence};
 use vep_core::coordinate::Strand;
 use vep_core::transcript::Transcript;
 use vep_core::variant::InputVariant;
@@ -50,7 +48,7 @@ pub fn calculate(
     let tx_end = transcript.end;
 
     if sv_hi < tx_start.saturating_sub(upstream_distance.max(downstream_distance))
-        || sv_lo > tx_end + upstream_distance.max(downstream_distance)
+        || sv_lo > tx_end.saturating_add(upstream_distance.max(downstream_distance))
     {
         return None;
     }
@@ -104,7 +102,7 @@ pub fn calculate(
             // in the arm above, can co-occur.
             consequences.push(Consequence::MatureMirnaVariant);
         } else {
-            // Perl VEP `feature_elongation` predicate:
+            // Ensembl VEP `feature_elongation` predicate:
             //   within_cdna(@_) AND complete_within_feature(@_) AND copy_number_gain(@_)
             // so it fires when the DUP lies entirely inside the transcript and
             // overlaps exonic sequence, not when it extends beyond.
@@ -114,7 +112,7 @@ pub fn calculate(
                 consequences.push(Consequence::FeatureElongation);
             }
 
-            add_regional_consequences(variant, transcript, sv_lo, sv_hi, &mut consequences);
+            add_regional_consequences(transcript, sv_lo, sv_hi, &mut consequences);
         }
 
         let impact = determine_impact(&consequences);
@@ -148,7 +146,6 @@ pub fn calculate(
 
 /// Add regional sub-consequences based on which transcript regions the DUP overlaps.
 fn add_regional_consequences(
-    _variant: &InputVariant,
     transcript: &Transcript,
     sv_lo: u64,
     sv_hi: u64,
@@ -188,11 +185,11 @@ fn add_regional_consequences(
         push_unique(consequences, Consequence::SplicePolypyrimidineTractVariant);
     }
 
-    // Perl VEP: for non-coding transcripts, non_coding_transcript_variant is added
+    // Ensembl VEP: for non-coding transcripts, non_coding_transcript_variant is added
     // when there is NO exon overlap (within_non_coding_gene requires not non_coding_exon_variant
     // and not mature_miRNA).
     if !is_protein_coding
-        && !transcript.is_nmd_transcript()
+        && !transcript.facts().is_nmd
         && !consequences.contains(&Consequence::NonCodingTranscriptExonVariant)
         && !consequences.contains(&Consequence::MatureMirnaVariant)
         && !consequences.contains(&Consequence::NonCodingTranscriptVariant)
@@ -201,8 +198,7 @@ fn add_regional_consequences(
     }
 
     // NMD transcript context: always added alongside other consequences.
-    if transcript.is_nmd_transcript() && !consequences.contains(&Consequence::NmdTranscriptVariant)
-    {
+    if transcript.facts().is_nmd && !consequences.contains(&Consequence::NmdTranscriptVariant) {
         push_unique(consequences, Consequence::NmdTranscriptVariant);
     }
 }
@@ -260,33 +256,9 @@ fn build_base_consequence(
     sorted_csqs.sort_by_key(|c| c.rank());
 
     TranscriptConsequence {
-        transcript_id: transcript.stable_id.clone(),
-        feature_start: transcript.start,
-        feature_end: transcript.end,
-        gene_id: transcript.gene_stable_id.clone(),
-        gene_symbol: transcript.gene_symbol.clone(),
-        gene_symbol_source: transcript.gene_symbol_source.clone(),
-        hgnc_id: transcript.hgnc_id.clone(),
         consequences: sorted_csqs,
         impact,
-        biotype: Some(transcript.biotype.clone()),
-        canonical: transcript.canonical,
-        strand: match transcript.strand {
-            Strand::Forward => 1,
-            Strand::Reverse => -1,
-        },
-        feature_type: FeatureType::Transcript,
-        flags: transcript.flags.clone(),
-        tsl: transcript.tsl,
-        mane_select: transcript.mane_select.clone(),
-        mane_plus_clinical: transcript.mane_plus_clinical.clone(),
-        appris: transcript.appris.clone(),
-        ccds: transcript.ccds.clone(),
-        protein_id: transcript.protein_id.clone(),
-        swissprot: transcript.swissprot.clone(),
-        trembl: transcript.trembl.clone(),
-        refseq: transcript.refseq.clone(),
-        ..TranscriptConsequence::default()
+        ..TranscriptConsequence::for_transcript(transcript)
     }
 }
 
@@ -301,6 +273,7 @@ fn push_unique(consequences: &mut ConsequenceList, consequence: Consequence) {
 mod tests {
     use super::*;
     use crate::test_helpers::{make_test_transcript, make_test_transcript_with_flags};
+    use vep_core::consequence::FeatureType;
     use vep_core::variant::VariantClass;
 
     /// Helper: build a structural duplication variant.
@@ -376,7 +349,7 @@ mod tests {
     #[test]
     fn test_dup_extends_left_no_feature_elongation() {
         let tx = make_test_transcript();
-        // Perl VEP: feature_elongation requires complete_within_feature, and this
+        // Ensembl VEP: feature_elongation requires complete_within_feature, and this
         // DUP extends beyond the transcript.
         let v = make_dup(24_999_000, 25_003_000, VariantClass::Duplication);
         let result = calculate(&v, &tx, 5000, 5000);
@@ -410,7 +383,7 @@ mod tests {
     fn test_dup_internal_cds_overlap_has_feature_elongation() {
         let tx = make_test_transcript();
         // DUP entirely within the transcript, overlapping CDS and introns.
-        // Perl VEP: feature_elongation fires when complete_within_feature
+        // Ensembl VEP: feature_elongation fires when complete_within_feature
         // and within_cdna (overlaps exonic sequence).
         let v = make_dup(25_000_100, 25_002_100, VariantClass::Duplication);
         let result = calculate(&v, &tx, 5000, 5000);
@@ -557,7 +530,7 @@ mod tests {
     #[test]
     fn test_dup_multiple_regions() {
         let tx = make_test_transcript();
-        // Contained within the transcript and overlapping exons, so Perl VEP
+        // Contained within the transcript and overlapping exons, so Ensembl VEP
         // fires feature_elongation (complete_within_feature and within_cdna).
         let v = make_dup(25_000_010, 25_005_000, VariantClass::Duplication);
         let result = calculate(&v, &tx, 5000, 5000);

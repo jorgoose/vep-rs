@@ -3,7 +3,7 @@
 
 //! Load transcripts from the converted JSON cache directory.
 //!
-//! The JSON cache (written by `vep-cache-builder` or converted from a Perl VEP cache) uses field names that
+//! The JSON cache (written by `vep-cache-builder` or converted from an Ensembl VEP cache) uses field names that
 //! differ from the Rust `Transcript` struct (e.g. `dbID` vs `db_id`,
 //! `is_canonical` vs `canonical`). This module provides deserialization types
 //! that map the JSON format and converts them to the canonical Rust types.
@@ -18,16 +18,19 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use rayon::prelude::*;
-use rustc_hash::FxHashMap;
 use serde::Deserialize;
 use tracing::info;
 
+use vep_core::cache_info::CacheInfo;
+use vep_core::cache_manifest::CacheManifest;
 use vep_core::coordinate::Strand;
 use vep_core::transcript::{
     Attribute, Exon, ExonCoordMapper, Intron, MapperPair, PredictionMatrix, ProteinFeature,
     ProteinFunctionPredictions, SeqEdit, Transcript, TranscriptMapper, TranscriptVEFC, Translation,
 };
-use vep_core::variation::CachedVariation;
+
+use crate::cache_resolve::manifest_error;
+use crate::config::CliError;
 
 /// Visitors for the numeric fields a Storable-derived cache may store as a JSON number
 /// or as a string holding one.
@@ -292,6 +295,8 @@ struct JsonTranscript {
     db_id: Option<u64>,
     #[serde(deserialize_with = "deserialize_arc_str")]
     gene_stable_id: Arc<str>,
+    #[serde(default, deserialize_with = "deserialize_optional_u32")]
+    gene_version: Option<u32>,
     #[serde(default)]
     chr: Option<String>,
     #[serde(deserialize_with = "deserialize_string_or_number")]
@@ -303,8 +308,6 @@ struct JsonTranscript {
     #[serde(deserialize_with = "deserialize_arc_str")]
     biotype: Arc<str>,
     source: String,
-    #[serde(default)]
-    description: Option<String>,
     #[serde(default, deserialize_with = "deserialize_optional_arc_str")]
     gene_symbol: Option<Arc<str>>,
     #[serde(default, deserialize_with = "deserialize_optional_arc_str")]
@@ -347,6 +350,8 @@ struct JsonTranscript {
     trembl: Option<String>,
     #[serde(default)]
     uniparc: Option<String>,
+    #[serde(default)]
+    uniprot_isoform: Option<String>,
     #[serde(default)]
     exons: Vec<JsonExon>,
     #[serde(default, deserialize_with = "deserialize_optional_string_or_number")]
@@ -531,8 +536,10 @@ struct JsonProteinFeature {
     analysis: Option<String>,
 }
 
-/// Deserialize `analysis` which may be a string (vep-cache-builder / GRCh37 Storable)
-/// or an object with `display_label` (raw Storable conversion).
+/// Deserialize `analysis`, the protein feature's display label: a string, or
+/// the Storable `Bio::EnsEMBL::Analysis` object the dumper reduces to its one
+/// `_display_label` key (`display_label` is the same key as the API's accessor
+/// spells it).
 fn deserialize_analysis<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -544,7 +551,7 @@ where
         type Value = Option<String>;
 
         fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-            f.write_str("a string, null, or an object with display_label")
+            f.write_str("a string, null, or an object with display_label or _display_label")
         }
 
         fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
@@ -575,8 +582,8 @@ where
             let mut display_label: Option<String> = None;
             while let Some(key) = map.next_key::<String>()? {
                 let val: serde_json::Value = map.next_value()?;
-                if key == "display_label" {
-                    display_label = val.as_str().map(|s| s.to_string());
+                if key == "display_label" || key == "_display_label" {
+                    display_label = val.as_str().filter(|s| !s.is_empty()).map(str::to_string);
                 }
             }
             Ok(display_label)
@@ -631,11 +638,6 @@ fn convert_intron(ji: JsonIntron, rank_fallback: u32) -> Intron {
     }
 }
 
-fn attribute_value_is_true(value: &str) -> bool {
-    let normalized = value.trim().to_ascii_lowercase();
-    matches!(normalized.as_str(), "" | "1" | "true" | "yes")
-}
-
 /// Transcript flags are the codes of every `cds_` attribute, whatever its value:
 /// VEP prints them that way (OutputFactory.pm) and its consequence predicates
 /// test the attribute's presence, not its value (VariationEffect.pm
@@ -650,11 +652,35 @@ fn derive_flags_from_attributes(attributes: &[Attribute]) -> Vec<String> {
     flags
 }
 
-fn derive_gencode_primary(attributes: &[Attribute]) -> bool {
-    attributes.iter().any(|a| {
-        (a.code == "gencode_primary" || a.code == "gencode_basic")
-            && attribute_value_is_true(&a.value)
-    })
+/// The value of the first attribute carrying `code`: VEP reads MANE, TSL and
+/// APPRIS from the attribute list with a `grep` on the code that keeps its
+/// first match (OutputFactory.pm `BaseTranscriptVariationAllele_to_output_hash`),
+/// so a later duplicate is never read.
+fn attribute_value<'a>(attributes: &'a [Attribute], code: &str) -> Option<&'a str> {
+    attributes
+        .iter()
+        .find(|a| a.code == code)
+        .map(|a| a.value.as_str())
+}
+
+/// Whether any attribute carries `code`, whatever its value.
+fn has_attribute(attributes: &[Attribute], code: &str) -> bool {
+    attributes.iter().any(|a| a.code == code)
+}
+
+/// The support level a `TSL` attribute's value carries: VEP's `m/tsl(\d+)/`
+/// followed by `if $1`, so `tsl1 (assigned to previous version 8)` is 1, and
+/// `tslNA` and a zero are none. The first `tsl` followed by a digit is the
+/// match, as the regex's is; a zero there is none and no later run is read.
+fn tsl_from_attribute_value(value: &str) -> Option<u8> {
+    let digits = value.match_indices("tsl").find_map(|(at, tsl)| {
+        let rest = &value[at + tsl.len()..];
+        let digit_run_len = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        (digit_run_len > 0).then_some(&rest[..digit_run_len])
+    })?;
+    digits.parse::<u8>().ok().filter(|&level| level != 0)
 }
 
 fn convert_transcript(jt: JsonTranscript, chr_override: &str) -> Transcript {
@@ -697,19 +723,29 @@ fn convert_transcript(jt: JsonTranscript, chr_override: &str) -> Transcript {
         })
         .collect();
     let flags = derive_flags_from_attributes(&attributes);
-    let gencode_primary = derive_gencode_primary(&attributes);
 
-    let tsl = jt.tsl.or_else(|| {
-        attributes.iter().find_map(|a| {
-            if a.code == "TSL" {
-                a.value
-                    .strip_prefix("tsl")
-                    .and_then(|n| n.parse::<u8>().ok())
-            } else {
-                None
-            }
-        })
-    });
+    // GENCODE set membership is the presence of the attribute, whatever its value:
+    // VEP's transcript filter and its `GENCODE_PRIMARY` column test
+    // `grep {$_->{code} eq 'gencode_basic'}` and `'gencode_primary'` alone
+    // (AnnotationType/Transcript.pm `filter_transcript`), and the dumped values
+    // are the labels `GENCODE basic` and `GENCODE primary`.
+    let gencode_basic = has_attribute(&attributes, "gencode_basic");
+    let gencode_primary = has_attribute(&attributes, "gencode_primary");
+
+    // A Storable-derived cache carries MANE, TSL and APPRIS only as transcript
+    // attributes; a top-level key, when a cache writes one, is read first.
+    let tsl = jt
+        .tsl
+        .or_else(|| attribute_value(&attributes, "TSL").and_then(tsl_from_attribute_value));
+    let mane_select = jt
+        .mane_select
+        .or_else(|| attribute_value(&attributes, "MANE_Select").map(str::to_string));
+    let mane_plus_clinical = jt
+        .mane_plus_clinical
+        .or_else(|| attribute_value(&attributes, "MANE_Plus_Clinical").map(str::to_string));
+    let appris = jt
+        .appris
+        .or_else(|| attribute_value(&attributes, "appris").map(str::to_string));
 
     // The transcript-level `introns` field prefers VEFC introns over the
     // exon-derived ones, which are only computed when needed.
@@ -811,28 +847,29 @@ fn convert_transcript(jt: JsonTranscript, chr_override: &str) -> Transcript {
         version: jt.version,
         db_id: jt.db_id,
         gene_stable_id: jt.gene_stable_id,
+        gene_version: jt.gene_version,
         chr,
         start: jt.start,
         end: jt.end,
         strand: jt.strand,
         biotype: jt.biotype,
         source: jt.source,
-        description: jt.description,
         gene_symbol: jt.gene_symbol,
         gene_symbol_source: jt.gene_symbol_source,
         hgnc_id: jt.hgnc_id,
         gene_phenotype: jt.gene_phenotype,
         canonical: jt.canonical,
-        mane_select: jt.mane_select,
-        mane_plus_clinical: jt.mane_plus_clinical,
+        mane_select,
+        mane_plus_clinical,
         tsl,
-        appris: jt.appris,
+        appris,
         ccds: jt.ccds,
         protein_id: jt.protein_id,
         refseq: jt.refseq,
         swissprot: jt.swissprot,
         trembl: jt.trembl,
         uniparc: jt.uniparc,
+        uniprot_isoform: jt.uniprot_isoform,
         exons,
         introns,
         cdna_coding_start: jt.cdna_coding_start,
@@ -845,10 +882,12 @@ fn convert_transcript(jt: JsonTranscript, chr_override: &str) -> Transcript {
         cdna_sequence: None,
         protein_sequence: None,
         flags: flags.into(),
+        gencode_basic,
         gencode_primary,
         attributes,
         vefc,
         derived: Default::default(),
+        id_rank: 0,
     }
 }
 
@@ -925,42 +964,48 @@ fn compute_coding_region(mapper: &JsonMapper) -> (Option<u64>, Option<u64>) {
 /// covers. That matters beyond convenience: several Perl-parity predicates in
 /// `runner.rs` / `annotator.rs` branch on whether a chromosome is *present* in
 /// the cache (the `intergenic_variant` fallback, and the inter-chromosomal BND
-/// mate-annotation gate), mirroring Perl VEP's own cache-loading behavior. A
+/// mate-annotation gate), mirroring Ensembl VEP's own cache-loading behavior. A
 /// lazy loader must therefore be able to answer "is this chromosome in the
 /// cache?" without parsing it, which this function provides.
 ///
-/// Returns an empty map when the directory is absent.
+/// A cache directory without `transcripts/` is an error: an empty map would
+/// annotate every variant as intergenic and exit 0. A `transcripts`
+/// directory under which no chromosome holds a shard is refused under the error
+/// contract, naming the cache's serialiser: a Sereal cache converts to no
+/// shard at all, and a copy that landed no shard reads the same.
 ///
-/// A chromosome directory holding no `.json` shards yields no key. The
-/// distinction is load-bearing rather than cosmetic: `contains_key` gates the
-/// `intergenic_variant` fallback and the inter-chromosomal BND mate check, so a
-/// key with an empty shard list would materialize an empty index and flip both
-/// predicates from "chromosome absent" (drop the row, as Perl does) to
-/// "chromosome present but has no transcripts" (emit `intergenic_variant`). A
-/// partially-copied cache is the realistic way to end up with an empty
-/// chromosome directory.
+/// The key set is Ensembl VEP's `valid_chromosomes`: every subdirectory whose
+/// name does not start with a dot (`CacheDir.pm:431`, `grep {!/^\./ && -d}`).
+/// A chromosome directory holding no `.json` shard is a key with an empty shard
+/// list, so a record on it is annotated `intergenic_variant` rather than
+/// skipped as a chromosome the cache lacks; a dot-prefixed directory is no
+/// chromosome, whatever it holds.
 pub fn enumerate_transcript_shards(
     json_cache_dir: &str,
 ) -> anyhow::Result<HashMap<String, Vec<PathBuf>>> {
     let mut by_chr: HashMap<String, Vec<PathBuf>> = HashMap::new();
     let transcripts_dir = Path::new(json_cache_dir).join("transcripts");
 
-    if !transcripts_dir.exists() {
-        info!(
-            "No transcripts directory found at {}",
+    if !transcripts_dir.is_dir() {
+        anyhow::bail!(
+            "no cache found at {json_cache_dir}: no transcripts directory ({})",
             transcripts_dir.display()
         );
-        return Ok(by_chr);
     }
 
     for chr_entry in std::fs::read_dir(&transcripts_dir)
         .with_context(|| format!("Failed to read {}", transcripts_dir.display()))?
     {
         let chr_entry = chr_entry?;
-        if !chr_entry.file_type()?.is_dir() {
+        // `path().is_dir()` follows a symlinked chromosome directory, which
+        // `DirEntry::file_type` reports as a link.
+        if !chr_entry.path().is_dir() {
             continue;
         }
         let chr = chr_entry.file_name().to_string_lossy().to_string();
+        if chr.starts_with('.') {
+            continue;
+        }
 
         let mut shards: Vec<PathBuf> = Vec::new();
         for file_entry in std::fs::read_dir(chr_entry.path())? {
@@ -975,15 +1020,32 @@ pub fn enumerate_transcript_shards(
         // returned them in, so two caches with the same content index their
         // transcripts identically.
         shards.sort_by_key(|p| shard_start(p));
+        by_chr.insert(chr, shards);
+    }
 
-        // Insert only when the directory actually holds shards, so a shard-less
-        // chromosome directory reads as absent (see the note above).
-        if !shards.is_empty() {
-            by_chr.insert(chr, shards);
-        }
+    if by_chr.values().all(Vec::is_empty) {
+        return Err(CliError::new(
+            "cache",
+            format!(
+                "no transcript shards under {} (serialiser_type {})",
+                transcripts_dir.display(),
+                cache_serialiser_type(json_cache_dir)
+            ),
+        )
+        .into());
     }
 
     Ok(by_chr)
+}
+
+/// The `serialiser_type` the cache's `info.json` declares; a cache that
+/// declares none was written by Storable.
+fn cache_serialiser_type(json_cache_dir: &str) -> String {
+    std::fs::read_to_string(Path::new(json_cache_dir).join("info.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<CacheInfo>(&text).ok())
+        .and_then(|info| info.serialiser_type)
+        .unwrap_or_else(|| "storable".to_string())
 }
 
 /// A shard is `<start>-<end>.json`, optionally gzip-compressed as `.json.gz`.
@@ -1008,9 +1070,11 @@ fn shard_start(path: &Path) -> (u64, String) {
     (start, name)
 }
 
-/// Read a shard's bytes, inflating a `.json.gz` shard.
-fn read_shard(path: &Path) -> anyhow::Result<Vec<u8>> {
+/// Read a shard's bytes, checking them against the cache's manifest before a
+/// `.json.gz` shard is inflated.
+fn read_shard(path: &Path, manifest: &CacheManifest) -> anyhow::Result<Vec<u8>> {
     let raw = std::fs::read(path).with_context(|| format!("Failed to read {}", path.display()))?;
+    manifest.verify_bytes(path, &raw).map_err(manifest_error)?;
     if path.extension().is_some_and(|e| e == "gz") {
         let mut out = Vec::new();
         std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(&raw[..]), &mut out)
@@ -1052,18 +1116,27 @@ fn parse_shard_transcripts(data: &[u8]) -> serde_json::Result<Vec<JsonTranscript
 /// `--fork 1` does not make shard parsing single-threaded.
 ///
 /// `chr` is the chromosome name the shards belong to; it is stamped onto every
-/// transcript by `convert_transcript`.
-pub fn load_transcripts_for_chr(chr: &str, shards: &[PathBuf]) -> anyhow::Result<Vec<Transcript>> {
+/// transcript by `convert_transcript`. Every shard's bytes are checked against
+/// `manifest`, the cache's checksum manifest, as they are read.
+pub fn load_transcripts_for_chr(
+    chr: &str,
+    shards: &[PathBuf],
+    manifest: &CacheManifest,
+) -> anyhow::Result<Vec<Transcript>> {
     let parsed: Vec<anyhow::Result<Vec<Transcript>>> = shards
         .par_iter()
         .map(|path| -> anyhow::Result<Vec<Transcript>> {
-            let data = read_shard(path)?;
+            let data = read_shard(path, manifest)?;
             let json_transcripts = parse_shard_transcripts(&data)
                 .with_context(|| format!("Failed to parse {}", path.display()))?;
             let transcripts: Vec<Transcript> = json_transcripts
                 .into_iter()
                 .map(|jt| convert_transcript(jt, chr))
                 .collect();
+            for transcript in &transcripts {
+                check_mapper_bounds(transcript)
+                    .map_err(|message| CliError::new("cache", message))?;
+            }
             Ok(transcripts)
         })
         .collect();
@@ -1087,7 +1160,99 @@ pub fn load_transcripts_for_chr(chr: &str, shards: &[PathBuf]) -> anyhow::Result
             }
         }
     }
+    assign_id_ranks(&mut out);
     Ok(out)
+}
+
+/// Refuses a coding transcript whose mapper places the coding sequence where
+/// the transcript's own span cannot hold it, or whose coding end precedes its
+/// coding start. A cache without UTR strings has each one padded with `N` to
+/// the mapper's `cdna_coding_start - 1` and to the cDNA length less
+/// `cdna_coding_end`, so each padding is bounded here by the transcript's
+/// genomic span plus the bases its RNA edits insert, the most bases its cDNA
+/// can hold, before any record is annotated against it; the coding span's
+/// length, `cdna_coding_end - cdna_coding_start + 1`, is sized from the pair
+/// wherever the spliced sequence is assembled, so an inverted pair is refused
+/// here rather than read as a transcript with no coding model.
+fn check_mapper_bounds(transcript: &Transcript) -> Result<(), String> {
+    let Some(vefc) = transcript.vefc.as_ref() else {
+        return Ok(());
+    };
+    // No padding is built for a transcript without a coding sequence.
+    if vefc.translateable_seq.as_deref().is_none_or(str::is_empty) {
+        return Ok(());
+    }
+    let Some(mapper) = vefc.mapper.as_ref() else {
+        return Ok(());
+    };
+    // An `_rna_edit` attribute (`<start> <end> <bases>` in cDNA coordinates)
+    // that inserts bases lengthens the cDNA the mapper measures past the
+    // exons' span; an insertion's end lies before its start and replaces
+    // nothing.
+    let inserted_bases: u64 = transcript
+        .attributes
+        .iter()
+        .filter(|attribute| attribute.code == "_rna_edit")
+        .filter_map(|attribute| {
+            let mut fields = attribute.value.split_whitespace();
+            let start: u64 = fields.next()?.parse().ok()?;
+            let end: u64 = fields.next()?.parse().ok()?;
+            let bases = fields.next().map_or(0, |bases| bases.len() as u64);
+            let replaced = if end >= start {
+                (end - start).saturating_add(1)
+            } else {
+                0
+            };
+            Some(bases.saturating_sub(replaced))
+        })
+        .sum();
+    let span = transcript
+        .end
+        .saturating_sub(transcript.start)
+        .saturating_add(1)
+        .saturating_add(inserted_bases);
+    let cdna_len = mapper
+        .exon_coord_mapper
+        .pairs
+        .iter()
+        .map(|p| p.from_end)
+        .max()
+        .unwrap_or(0);
+    let five_prime = mapper.cdna_coding_start.saturating_sub(1);
+    let three_prime = cdna_len.saturating_sub(mapper.cdna_coding_end);
+    if five_prime > span || three_prime > span {
+        return Err(format!(
+            "transcript {}: the mapper's coding start {} and end {} on a cDNA of {cdna_len} \
+             bases leave a UTR longer than the transcript's {span}-base span",
+            transcript.stable_id, mapper.cdna_coding_start, mapper.cdna_coding_end
+        ));
+    }
+    if mapper.cdna_coding_end < mapper.cdna_coding_start {
+        return Err(format!(
+            "transcript {}: the mapper's coding end {} precedes its coding start {}",
+            transcript.stable_id, mapper.cdna_coding_end, mapper.cdna_coding_start
+        ));
+    }
+    Ok(())
+}
+
+/// Sets every transcript's `id_rank` to its stable id's position in the byte
+/// order of the slice's ids, counted from 1; transcripts sharing an id share the
+/// rank. Rank 0 stays the mark of a transcript no loader ranked, which the
+/// writers order by its id instead.
+fn assign_id_ranks(transcripts: &mut [Transcript]) {
+    let mut by_id: Vec<usize> = (0..transcripts.len()).collect();
+    by_id.sort_by(|&a, &b| transcripts[a].stable_id.cmp(&transcripts[b].stable_id));
+    let mut rank = 1u32;
+    let mut previous: Option<Arc<str>> = None;
+    for i in by_id {
+        let id = &transcripts[i].stable_id;
+        if previous.as_ref().is_some_and(|p| p != id) {
+            rank += 1;
+        }
+        previous = Some(id.clone());
+        transcripts[i].id_rank = rank;
+    }
 }
 
 /// Load every chromosome's transcripts from the JSON cache directory.
@@ -1101,10 +1266,15 @@ pub fn load_transcripts_for_chr(chr: &str, shards: &[PathBuf]) -> anyhow::Result
 /// `load_transcripts_for_chr`: the loop below is parallel, so logging from the
 /// closure would interleave the ~25 lines in completion order and make two runs
 /// of the same cache produce different logs.
+///
+/// The cache's checksum manifest is read from the directory, every file it
+/// lists must be present, and every shard is checked against it.
 pub fn load_all_transcripts(
     json_cache_dir: &str,
 ) -> anyhow::Result<HashMap<String, Vec<Transcript>>> {
     let shards = enumerate_transcript_shards(json_cache_dir)?;
+    let manifest = CacheManifest::load(json_cache_dir).map_err(manifest_error)?;
+    manifest.require_complete().map_err(manifest_error)?;
     // Parallel across chromosomes, not only across one chromosome's shards: a
     // serial outer loop drains the pool at every chromosome boundary and runs
     // each tail shard alone. Rayon nests safely here because this eager path
@@ -1114,7 +1284,10 @@ pub fn load_all_transcripts(
         .par_iter()
         .map(
             |(chr, paths)| -> anyhow::Result<(String, Vec<Transcript>)> {
-                Ok((chr.clone(), load_transcripts_for_chr(chr, paths)?))
+                Ok((
+                    chr.clone(),
+                    load_transcripts_for_chr(chr, paths, &manifest)?,
+                ))
             },
         )
         .collect::<anyhow::Result<HashMap<_, _>>>()?;
@@ -1127,365 +1300,71 @@ pub fn load_all_transcripts(
     Ok(by_chr)
 }
 
-/// Deserialize helper for fields that can be "", "0", 0, or 1 in the variation JSON.
-fn deserialize_string_or_num_as_u8<'de, D>(deserializer: D) -> Result<u8, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum StringOrNum {
-        Num(i64),
-        Float(f64),
-        Str(String),
-    }
-    let v: Option<StringOrNum> = Option::deserialize(deserializer)?;
-    match v {
-        None => Ok(0),
-        Some(StringOrNum::Num(n)) => Ok(n as u8),
-        Some(StringOrNum::Float(f)) => Ok(f as u8),
-        Some(StringOrNum::Str(s)) if s.is_empty() => Ok(0),
-        Some(StringOrNum::Str(s)) => s.parse::<u8>().or(Ok(0)),
-    }
-}
-
-fn deserialize_var_start<'de, D>(deserializer: D) -> Result<u64, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Val {
-        Num(u64),
-        Float(f64),
-        Str(String),
-    }
-    match Val::deserialize(deserializer)? {
-        Val::Num(n) => Ok(n),
-        Val::Float(f) => Ok(f as u64),
-        Val::Str(s) => s.parse::<u64>().map_err(serde::de::Error::custom),
-    }
-}
-
-fn deserialize_optional_var_u64<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Val {
-        Num(u64),
-        Float(f64),
-        Str(String),
-    }
-    let v: Option<Val> = Option::deserialize(deserializer)?;
-    match v {
-        None => Ok(None),
-        Some(Val::Str(s)) if s.is_empty() => Ok(None),
-        Some(Val::Str(s)) => s.parse::<u64>().map(Some).map_err(serde::de::Error::custom),
-        Some(Val::Num(n)) => Ok(Some(n)),
-        Some(Val::Float(f)) => Ok(Some(f as u64)),
-    }
-}
-
-fn deserialize_optional_var_f64<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Val {
-        Num(f64),
-        Str(String),
-    }
-    let v: Option<Val> = Option::deserialize(deserializer)?;
-    match v {
-        None => Ok(None),
-        Some(Val::Str(s)) if s.is_empty() => Ok(None),
-        Some(Val::Str(s)) => s.parse::<f64>().map(Some).map_err(serde::de::Error::custom),
-        Some(Val::Num(n)) => Ok(Some(n)),
-    }
-}
-
-fn deserialize_var_strand<'de, D>(deserializer: D) -> Result<i8, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Val {
-        Num(i64),
-        Float(f64),
-        Str(String),
-    }
-    let v: Option<Val> = Option::deserialize(deserializer)?;
-    match v {
-        None => Ok(1),
-        Some(Val::Num(n)) => Ok(n as i8),
-        Some(Val::Float(f)) => Ok(f as i8),
-        Some(Val::Str(s)) if s.is_empty() => Ok(1),
-        Some(Val::Str(s)) => s.parse::<i8>().or(Ok(1)),
-    }
-}
-
-/// JSON representation of a variation record from the converted cache.
-#[derive(Deserialize)]
-#[allow(non_snake_case)] // The cache carries Perl's mixed-case field names (e.g. "gnomADe_AFR")
-struct JsonVariation {
-    #[serde(default)]
-    variation_name: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_string_or_num_as_u8")]
-    failed: u8,
-    #[serde(default, deserialize_with = "deserialize_string_or_num_as_u8")]
-    somatic: u8,
-    #[serde(deserialize_with = "deserialize_var_start")]
-    start: u64,
-    #[serde(default, deserialize_with = "deserialize_optional_var_u64")]
-    end: Option<u64>,
-    #[serde(default)]
-    allele_string: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_var_strand")]
-    strand: i8,
-    #[serde(default)]
-    minor_allele: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_optional_var_f64")]
-    minor_allele_freq: Option<f64>,
-    #[serde(default)]
-    clin_sig: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_string_or_num_as_u8")]
-    phenotype_or_disease: u8,
-    #[serde(default)]
-    pubmed: Option<String>,
-    #[serde(default)]
-    var_synonyms: Option<String>,
-    #[serde(default, rename = "AF")]
-    af: Option<String>,
-    #[serde(default, rename = "AFR")]
-    afr: Option<String>,
-    #[serde(default, rename = "AMR")]
-    amr: Option<String>,
-    #[serde(default, rename = "EAS")]
-    eas: Option<String>,
-    #[serde(default, rename = "EUR")]
-    eur: Option<String>,
-    #[serde(default, rename = "SAS")]
-    sas: Option<String>,
-    #[serde(default, rename = "AA")]
-    aa: Option<String>,
-    #[serde(default, rename = "EA")]
-    ea: Option<String>,
-    #[serde(default)]
-    gnomADe: Option<String>,
-    #[serde(default)]
-    gnomADe_AFR: Option<String>,
-    #[serde(default)]
-    gnomADe_AMR: Option<String>,
-    #[serde(default)]
-    gnomADe_ASJ: Option<String>,
-    #[serde(default)]
-    gnomADe_EAS: Option<String>,
-    #[serde(default)]
-    gnomADe_FIN: Option<String>,
-    #[serde(default)]
-    gnomADe_MID: Option<String>,
-    #[serde(default)]
-    gnomADe_NFE: Option<String>,
-    #[serde(default)]
-    gnomADe_REMAINING: Option<String>,
-    #[serde(default)]
-    gnomADe_SAS: Option<String>,
-    #[serde(default)]
-    gnomADg: Option<String>,
-    #[serde(default)]
-    gnomADg_AFR: Option<String>,
-    #[serde(default)]
-    gnomADg_AMR: Option<String>,
-    #[serde(default)]
-    gnomADg_ASJ: Option<String>,
-    #[serde(default)]
-    gnomADg_EAS: Option<String>,
-    #[serde(default)]
-    gnomADg_FIN: Option<String>,
-    #[serde(default)]
-    gnomADg_MID: Option<String>,
-    #[serde(default)]
-    gnomADg_NFE: Option<String>,
-    #[serde(default)]
-    gnomADg_REMAINING: Option<String>,
-    #[serde(default)]
-    gnomADg_SAS: Option<String>,
-}
-
-fn convert_variation(jv: JsonVariation) -> CachedVariation {
-    let mut frequencies = HashMap::new();
-
-    macro_rules! insert_freq {
-        ($key:expr, $val:expr) => {
-            if let Some(ref v) = $val {
-                if !v.is_empty() {
-                    frequencies.insert($key.to_string(), v.clone());
-                }
-            }
-        };
-    }
-
-    insert_freq!("AF", jv.af);
-    insert_freq!("AFR", jv.afr);
-    insert_freq!("AMR", jv.amr);
-    insert_freq!("EAS", jv.eas);
-    insert_freq!("EUR", jv.eur);
-    insert_freq!("SAS", jv.sas);
-    insert_freq!("AA", jv.aa);
-    insert_freq!("EA", jv.ea);
-    insert_freq!("gnomADe", jv.gnomADe);
-    insert_freq!("gnomADe_AFR", jv.gnomADe_AFR);
-    insert_freq!("gnomADe_AMR", jv.gnomADe_AMR);
-    insert_freq!("gnomADe_ASJ", jv.gnomADe_ASJ);
-    insert_freq!("gnomADe_EAS", jv.gnomADe_EAS);
-    insert_freq!("gnomADe_FIN", jv.gnomADe_FIN);
-    insert_freq!("gnomADe_MID", jv.gnomADe_MID);
-    insert_freq!("gnomADe_NFE", jv.gnomADe_NFE);
-    insert_freq!("gnomADe_REMAINING", jv.gnomADe_REMAINING);
-    insert_freq!("gnomADe_SAS", jv.gnomADe_SAS);
-    insert_freq!("gnomADg", jv.gnomADg);
-    insert_freq!("gnomADg_AFR", jv.gnomADg_AFR);
-    insert_freq!("gnomADg_AMR", jv.gnomADg_AMR);
-    insert_freq!("gnomADg_ASJ", jv.gnomADg_ASJ);
-    insert_freq!("gnomADg_EAS", jv.gnomADg_EAS);
-    insert_freq!("gnomADg_FIN", jv.gnomADg_FIN);
-    insert_freq!("gnomADg_MID", jv.gnomADg_MID);
-    insert_freq!("gnomADg_NFE", jv.gnomADg_NFE);
-    insert_freq!("gnomADg_REMAINING", jv.gnomADg_REMAINING);
-    insert_freq!("gnomADg_SAS", jv.gnomADg_SAS);
-
-    let start = jv.start;
-    let end = jv.end.unwrap_or(start);
-
-    let clin_sig = jv.clin_sig.filter(|s| !s.is_empty());
-    let pubmed = jv.pubmed.filter(|s| !s.is_empty());
-    let minor_allele = jv.minor_allele.filter(|s| !s.is_empty());
-    let var_synonyms = jv.var_synonyms.filter(|s| !s.is_empty());
-
-    CachedVariation {
-        variation_name: jv.variation_name.unwrap_or_default(),
-        failed: jv.failed,
-        somatic: jv.somatic,
-        start,
-        end,
-        allele_string: jv.allele_string.unwrap_or_default(),
-        strand: jv.strand,
-        minor_allele,
-        minor_allele_freq: jv.minor_allele_freq,
-        clin_sig,
-        phenotype_or_disease: jv.phenotype_or_disease,
-        pubmed,
-        frequencies,
-        var_synonyms,
-    }
-}
-
-/// Container for loaded variation data with a position index for fast lookup.
-///
-/// The `position_index` maps `(chromosome, position) -> Vec<index>` into the
-/// per-chromosome `variations` vec, enabling O(1) position-based lookups in
-/// the variation matching pipeline.
-pub struct VariationData {
-    /// Variations keyed by chromosome.
-    pub variations: HashMap<String, Vec<CachedVariation>>,
-    /// Position index: chromosome -> (position -> vec of indices into variations vec).
-    pub position_index: HashMap<String, FxHashMap<u64, Vec<usize>>>,
-}
-
-/// Load all variations from the JSON cache directory.
-///
-/// Directory structure: `{json_cache_dir}/variations/{chr}/{start}-{end}.json`
-///
-/// JSON files are parsed in parallel using the rayon thread pool (same
-/// strategy as `load_all_transcripts`).
-pub fn load_all_variations(json_cache_dir: &str) -> anyhow::Result<VariationData> {
-    let mut variations: HashMap<String, Vec<CachedVariation>> = HashMap::new();
-    let mut position_index: HashMap<String, FxHashMap<u64, Vec<usize>>> = HashMap::new();
-    let variations_dir = Path::new(json_cache_dir).join("variations");
-
-    if !variations_dir.exists() {
-        info!(
-            "No variations directory found at {}",
-            variations_dir.display()
-        );
-        return Ok(VariationData {
-            variations,
-            position_index,
-        });
-    }
-
-    let mut files: Vec<(String, PathBuf)> = Vec::new();
-    for chr_entry in std::fs::read_dir(&variations_dir)
-        .with_context(|| format!("Failed to read {}", variations_dir.display()))?
-    {
-        let chr_entry = chr_entry?;
-        if !chr_entry.file_type()?.is_dir() {
-            continue;
-        }
-        let chr = chr_entry.file_name().to_string_lossy().to_string();
-
-        for file_entry in std::fs::read_dir(chr_entry.path())? {
-            let file_entry = file_entry?;
-            let path = file_entry.path();
-            if path.extension().is_none_or(|e| e != "json") {
-                continue;
-            }
-            files.push((chr.clone(), path));
-        }
-    }
-
-    let parsed: Vec<anyhow::Result<(String, Vec<CachedVariation>)>> = files
-        .par_iter()
-        .map(
-            |(chr, path)| -> anyhow::Result<(String, Vec<CachedVariation>)> {
-                let data = std::fs::read(path)
-                    .with_context(|| format!("Failed to read {}", path.display()))?;
-                let json_variations: Vec<JsonVariation> = serde_json::from_slice(&data)
-                    .with_context(|| format!("Failed to parse {}", path.display()))?;
-                let converted: Vec<CachedVariation> =
-                    json_variations.into_iter().map(convert_variation).collect();
-                Ok((chr.clone(), converted))
-            },
-        )
-        .collect();
-
-    for item in parsed {
-        let (chr, converted) = item?;
-        let chr_vars = variations.entry(chr.clone()).or_default();
-        let chr_idx = position_index.entry(chr).or_default();
-        let base_idx = chr_vars.len();
-
-        for (i, cv) in converted.into_iter().enumerate() {
-            let pos = cv.start;
-            chr_idx.entry(pos).or_default().push(base_idx + i);
-            chr_vars.push(cv);
-        }
-    }
-
-    info!("Loaded variations for {} chromosomes", variations.len());
-    for (chr, vars) in &variations {
-        info!("  chr{}: {} variations", chr, vars.len());
-    }
-
-    Ok(VariationData {
-        variations,
-        position_index,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transcript_index::LazyTranscriptIndexes;
+    use crate::variation_source::VariationSource;
+    use std::io::Write;
+    use vep_core::variation::CachedVariation;
+    use vep_io::output::fields::{ClinSigAllele, FieldOptions};
 
+    /// A manifest that checks nothing, for the shards these tests write.
+    fn unchecked() -> CacheManifest {
+        CacheManifest::absent("")
+    }
+
+    /// A directory without `transcripts/`, or whose `transcripts/` holds no
+    /// shard, loads nothing and says so: an empty transcript set would annotate
+    /// every variant as intergenic and exit 0.
     #[test]
     fn test_load_cache_missing_dir() {
-        let result = load_all_transcripts("/nonexistent/path");
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_empty());
+        let error = load_all_transcripts("/nonexistent/path").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .starts_with("no cache found at /nonexistent/path: no transcripts directory"),
+            "{error}"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        assert!(load_all_transcripts(path).is_err());
+        std::fs::create_dir(dir.path().join("transcripts")).unwrap();
+        let error = load_all_transcripts(path).unwrap_err();
+        assert!(
+            error.to_string().contains("no transcript shards under"),
+            "{error}"
+        );
+    }
+
+    /// A copy of a manifest-carrying cache that lacks a listed shard is refused
+    /// before any shard is read, naming the file, as a run's cache resolution
+    /// refuses it.
+    #[test]
+    fn eager_load_refuses_a_cache_missing_a_listed_shard() {
+        let dir = cache_with_shards(
+            "vep_jc_incomplete_",
+            &[
+                ("21", "[]"),
+                ("22", &format!("[{}]", coding_transcript_json(""))),
+            ],
+        );
+        CacheManifest::write(dir.path()).unwrap();
+        let path = dir.path().to_str().unwrap();
+        assert_eq!(load_all_transcripts(path).unwrap().len(), 2);
+        let shard = dir
+            .path()
+            .join("transcripts")
+            .join("22")
+            .join("1-1000000.json");
+        std::fs::remove_file(&shard).unwrap();
+        let error = load_all_transcripts(path).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "ERROR: [cache] transcripts/22/1-1000000.json is listed in CHECKSUMS.sha256 but missing from {path}"
+            )
+        );
     }
 
     /// The parallel outer loop must produce the same map a serial one would.
@@ -1557,10 +1436,12 @@ mod tests {
     }
 
     /// A cache converted from VEP's region files carries a gene's transcripts in
-    /// every shard the gene overlaps. The loader must keep one copy, and the copy
-    /// it keeps must not depend on directory listing order.
+    /// every shard the gene overlaps. The loader keeps one copy per `dbID`, as
+    /// VEP's cache reader does, and keys a transcript without one on its stable
+    /// id and version; the copy it keeps does not depend on directory listing
+    /// order.
     #[test]
-    fn a_transcript_present_in_two_shards_loads_once() {
+    fn dedup_by_dbid_then_stable_id_version() {
         let dir = tempfile::Builder::new()
             .prefix("vep_jc_dedup_")
             .tempdir()
@@ -1600,10 +1481,78 @@ mod tests {
             ]
         );
 
-        let txs = load_transcripts_for_chr("21", &shards["21"]).unwrap();
+        let txs = load_transcripts_for_chr("21", &shards["21"], &unchecked()).unwrap();
         let mut ids: Vec<&str> = txs.iter().map(|t| &*t.stable_id).collect();
         ids.sort();
         assert_eq!(ids, vec!["ENST_A", "ENST_NODB", "ENST_STRADDLE"]);
+    }
+
+    /// `id_rank` orders a chromosome's transcripts as their stable ids order as
+    /// bytes, whatever order the shards listed them in, counted from 1 so that
+    /// no ranked transcript carries the unranked 0, and two transcripts with one
+    /// id (distinct dbIDs) share a rank.
+    #[test]
+    fn loaded_transcripts_rank_by_stable_id_with_ties_shared() {
+        let dir = tempfile::Builder::new()
+            .prefix("vep_jc_rank_")
+            .tempdir()
+            .unwrap();
+        let chr_dir = dir.path().join("transcripts").join("21");
+        std::fs::create_dir_all(&chr_dir).unwrap();
+        let tx = |id: &str, db_id: u32, start: u64| {
+            format!(
+                r#"{{"stable_id":"{id}","dbID":"{db_id}","gene_stable_id":"ENSG","chr":"21","start":{start},"end":{end},"strand":1,"biotype":"protein_coding","source":"ensembl"}}"#,
+                end = start + 100
+            )
+        };
+        std::fs::write(
+            chr_dir.join("1-1000000.json"),
+            format!(
+                "[{},{},{}]",
+                tx("ENST00000300", 1, 100),
+                tx("ENST00000010", 2, 200),
+                tx("ENST00000200", 3, 300)
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            chr_dir.join("1000001-2000000.json"),
+            format!(
+                "[{},{}]",
+                tx("ENST00000200", 4, 1000100),
+                tx("ENST0000002", 5, 1000200)
+            ),
+        )
+        .unwrap();
+
+        let shards = enumerate_transcript_shards(dir.path().to_str().unwrap()).unwrap();
+        let txs = load_transcripts_for_chr("21", &shards["21"], &unchecked()).unwrap();
+        let mut ranked: Vec<(&str, u32)> = txs.iter().map(|t| (&*t.stable_id, t.id_rank)).collect();
+        ranked.sort();
+        // Byte order, not numeric: the shorter `ENST0000002` sorts between
+        // `ENST00000010` and `ENST00000200`.
+        assert_eq!(
+            ranked,
+            vec![
+                ("ENST00000010", 1),
+                ("ENST0000002", 2),
+                ("ENST00000200", 3),
+                ("ENST00000200", 3),
+                ("ENST00000300", 4),
+            ]
+        );
+        assert!(txs.iter().all(|t| t.id_rank != 0));
+        for a in &txs {
+            for b in &txs {
+                assert_eq!(
+                    a.id_rank.cmp(&b.id_rank),
+                    a.stable_id.cmp(&b.stable_id),
+                    "{} against {}",
+                    a.stable_id,
+                    b.stable_id
+                );
+            }
+        }
     }
 
     /// A shard may be stored gzip-compressed as `.json.gz`; it loads like a plain shard.
@@ -1623,7 +1572,7 @@ mod tests {
 
         let shards = enumerate_transcript_shards(dir.path().to_str().unwrap()).unwrap();
         assert_eq!(shards["21"].len(), 1);
-        let txs = load_transcripts_for_chr("21", &shards["21"]).unwrap();
+        let txs = load_transcripts_for_chr("21", &shards["21"], &unchecked()).unwrap();
         assert_eq!(txs.len(), 1);
         assert_eq!(&*txs[0].stable_id, "ENST_GZ");
     }
@@ -1660,7 +1609,7 @@ mod tests {
         .unwrap();
 
         let shards = enumerate_transcript_shards(dir.path().to_str().unwrap()).unwrap();
-        let txs = load_transcripts_for_chr("21", &shards["21"]).unwrap();
+        let txs = load_transcripts_for_chr("21", &shards["21"], &unchecked()).unwrap();
         let ids: Vec<&str> = txs.iter().map(|t| &*t.stable_id).collect();
         assert_eq!(ids, vec!["ENST_ARR", "ENST_MAP_A", "ENST_MAP_B"]);
         assert!(txs.iter().all(|t| t.chr == "21"));
@@ -1683,71 +1632,99 @@ mod tests {
         .unwrap();
 
         let shards = enumerate_transcript_shards(dir.path().to_str().unwrap()).unwrap();
-        let err = load_transcripts_for_chr("21", &shards["21"]).unwrap_err();
+        let err = load_transcripts_for_chr("21", &shards["21"], &unchecked()).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("1-1000000.json"), "{msg}");
         assert!(msg.contains("EOF"), "{msg}");
         assert!(!msg.contains("expected a sequence"), "{msg}");
     }
 
+    /// A shard whose mapper places the coding start, or the coding end, a UTR
+    /// longer than the transcript's span away is refused under the `cache`
+    /// component, naming the transcript, when its chromosome loads; the
+    /// 30-base transcript with its coding sequence over the whole span loads,
+    /// as do a non-coding transcript whose mapper runs past its span (no
+    /// padding is built for it) and a coding one whose cDNA runs past its span
+    /// by the bases an RNA edit inserts; an edit whose replaced range fills the
+    /// cDNA numbering inserts nothing and is read without a failure.
     #[test]
-    fn test_load_variations_missing_dir() {
-        let result = load_all_variations("/nonexistent/path");
-        assert!(result.is_ok());
-        let data = result.unwrap();
-        assert!(data.variations.is_empty());
-        assert!(data.position_index.is_empty());
-    }
+    fn mapper_utr_longer_than_the_transcript_span_is_refused() {
+        let load = |replacements: &[(&str, &str)]| {
+            let mut json = coding_transcript_json("");
+            for (from, to) in replacements {
+                assert!(json.contains(from), "{from}");
+                json = json.replace(from, to);
+            }
+            let dir = cache_with_shards("vep_jc_mapper_", &[("21", &format!("[{json}]"))]);
+            let shards = enumerate_transcript_shards(dir.path().to_str().unwrap()).unwrap();
+            load_transcripts_for_chr("21", &shards["21"], &unchecked()).map(|txs| txs.len())
+        };
+        // The fixture's one mapper pair ends at cDNA 30, so its `from_end` is
+        // the cDNA length.
+        let cdna_far_past_span = (r#""from_end":30,"#, r#""from_end":4000000000,"#);
+        let cdna_five_bases_past_span = (r#""from_end":30,"#, r#""from_end":65,"#);
+        assert_eq!(load(&[]).unwrap(), 1);
 
-    #[test]
-    fn test_convert_variation_basic() {
-        let json = r#"{
-            "variation_name": "rs123",
-            "start": "100",
-            "allele_string": "A/G",
-            "strand": 1,
-            "failed": "",
-            "somatic": "",
-            "phenotype_or_disease": 0,
-            "end": "",
-            "AFR": "G:0.003",
-            "gnomADe": "G:0.0005"
-        }"#;
-        let jv: JsonVariation = serde_json::from_str(json).unwrap();
-        let cv = convert_variation(jv);
-        assert_eq!(cv.variation_name, "rs123");
-        assert_eq!(cv.start, 100);
-        assert_eq!(cv.allele_string, "A/G");
-        assert_eq!(cv.strand, 1);
-        assert_eq!(cv.failed, 0);
-        assert_eq!(cv.somatic, 0);
-        assert_eq!(cv.frequencies.get("AFR").unwrap(), "G:0.003");
-        assert_eq!(cv.frequencies.get("gnomADe").unwrap(), "G:0.0005");
-    }
+        let far_start = load(&[(
+            r#""cdna_coding_start":1,"#,
+            &format!(r#""cdna_coding_start":{},"#, u64::MAX),
+        )])
+        .unwrap_err();
+        assert_eq!(
+            CliError::from_run(&far_start),
+            format!(
+                "ERROR: [cache] transcript ENST1: the mapper's coding start {} and end 30 on a \
+                 cDNA of 30 bases leave a UTR longer than the transcript's 30-base span",
+                u64::MAX
+            )
+        );
+        let far_end = load(&[cdna_far_past_span]).unwrap_err();
+        assert_eq!(
+            CliError::from_run(&far_end),
+            "ERROR: [cache] transcript ENST1: the mapper's coding start 1 and end 30 on a cDNA \
+             of 4000000000 bases leave a UTR longer than the transcript's 30-base span"
+        );
 
-    #[test]
-    fn test_convert_variation_empty_optionals() {
-        let json = r#"{
-            "variation_name": "rs456",
-            "start": "200",
-            "allele_string": "C/T",
-            "strand": "",
-            "failed": "",
-            "somatic": "",
-            "phenotype_or_disease": "",
-            "end": "",
-            "clin_sig": "",
-            "pubmed": "",
-            "minor_allele": "",
-            "minor_allele_freq": ""
-        }"#;
-        let jv: JsonVariation = serde_json::from_str(json).unwrap();
-        let cv = convert_variation(jv);
-        assert_eq!(cv.strand, 1); // default for empty
-        assert!(cv.clin_sig.is_none());
-        assert!(cv.pubmed.is_none());
-        assert!(cv.minor_allele.is_none());
-        assert!(cv.minor_allele_freq.is_none());
+        // A five-base RNA edit insertion lets the cDNA run five bases past the span.
+        assert!(load(&[cdna_five_bases_past_span]).is_err());
+        let inserting_edit = (
+            r#""stable_id":"ENST1","#,
+            r#""stable_id":"ENST1","attributes":[{"code":"_rna_edit","value":"5 4 AAAAA"}],"#,
+        );
+        assert_eq!(
+            load(&[cdna_five_bases_past_span, inserting_edit]).unwrap(),
+            1
+        );
+        // An edit replacing cDNA 0 through `u64::MAX` with one base inserts
+        // nothing: the transcript loads with its cDNA inside the span and is
+        // refused, not abandoned, with the cDNA five bases past it.
+        let whole_range = format!(
+            r#""stable_id":"ENST1","attributes":[{{"code":"_rna_edit","value":"0 {} A"}}],"#,
+            u64::MAX
+        );
+        let whole_range_edit = (r#""stable_id":"ENST1","#, whole_range.as_str());
+        assert_eq!(load(&[whole_range_edit]).unwrap(), 1);
+        assert!(load(&[cdna_five_bases_past_span, whole_range_edit]).is_err());
+
+        // The mapper the far-end case refused loads on a transcript without a
+        // coding sequence: no padding is built for it, so the bound does not apply.
+        let non_coding = (
+            r#""translateable_seq":"ATGGCTGCTGCTGCTGCTGCTGCTGCTTGA","#,
+            r#""translateable_seq":"","#,
+        );
+        assert_eq!(load(&[cdna_far_past_span, non_coding]).unwrap(), 1);
+
+        // A coding end before the coding start is refused on a coding
+        // transcript, where the coding span's length is sized from the pair,
+        // and loads on a transcript without a coding sequence.
+        let inverted = (r#""cdna_coding_end":30,"#, r#""cdna_coding_end":0,"#);
+        let inverted_pair = load(&[inverted]).unwrap_err();
+        assert_eq!(
+            CliError::from_run(&inverted_pair),
+            "ERROR: [cache] transcript ENST1: the mapper's coding end 0 precedes its coding \
+             start 1"
+        );
+        assert_eq!(load(&[inverted, non_coding]).unwrap(), 1);
     }
 
     /// The numeric helpers accept a JSON number, a float, a string holding a
@@ -1856,7 +1833,7 @@ mod tests {
     /// written over them; a cache written without the key loads with none and keeps
     /// the cached-translation reading of the reference peptide.
     #[test]
-    fn loaded_transcript_carries_its_seq_edits_and_tolerates_their_absence() {
+    fn seq_edits_loaded() {
         let with_edits = r#"{"stable_id":"ENST1","gene_stable_id":"ENSG1","start":100,"end":300,
             "strand":1,"biotype":"protein_coding","source":"ensembl",
             "exons":[{"start":100,"end":300}],
@@ -1884,6 +1861,277 @@ mod tests {
             .is_empty());
     }
 
+    /// A one-exon coding transcript on chromosome 21 at 1000-1029, ten codons
+    /// `ATG GCT x8 TGA`, in the JSON the cache converter writes, with
+    /// `translation_extra` spliced into its translation object.
+    fn coding_transcript_json(translation_extra: &str) -> String {
+        format!(
+            r#"{{"stable_id":"ENST1","gene_stable_id":"ENSG1","chr":"21","start":1000,"end":1029,
+            "strand":1,"biotype":"protein_coding","source":"ensembl","is_canonical":1,
+            "exons":[{{"start":1000,"end":1029,"rank":1,"phase":0,"end_phase":0}}],
+            "translation":{{"stable_id":"ENSP1","start":1,"end":30{translation_extra}}},
+            "variation_effect_feature_cache":{{"codon_table":1,
+              "translateable_seq":"ATGGCTGCTGCTGCTGCTGCTGCTGCTTGA","peptide":"MAAAAAAAA",
+              "mapper":{{"start_phase":0,"cdna_coding_start":1,"cdna_coding_end":30,
+                "pairs":[{{"from_start":1,"from_end":30,"to_start":1000,"to_end":1029,"ori":1}}]}}}}}}"#
+        )
+    }
+
+    /// The default-format rows for a missense SNV at 21:1004 against one
+    /// transcript, under `options`.
+    fn missense_rows_under(
+        transcript_json: &str,
+        variations: Option<Arc<VariationSource>>,
+        options: FieldOptions,
+    ) -> String {
+        let jt: JsonTranscript = serde_json::from_str(transcript_json).unwrap();
+        let mut raw = HashMap::new();
+        raw.insert("21".to_string(), vec![convert_transcript(jt, "21")]);
+        let transcripts = Arc::new(LazyTranscriptIndexes::from_loaded(raw, 5_000, 5_000));
+        crate::runner::default_rows_for_test(
+            "21\t1004\tsnv\tC\tA\t.\t.\t.",
+            transcripts,
+            variations,
+            options,
+        )
+    }
+
+    /// The default-format rows for a missense SNV at 21:1004 against one transcript.
+    fn missense_rows(transcript_json: &str, variations: Option<Arc<VariationSource>>) -> String {
+        let options = FieldOptions {
+            check_existing: variations.is_some(),
+            ..Default::default()
+        };
+        missense_rows_under(transcript_json, variations, options)
+    }
+
+    /// The fixed columns of a variation record on the region layout, which has
+    /// no chromosome column.
+    const REGION_COLUMNS: &str = "variation_name,failed,somatic,start,end,allele_string,strand,clin_sig,phenotype_or_disease,clin_sig_allele,clin_sig_ref_allele,clinical_impact,pubmed,var_synonyms";
+
+    /// The metadata of a region-layout cache whose records carry the fixed
+    /// columns then `extra_columns`.
+    fn region_cache_info(extra_columns: &[&str]) -> CacheInfo {
+        CacheInfo {
+            variation_cols: REGION_COLUMNS
+                .split(',')
+                .chain(extra_columns.iter().copied())
+                .map(str::to_string)
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// Writes `line` as the one record of the gzip region file at `path`.
+    fn write_region_file(path: &Path, line: &str) {
+        let mut encoder = flate2::write::GzEncoder::new(
+            std::fs::File::create(path).unwrap(),
+            flate2::Compression::default(),
+        );
+        writeln!(encoder, "{line}").unwrap();
+        encoder.finish().unwrap();
+    }
+
+    /// A variation source over chromosome 21 whose one region file, in the
+    /// cache's own `<start>-<end>_var.gz` layout, holds `line`, a record under
+    /// the fixed columns then `extra_columns`. The directory must outlive the
+    /// source, which parses the file on first use.
+    fn region_source(
+        extra_columns: &[&str],
+        line: &str,
+    ) -> (tempfile::TempDir, Arc<VariationSource>) {
+        let dir = tempfile::tempdir().unwrap();
+        let region_dir = dir.path().join("variations").join("21");
+        std::fs::create_dir_all(&region_dir).unwrap();
+        write_region_file(&region_dir.join("1-1000000_var.gz"), line);
+        let source = VariationSource::open(
+            dir.path(),
+            &region_cache_info(extra_columns),
+            false,
+            Arc::new(CacheManifest::absent(dir.path())),
+        )
+        .unwrap()
+        .expect("a region file is a variation source");
+        (dir, Arc::new(source))
+    }
+
+    /// A variation source over chromosome 21 holding one record in the
+    /// cache's own `<start>-<end>_var.gz` layout: `extra_columns` extends the
+    /// fixed columns, `extra_fields` the record's cells in the same order. The
+    /// directory must outlive the source, which parses the file on first use.
+    fn variations_from(
+        extra_columns: &[&str],
+        extra_fields: &[&str],
+    ) -> (tempfile::TempDir, Arc<VariationSource>) {
+        let mut fields = vec![
+            "rs1", "0", "0", "1004", "", "C/A", "1", "", "0", "", "", "", "", "",
+        ];
+        fields.extend_from_slice(extra_fields);
+        region_source(extra_columns, &fields.join(" "))
+    }
+
+    /// The one record of such a source, as the reader parses it.
+    fn only_record(source: &VariationSource) -> CachedVariation {
+        let records = source.records_overlapping("21", 1004, 1004).unwrap();
+        assert_eq!(records.len(), 1);
+        records.into_iter().next().unwrap()
+    }
+
+    /// A variation record's `AA` and `EA` columns change nothing in the output
+    /// under `--check_existing`, the flag that reads a co-located record:
+    /// Ensembl VEP's `OutputFactory.pm` `%FREQUENCY_KEYS` has no AA or EA entry,
+    /// and no release-115 or later cache carries the columns.
+    #[test]
+    fn legacy_esp_columns_change_no_output() {
+        let (_without_dir, without) = variations_from(&["AFR"], &["A:0.01"]);
+        let (_with_dir, with) =
+            variations_from(&["AFR", "AA", "EA"], &["A:0.01", "A:0.2", "A:0.3"]);
+        assert_eq!(only_record(&with).frequencies["AA"], "A:0.2");
+        assert!(!only_record(&without).frequencies.contains_key("AA"));
+        let transcript = coding_transcript_json("");
+        let rows = missense_rows(&transcript, Some(with));
+        assert!(
+            rows.contains("missense_variant") && rows.contains("\trs1\t"),
+            "{rows}"
+        );
+        assert_eq!(rows, missense_rows(&transcript, Some(without)));
+    }
+
+    /// A region line whose `clin_sig_allele` and `clinical_impact` cells are empty
+    /// inside the line prints as Ensembl VEP 116.2 prints a region-layout cache
+    /// (`21 10602054 ATA A` against rs149363218):
+    /// `CLIN_SIG` is left out under the default `--clin_sig_allele 1`
+    /// (OutputFactory.pm:1097, 1121, 1125 on the defined `''`), `CLIN_SIG=benign`
+    /// prints under `--clin_sig_allele 0`, and `--clinvar_somatic_classification`
+    /// writes `CLINVAR_SOMATIC_CLASSIFICATION=` (:1093). A line ending after
+    /// `phenotype_or_disease` leaves both cells undefined, so `CLIN_SIG=benign`
+    /// prints under the default and the classification key is not written.
+    #[test]
+    fn region_line_empty_clinvar_cells_print_as_ensembl_vep_does() {
+        let rows_for = |line: &str, options: FieldOptions| {
+            let (_dir, source) = region_source(&["AFR"], line);
+            missense_rows_under(&coding_transcript_json(""), Some(source), options)
+        };
+        let defined_empty = "rs1 0 0 1004  C/A 1 benign 1      A:0.01";
+        let trailing = "rs1 0 0 1004  C/A 1 benign 1";
+        let default = FieldOptions {
+            check_existing: true,
+            ..Default::default()
+        };
+        let whole = FieldOptions {
+            clin_sig_allele: ClinSigAllele::WholeVariant,
+            ..default.clone()
+        };
+        let somatic = FieldOptions {
+            clinvar_somatic_classification: true,
+            ..default.clone()
+        };
+        let rows = rows_for(defined_empty, default.clone());
+        assert!(
+            rows.contains("\trs1\t") && !rows.contains("CLIN_SIG"),
+            "{rows}"
+        );
+        assert!(
+            rows_for(defined_empty, whole).contains("CLIN_SIG=benign"),
+            "the whole-variant term prints"
+        );
+        let rows = rows_for(defined_empty, somatic.clone());
+        assert!(
+            rows.contains(";CLINVAR_SOMATIC_CLASSIFICATION=;PHENO=1"),
+            "the key is written with an empty value: {rows}"
+        );
+        assert!(rows_for(trailing, default).contains("CLIN_SIG=benign"));
+        assert!(!rows_for(trailing, somatic).contains("CLINVAR_SOMATIC_CLASSIFICATION"));
+    }
+
+    /// A variation record's `minor_allele` and `minor_allele_freq` columns, which
+    /// a pre-108 cache declares and no release-115 or later cache carries, print
+    /// in no text column under `--check_existing` (`get_frequency_data` reads
+    /// them for `--freq_pop 1KG_ALL` alone, BaseCacheVariation.pm:216-228) and
+    /// are echoed in every JSON `colocated_variants` object under their own
+    /// names, as `add_colocated_variant_info_JSON` copies the record's hash
+    /// (OutputFactory/JSON.pm:415, :473): Ensembl VEP 116.2 writes both keys in
+    /// every object on such a cache. The reader keeps the columns as it keeps
+    /// every column outside the fixed set.
+    #[test]
+    fn minor_allele_columns_print_in_json_alone() {
+        let (_without_dir, without) = variations_from(&[], &[]);
+        let (_with_dir, with) =
+            variations_from(&["minor_allele", "minor_allele_freq"], &["A", "0.12"]);
+        assert_eq!(only_record(&with).frequencies["minor_allele"], "A");
+        assert!(!only_record(&without)
+            .frequencies
+            .contains_key("minor_allele"));
+        let transcript = coding_transcript_json("");
+        let rows = missense_rows(&transcript, Some(Arc::clone(&with)));
+        assert!(rows.contains("\trs1\t"), "{rows}");
+        assert_eq!(rows, missense_rows(&transcript, Some(Arc::clone(&without))));
+
+        let colocated = |source: &VariationSource| -> serde_json::Value {
+            let mut variant =
+                crate::vcf_parser::parse_vcf_line("21\t1004\tsnv\tC\tA\t.\t.\t.", true)
+                    .expect("parse test VCF line")
+                    .remove(0);
+            crate::variation_matcher::annotate_colocated(
+                &mut variant,
+                source,
+                &crate::variation_matcher::ColocationRules::default(),
+                &crate::variation_source::ReadFailure::default(),
+            );
+            let options = FieldOptions {
+                check_existing: true,
+                ..Default::default()
+            };
+            vep_io::output::json::JsonOutputFormatter::new(options, Vec::new(), None)
+                .format_variant_value(&variant)["colocated_variants"][0]
+                .clone()
+        };
+        let echoed = colocated(&with);
+        assert_eq!(echoed["id"], "rs1");
+        assert_eq!(echoed["minor_allele"], "A");
+        assert_eq!(echoed["minor_allele_freq"], 0.12);
+        let plain = colocated(&without);
+        assert_eq!(plain["id"], "rs1");
+        assert!(plain.get("minor_allele").is_none());
+        assert!(plain.get("minor_allele_freq").is_none());
+    }
+
+    /// A transcript's `source` names the set it came from; Ensembl VEP reads it
+    /// only to resolve two transcripts sharing a stable ID under `--refseq` or
+    /// `--merged` to the `ensembl` one (`AnnotationType/Transcript.pm:313-339` at
+    /// release/116.2), and the SOURCE column prints the separate `_source_cache`
+    /// key (`OutputFactory.pm:1583` at release/116.2), so at the default flags two
+    /// caches differing only there annotate alike.
+    #[test]
+    fn transcript_source_changes_no_output() {
+        let ensembl = coding_transcript_json("");
+        let refseq = ensembl.replace(r#""source":"ensembl""#, r#""source":"RefSeq""#);
+        assert_ne!(ensembl, refseq);
+        let rows = missense_rows(&ensembl, None);
+        assert!(rows.contains("missense_variant"), "{rows}");
+        assert_eq!(rows, missense_rows(&refseq, None));
+    }
+
+    /// The translation object's `start_exon` and `end_exon` objects and its
+    /// exon-relative offsets (the `Bio::EnsEMBL::Translation` fields the Storable
+    /// cache keeps, `Pipeline/DumpVEP/Dumper/Core.pm:226-235` at release/116.2
+    /// stripping only the translation's attributes, protein features, dates,
+    /// cross-references and adaptor) are not read: the coding region comes from
+    /// the exon coordinate mapper, so a cache with or without them annotates alike.
+    #[test]
+    fn translation_exon_fields_change_no_output() {
+        let plain = coding_transcript_json("");
+        let with_exons = coding_transcript_json(
+            r#","start_exon":{"start":1000,"end":1029,"stable_id":"ENSE1"},"end_exon":{"start":1000,"end":1029,"stable_id":"ENSE1"}"#,
+        );
+        let shifted = plain.replace(r#""start":1,"end":30"#, r#""start":7,"end":12"#);
+        assert_ne!(plain, shifted);
+        let rows = missense_rows(&plain, None);
+        assert!(rows.contains("missense_variant"), "{rows}");
+        assert_eq!(rows, missense_rows(&with_exons, None));
+        assert_eq!(rows, missense_rows(&shifted, None));
+    }
+
     #[test]
     fn test_derive_flags_from_attributes() {
         let attrs = vec![
@@ -1907,18 +2155,566 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_derive_gencode_primary_from_attributes() {
-        let attrs = vec![Attribute {
-            code: "gencode_basic".into(),
-            value: "1".into(),
-        }];
-        assert!(derive_gencode_primary(&attrs));
+    /// A transcript parsed from one JSON object, filed under chromosome `21`.
+    fn transcript_from(json: &str) -> Transcript {
+        let jt: JsonTranscript = serde_json::from_str(json).unwrap_or_else(|e| panic!("{e}"));
+        convert_transcript(jt, "21")
+    }
 
-        let attrs_false = vec![Attribute {
-            code: "gencode_primary".into(),
-            value: "0".into(),
-        }];
-        assert!(!derive_gencode_primary(&attrs_false));
+    /// The smallest transcript object the loader accepts, with `extra` JSON
+    /// members spliced in after `source`.
+    fn minimal(extra: &str) -> String {
+        format!(
+            r#"{{"stable_id":"ENST00000400375","gene_stable_id":"ENSG00000215455","start":44538981,"end":44540195,"strand":-1,"biotype":"protein_coding","source":"havana"{extra}}}"#
+        )
+    }
+
+    /// One `attributes` member from `(code, value)` pairs, each as the cache
+    /// writes it (with the `name` the loader ignores).
+    fn attributes(pairs: &[(&str, &str)]) -> String {
+        let items: Vec<String> = pairs
+            .iter()
+            .map(|(code, value)| {
+                format!(r#"{{"code":"{code}","name":"{code} name","value":"{value}"}}"#)
+            })
+            .collect();
+        format!(r#","attributes":[{}]"#, items.join(","))
+    }
+
+    /// A cache directory holding one chromosome directory per `(chr, body)`
+    /// pair, each with one shard of that body.
+    fn cache_with_shards(prefix: &str, shards: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::Builder::new().prefix(prefix).tempdir().unwrap();
+        for (chr, body) in shards {
+            let chr_dir = dir.path().join("transcripts").join(chr);
+            std::fs::create_dir_all(&chr_dir).unwrap();
+            std::fs::write(chr_dir.join("1-1000000.json"), body).unwrap();
+        }
+        dir
+    }
+
+    /// `TSL` follows VEP's `m/tsl(\d+)/` with `$hash->{TSL} = $1 if $1`
+    /// (OutputFactory.pm `BaseTranscriptVariationAllele_to_output_hash`, the
+    /// same rule the pick order reads): `tsl1 (assigned to previous version 8)`
+    /// is 1, `tslNA` with or without a suffix is none, and a zero is none.
+    #[test]
+    fn tsl_leading_digits_with_assigned_suffix() {
+        let tsl = |value: &str| transcript_from(&minimal(&attributes(&[("TSL", value)]))).tsl;
+        assert_eq!(tsl("tsl1 (assigned to previous version 8)"), Some(1));
+        assert_eq!(tsl("tsl5"), Some(5));
+        assert_eq!(tsl("tsl3 (assigned to previous version 2)"), Some(3));
+        assert_eq!(tsl("tslNA"), None);
+        assert_eq!(tsl("tslNA (assigned to previous version 4)"), None);
+        assert_eq!(tsl("tsl0"), None);
+        // The first digit-bearing match is the only one read, as the regex's is.
+        assert_eq!(tsl("tsl0 (assigned to previous version tsl3)"), None);
+        assert_eq!(tsl("tslNA then tsl4"), Some(4));
+        assert_eq!(tsl_from_attribute_value("tsl2"), Some(2));
+        assert_eq!(tsl_from_attribute_value(""), None);
+
+        // A cache writing the level as a top-level number is read as such.
+        assert_eq!(transcript_from(&minimal(r#","tsl":2"#)).tsl, Some(2));
+        assert_eq!(transcript_from(&minimal("")).tsl, None);
+    }
+
+    /// `appris` is the attribute's value as the cache spells it: VEP rewrites
+    /// `principal` to `P` and `alternative` to `A` only when it prints the
+    /// column, and its pick order reads the spelled value's letter and digit.
+    #[test]
+    fn appris_derived_from_attribute() {
+        let appris =
+            |value: &str| transcript_from(&minimal(&attributes(&[("appris", value)]))).appris;
+        assert_eq!(appris("principal1").as_deref(), Some("principal1"));
+        assert_eq!(appris("alternative2").as_deref(), Some("alternative2"));
+        assert_eq!(appris("principalM").as_deref(), Some("principalM"));
+        assert_eq!(transcript_from(&minimal("")).appris, None);
+        // A top-level key is read before the attribute.
+        let both = minimal(&format!(
+            r#","appris":"principal3"{}"#,
+            attributes(&[("appris", "alternative1")])
+        ));
+        assert_eq!(transcript_from(&both).appris.as_deref(), Some("principal3"));
+    }
+
+    /// The `MANE_Select` attribute's value, VEP's `MANE_SELECT` column, is a
+    /// RefSeq accession; the field is `Some` on the attribute's presence,
+    /// which is what lists `MANE_Select` under `MANE`.
+    #[test]
+    fn mane_select_derived_from_attribute() {
+        let tx = transcript_from(&minimal(&attributes(&[("MANE_Select", "NM_198691.3")])));
+        assert_eq!(tx.mane_select.as_deref(), Some("NM_198691.3"));
+        assert_eq!(tx.mane_plus_clinical, None);
+        assert_eq!(transcript_from(&minimal("")).mane_select, None);
+        let empty = transcript_from(&minimal(&attributes(&[("MANE_Select", "")])));
+        assert_eq!(empty.mane_select.as_deref(), Some(""));
+    }
+
+    /// `MANE_Plus_Clinical` is read beside `MANE_Select` from its own attribute
+    /// (OutputFactory.pm lists `MANE_Plus_Clinical` under `MANE` on its presence
+    /// and prints the value as `MANE_PLUS_CLINICAL`); a transcript may carry
+    /// both.
+    #[test]
+    fn mane_plus_clinical_derived_from_attribute() {
+        let tx = transcript_from(&minimal(&attributes(&[
+            ("MANE_Plus_Clinical", "NM_001005484.2"),
+            ("MANE_Select", "NM_001005484.3"),
+        ])));
+        assert_eq!(tx.mane_plus_clinical.as_deref(), Some("NM_001005484.2"));
+        assert_eq!(tx.mane_select.as_deref(), Some("NM_001005484.3"));
+        let select_only = transcript_from(&minimal(&attributes(&[("MANE_Select", "NM_1.1")])));
+        assert_eq!(select_only.mane_plus_clinical, None);
+        // The first attribute of a code is the one read, as VEP's grep takes it.
+        let twice = transcript_from(&minimal(&attributes(&[
+            ("MANE_Plus_Clinical", "NM_2.1"),
+            ("MANE_Plus_Clinical", "NM_3.1"),
+        ])));
+        assert_eq!(twice.mane_plus_clinical.as_deref(), Some("NM_2.1"));
+    }
+
+    /// GENCODE set membership is the presence of the `gencode_basic` and
+    /// `gencode_primary` attributes, whose dumped values are the labels
+    /// `GENCODE basic` and `GENCODE primary` (AnnotationType/Transcript.pm
+    /// `filter_transcript` greps the codes alone); one set does not imply the
+    /// other.
+    #[test]
+    fn gencode_basic_and_primary_by_presence() {
+        let both = transcript_from(&minimal(&attributes(&[
+            ("gencode_basic", "GENCODE basic"),
+            ("gencode_primary", "GENCODE primary"),
+        ])));
+        assert!(both.gencode_basic && both.gencode_primary);
+        let basic = transcript_from(&minimal(&attributes(&[("gencode_basic", "GENCODE basic")])));
+        assert!(basic.gencode_basic && !basic.gencode_primary);
+        let numeric = transcript_from(&minimal(&attributes(&[("gencode_primary", "1")])));
+        assert!(!numeric.gencode_basic && numeric.gencode_primary);
+        let neither = transcript_from(&minimal(&attributes(&[("TSL", "tsl1")])));
+        assert!(!neither.gencode_basic && !neither.gencode_primary);
+    }
+
+    /// Every chromosome directory under `transcripts/` is a chromosome of the
+    /// cache, patches, alternate loci, scaffolds and `LRG_` regions included, in
+    /// the sorted order of VEP's `valid_chromosomes` (CacheDir.pm reads the
+    /// cache directory's subdirectory names); each transcript is stamped with its
+    /// directory's name.
+    #[test]
+    fn alt_contig_directory_loads() {
+        let tx = |id: &str| {
+            format!(
+                r#"[{{"stable_id":"{id}","gene_stable_id":"ENSG_{id}","start":100,"end":900,"strand":1,"biotype":"protein_coding","source":"ensembl"}}]"#
+            )
+        };
+        let dir = cache_with_shards(
+            "vep_jc_alt_",
+            &[
+                ("HG1012_PATCH", &tx("ENST_PATCH")),
+                ("21", &tx("ENST_21")),
+                ("GL000008.2", &tx("ENST_GL")),
+                ("LRG_1", &tx("ENST_LRG")),
+                ("KI270728.1", &tx("ENST_KI")),
+            ],
+        );
+        let shards = enumerate_transcript_shards(dir.path().to_str().unwrap()).unwrap();
+        let mut chromosomes: Vec<&String> = shards.keys().collect();
+        chromosomes.sort();
+        assert_eq!(
+            chromosomes,
+            ["21", "GL000008.2", "HG1012_PATCH", "KI270728.1", "LRG_1"]
+        );
+        for (chr, id) in [("HG1012_PATCH", "ENST_PATCH"), ("LRG_1", "ENST_LRG")] {
+            let txs = load_transcripts_for_chr(chr, &shards[chr], &unchecked()).unwrap();
+            assert_eq!(txs.len(), 1);
+            assert_eq!(&*txs[0].stable_id, id);
+            assert_eq!(txs[0].chr, chr);
+        }
+    }
+
+    /// The key set is Ensembl VEP's `valid_chromosomes`, every subdirectory
+    /// not starting with a dot (CacheDir.pm:431): a chromosome directory with
+    /// no shard is a chromosome of the cache holding no transcript, and a
+    /// dot-prefixed directory is none, shard or not.
+    #[test]
+    fn empty_chromosome_directory_is_a_key_and_a_dot_directory_none() {
+        let dir = cache_with_shards("vep_jc_valid_", &[("21", "[]")]);
+        let transcripts = dir.path().join("transcripts");
+        std::fs::create_dir(transcripts.join("GL000008.2")).unwrap();
+        std::fs::create_dir(transcripts.join(".hidden")).unwrap();
+        std::fs::write(transcripts.join(".hidden").join("1-1000000.json"), "[]").unwrap();
+        let root = dir.path().to_str().unwrap();
+        let shards = enumerate_transcript_shards(root).unwrap();
+        let mut chromosomes: Vec<&String> = shards.keys().collect();
+        chromosomes.sort();
+        assert_eq!(chromosomes, ["21", "GL000008.2"]);
+        assert!(shards["GL000008.2"].is_empty());
+        let indexes = LazyTranscriptIndexes::new(root, 5_000, 5_000).unwrap();
+        indexes.prewarm("GL000008.2").unwrap();
+        assert!(indexes.contains_key("GL000008.2"));
+        assert!(indexes.get("GL000008.2").unwrap().is_empty());
+        assert!(!indexes.contains_key(".hidden"));
+    }
+
+    /// The whole-cache refusal counts shards, not chromosome directories: a
+    /// cache whose only shard sits in a dot-prefixed directory holds none. The
+    /// refusal is this engine's own: Ensembl VEP lists every non-dot directory as
+    /// a valid chromosome whatever it holds (`CacheDir.pm:431`), reads a region's
+    /// file only `if -e $file` (`BaseSerialized.pm:263`) and runs such a cache
+    /// to the end, every record `intergenic_variant`, exit 0, as
+    /// `docs/divergences/damaged-cache-shard.md` states.
+    #[test]
+    fn cache_with_shards_only_in_a_dot_directory_is_refused() {
+        let dir = tempfile::Builder::new()
+            .prefix("vep_jc_dotonly_")
+            .tempdir()
+            .unwrap();
+        let transcripts = dir.path().join("transcripts");
+        std::fs::create_dir_all(transcripts.join("21")).unwrap();
+        std::fs::create_dir_all(transcripts.join(".hidden")).unwrap();
+        std::fs::write(transcripts.join(".hidden").join("1-1000000.json"), "[]").unwrap();
+        let err = enumerate_transcript_shards(dir.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            CliError::from_run(&err).starts_with("ERROR: [cache] no transcript shards under"),
+            "{err}"
+        );
+    }
+
+    /// `is_canonical` is the dumped flag (Database/Transcript.pm sets it to 1
+    /// on the gene's canonical transcript and leaves it undefined otherwise),
+    /// read as an integer or a boolean.
+    #[test]
+    fn is_canonical_from_int_or_bool() {
+        assert!(transcript_from(&minimal(r#","is_canonical":1"#)).canonical);
+        assert!(transcript_from(&minimal(r#","is_canonical":true"#)).canonical);
+        assert!(!transcript_from(&minimal(r#","is_canonical":0"#)).canonical);
+        assert!(!transcript_from(&minimal(r#","is_canonical":false"#)).canonical);
+        assert!(!transcript_from(&minimal("")).canonical);
+    }
+
+    /// The gene identifiers VEP prefetches under `_gene_symbol`,
+    /// `_gene_symbol_source` and `_gene_hgnc_id` arrive under the converter's
+    /// unprefixed names; a transcript of an unnamed gene carries none.
+    #[test]
+    fn gene_symbol_loaded_from_renamed_key() {
+        let tx = transcript_from(&minimal(
+            r#","gene_symbol":"KRTAP10-1","gene_symbol_source":"HGNC","gene_hgnc_id":"HGNC:22966""#,
+        ));
+        assert_eq!(tx.gene_symbol.as_deref(), Some("KRTAP10-1"));
+        assert_eq!(tx.gene_symbol_source.as_deref(), Some("HGNC"));
+        assert_eq!(tx.hgnc_id.as_deref(), Some("HGNC:22966"));
+        let unnamed = transcript_from(&minimal(""));
+        assert!(unnamed.gene_symbol.is_none() && unnamed.gene_symbol_source.is_none());
+        assert!(unnamed.hgnc_id.is_none());
+    }
+
+    /// `gene_stable_id` (VEP's `_gene_stable_id`) is required: a shard whose
+    /// transcript lacks it fails to parse, and the loaded transcript carries
+    /// it; the gene's `_gene` object is not in the cache and nothing reads it.
+    #[test]
+    fn gene_stable_id_required() {
+        assert_eq!(
+            &*transcript_from(&minimal("")).gene_stable_id,
+            "ENSG00000215455"
+        );
+        let without = r#"{"stable_id":"ENST1","start":1,"end":9,"strand":1,"biotype":"lncRNA","source":"ensembl"}"#;
+        let err = serde_json::from_str::<JsonTranscript>(without)
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("gene_stable_id"), "{err}");
+    }
+
+    /// `biotype` is required and read verbatim.
+    #[test]
+    fn biotype_required() {
+        assert_eq!(&*transcript_from(&minimal("")).biotype, "protein_coding");
+        let without = r#"{"stable_id":"ENST1","gene_stable_id":"ENSG1","start":1,"end":9,"strand":1,"source":"ensembl"}"#;
+        let err = serde_json::from_str::<JsonTranscript>(without)
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("biotype"), "{err}");
+    }
+
+    /// A Storable-derived transcript carries no chromosome of its own (the
+    /// dumper keeps the slice, the converter drops it), so the shard directory
+    /// names it; a `chr` key is kept when present. Coordinates are read from
+    /// numbers or strings, and a negative strand is the reverse strand.
+    #[test]
+    fn chr_falls_back_to_shard_directory() {
+        let tx = transcript_from(&minimal(""));
+        assert_eq!(tx.chr, "21");
+        assert_eq!((tx.start, tx.end), (44538981, 44540195));
+        assert_eq!(tx.strand, Strand::Reverse);
+        let named = transcript_from(
+            r#"{"stable_id":"ENST1","gene_stable_id":"ENSG1","chr":"X","start":"100","end":"900","strand":"1","biotype":"lncRNA","source":"ensembl"}"#,
+        );
+        assert_eq!(named.chr, "X");
+        assert_eq!((named.start, named.end), (100, 900));
+        assert_eq!(named.strand, Strand::Forward);
+    }
+
+    /// The transcript `version` arrives as a number or a string holding one.
+    #[test]
+    fn version_from_number_or_string() {
+        assert_eq!(
+            transcript_from(&minimal(r#","version":3"#)).version,
+            Some(3)
+        );
+        assert_eq!(
+            transcript_from(&minimal(r#","version":"3""#)).version,
+            Some(3)
+        );
+        assert_eq!(transcript_from(&minimal("")).version, None);
+        assert_eq!(transcript_from(&minimal(r#","version":"""#)).version, None);
+    }
+
+    /// `gene_version` (VEP's `_gene_version`, the `.version` suffix of the Gene
+    /// column under `--gene_version`) arrives as a number or a string.
+    #[test]
+    fn gene_version_loaded() {
+        assert_eq!(
+            transcript_from(&minimal(r#","gene_version":4"#)).gene_version,
+            Some(4)
+        );
+        assert_eq!(
+            transcript_from(&minimal(r#","gene_version":"12""#)).gene_version,
+            Some(12)
+        );
+        assert_eq!(transcript_from(&minimal("")).gene_version, None);
+    }
+
+    /// `uniprot_isoform` (VEP's `_uniprot_isoform`) is read as the cache writes
+    /// it, the `-` VEP stores for a translation without one included; the
+    /// column suppresses the sentinel.
+    #[test]
+    fn uniprot_isoform_loaded() {
+        assert_eq!(
+            transcript_from(&minimal(r#","uniprot_isoform":"P60331-2""#))
+                .uniprot_isoform
+                .as_deref(),
+            Some("P60331-2")
+        );
+        assert_eq!(
+            transcript_from(&minimal(r#","uniprot_isoform":"-""#))
+                .uniprot_isoform
+                .as_deref(),
+            Some("-")
+        );
+        assert_eq!(transcript_from(&minimal("")).uniprot_isoform, None);
+    }
+
+    /// The VEFC intron list (VEP's `get_all_Introns`) is the transcript's intron
+    /// list when present, even where it disagrees with the gaps between exons;
+    /// without one the gaps are derived.
+    #[test]
+    fn vefc_introns_preferred_over_derived() {
+        let exons = r#","exons":[{"start":100,"end":200},{"start":301,"end":400}]"#;
+        let with_vefc = transcript_from(&minimal(&format!(
+            r#"{exons},"variation_effect_feature_cache":{{"introns":[{{"start":"201","end":"299"}}]}}"#
+        )));
+        let introns: Vec<(u64, u64)> = with_vefc.introns.iter().map(|i| (i.start, i.end)).collect();
+        assert_eq!(introns, vec![(201, 299)]);
+        assert_eq!(with_vefc.vefc.unwrap().introns.len(), 1);
+
+        let derived = transcript_from(&minimal(exons));
+        let introns: Vec<(u64, u64)> = derived.introns.iter().map(|i| (i.start, i.end)).collect();
+        assert_eq!(introns, vec![(201, 300)]);
+    }
+
+    /// `peptide` (the translation's sequence with its edits applied) loads on a
+    /// translated transcript and is absent on one without a translation.
+    #[test]
+    fn peptide_loaded_when_translated() {
+        let coding = transcript_from(&minimal(
+            r#","translation":{"stable_id":"ENSP00000383226","start":46,"end":894},"variation_effect_feature_cache":{"peptide":"MAASTMSVC","translateable_seq":"ATGGCCGCG"}"#,
+        ));
+        assert_eq!(coding.vefc.unwrap().peptide.as_deref(), Some("MAASTMSVC"));
+        let non_coding = transcript_from(&minimal(
+            r#","variation_effect_feature_cache":{"translateable_seq":""}"#,
+        ));
+        assert_eq!(non_coding.vefc.unwrap().peptide, None);
+    }
+
+    /// The runtime-only keys VEP's `BaseTranscriptVariation` writes into a live
+    /// transcript's cache, and any key the loader has no use for, are ignored
+    /// rather than refused.
+    #[test]
+    fn unknown_vefc_keys_ignored() {
+        let tx = transcript_from(&minimal(
+            r#","description":"keratin associated protein 10-1","variation_effect_feature_cache":{"_exon_interval_tree":{},"_intron_numbers":"1-2","_has_frameshift_intron":0,"translation_md5":"4fb6e2a4930c8b5aa1ac86f88fbc545b","spliced_seq":"ATG","codon_table":"2","bam":{}}"#,
+        ));
+        assert_eq!(tx.vefc.unwrap().codon_table, 2);
+    }
+
+    /// Ensembl VEP's cache dumper deletes a transcript's `description` when it
+    /// is defined, one of the keys it drops with `display_xref`, `external_name`
+    /// and `status` (`Pipeline/DumpVEP/Dumper/Core.pm:155-173`), so no cache
+    /// carries a value under the key: a record that does loads with the key
+    /// ignored and the transcript carries no such field.
+    #[test]
+    fn description_key_is_ignored() {
+        let tx = transcript_from(&minimal(
+            r#","description":"keratin associated protein 10-1 [Source:HGNC Symbol;Acc:HGNC:22966]""#,
+        ));
+        assert_eq!(&*tx.stable_id, "ENST00000400375");
+        let fields = serde_json::to_value(&tx).unwrap();
+        assert!(fields.get("description").is_none(), "{fields}");
+    }
+
+    /// A protein feature's `analysis` is its display label: a string, or the
+    /// dumped `Bio::EnsEMBL::Analysis` object reduced to `_display_label`
+    /// (Database/Transcript.pm keeps that key alone); an object without a label
+    /// yields none.
+    #[test]
+    fn protein_feature_label_from_display_label() {
+        let tx = transcript_from(&minimal(
+            r#","variation_effect_feature_cache":{"protein_features":[
+                {"start":"1","end":"282","hseqname":"AF-P60331-F1","analysis":"AFDB-ENSP mappings"},
+                {"start":22,"end":282,"hseqname":"PF00080","analysis":{"_display_label":"Pfam"}},
+                {"start":5,"end":9,"hseqname":"PTHR24416","analysis":{"display_label":"PANTHER"}},
+                {"start":5,"end":9,"hseqname":"orphan","analysis":{}},
+                {"start":5,"end":9,"hseqname":"blank","analysis":""}]}"#,
+        ));
+        let labels: Vec<Option<&str>> = tx
+            .vefc
+            .as_ref()
+            .unwrap()
+            .protein_features
+            .iter()
+            .map(|pf| pf.analysis.as_deref())
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                Some("AFDB-ENSP mappings"),
+                Some("Pfam"),
+                Some("PANTHER"),
+                None,
+                None
+            ]
+        );
+    }
+
+    /// A prediction matrix arrives as base64 of the Storable `matrix` blob: a
+    /// gzip stream over `VEP` and 20 little-endian 16-bit cells per residue,
+    /// each the category in its top two bits over the score times 1000
+    /// (ProteinFunctionPredictionMatrix.pm `pack 'v'`); a cell of all ones is
+    /// no prediction, and a tool's empty object is no matrix.
+    #[test]
+    fn storable_matrix_decodes() {
+        use base64::Engine;
+        use std::io::Write as _;
+        use vep_core::prediction::AnalysisType;
+
+        let mut raw = b"VEP".to_vec();
+        raw.extend(std::iter::repeat_n(0xFFu8, 2 * 20 * 40));
+        // Residue 2, amino acid C (column 1): SIFT category 1 (deleterious),
+        // score 0.01.
+        let cell = ((1u16) << 14 | 10).to_le_bytes();
+        let offset = 3 + (20 + 1) * 2;
+        raw[offset..offset + 2].copy_from_slice(&cell);
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&raw).unwrap();
+        let blob = base64::engine::general_purpose::STANDARD.encode(gz.finish().unwrap());
+
+        let tx = transcript_from(&minimal(&format!(
+            r#","variation_effect_feature_cache":{{"protein_function_predictions":{{"sift":{{"analysis":"sift","translation_md5":"4fb6e2a4930c8b5aa1ac86f88fbc545b","predictions_data":"{blob}"}},"polyphen_humvar":{{}},"polyphen_humdiv":{{}}}}}}"#
+        )));
+        let predictions = tx.vefc.unwrap().protein_function_predictions.unwrap();
+        let sift = predictions.sift.unwrap();
+        assert_eq!(sift.analysis, "sift");
+        assert_eq!(sift.peptide_length, 0);
+        let hit = sift.lookup(2, b'C', AnalysisType::Sift).unwrap();
+        assert_eq!((hit.label(), hit.score), ("deleterious", 0.01));
+        assert!(sift.lookup(1, b'A', AnalysisType::Sift).is_none());
+        assert!(predictions.polyphen_humvar.is_none());
+        assert!(predictions.polyphen_humdiv.is_none());
+    }
+
+    /// A chromosome directory reached through a symlink loads like a real one
+    /// in both walks: a skipped link would leave the transcript cache refused
+    /// as shard-less and the variations silently absent.
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_chromosome_directory_is_walked() {
+        let dir = tempfile::Builder::new()
+            .prefix("vep_jc_symlink_")
+            .tempdir()
+            .unwrap();
+        let real = dir.path().join("real_21");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("1-1000000.json"), b"[]").unwrap();
+        let transcripts = dir.path().join("transcripts");
+        std::fs::create_dir_all(&transcripts).unwrap();
+        std::os::unix::fs::symlink(&real, transcripts.join("21")).unwrap();
+        let shards = enumerate_transcript_shards(dir.path().to_str().unwrap()).unwrap();
+        assert_eq!(
+            shards["21"],
+            vec![transcripts.join("21").join("1-1000000.json")]
+        );
+        let real_variations = dir.path().join("real_v21");
+        std::fs::create_dir_all(&real_variations).unwrap();
+        write_region_file(
+            &real_variations.join("1-1000000_var.gz"),
+            "rs123 0 0 100  A/G 1  0",
+        );
+        let variations = dir.path().join("variations");
+        std::fs::create_dir_all(&variations).unwrap();
+        std::os::unix::fs::symlink(&real_variations, variations.join("21")).unwrap();
+        let source = VariationSource::open(
+            dir.path(),
+            &region_cache_info(&[]),
+            false,
+            Arc::new(CacheManifest::absent(dir.path())),
+        )
+        .unwrap()
+        .expect("the linked chromosome directory is a variation source");
+        let records = source.records_overlapping("21", 100, 100).unwrap();
+        assert_eq!(records[0].variation_name, "rs123");
+    }
+
+    /// A cache whose `transcripts` directory holds no shard is refused under
+    /// the error contract, naming the serialiser `info.json` declares: a Sereal
+    /// cache converts to no shard. A cache without an `info.json` is a Storable
+    /// one.
+    #[test]
+    fn sereal_cache_without_shards_is_refused() {
+        let dir = tempfile::Builder::new()
+            .prefix("vep_jc_sereal_")
+            .tempdir()
+            .unwrap();
+        let chr_dir = dir.path().join("transcripts").join("21");
+        std::fs::create_dir_all(&chr_dir).unwrap();
+        std::fs::write(chr_dir.join("1-1000000.sereal"), b"=srl").unwrap();
+        std::fs::write(
+            dir.path().join("info.json"),
+            r#"{"species":"homo_sapiens","assembly":"GRCh38","serialiser_type":"sereal"}"#,
+        )
+        .unwrap();
+        let root = dir.path().to_str().unwrap();
+        let err = enumerate_transcript_shards(root).unwrap_err();
+        assert_eq!(
+            CliError::from_run(&err),
+            format!(
+                "ERROR: [cache] no transcript shards under {}/transcripts (serialiser_type sereal)",
+                root
+            )
+        );
+
+        std::fs::remove_file(dir.path().join("info.json")).unwrap();
+        let err = enumerate_transcript_shards(root).unwrap_err();
+        assert!(
+            CliError::from_run(&err).ends_with("(serialiser_type storable)"),
+            "{err}"
+        );
+    }
+
+    /// The spliced cDNA of a coding transcript is assembled from the cached
+    /// UTRs and translateable sequence as the transcript is read.
+    #[test]
+    fn spliced_seq_assembled_for_coding_transcript() {
+        let tx = transcript_from(&minimal(
+            r#","translation":{"stable_id":"ENSP1","start":4,"end":12},"exons":[{"start":44538981,"end":44538995}],
+            "variation_effect_feature_cache":{"five_prime_utr":"GGA","translateable_seq":"ATGCCCTAA","three_prime_utr":"TTT",
+            "mapper":{"start_phase":-1,"cdna_coding_start":4,"cdna_coding_end":12,"pairs":[{"from_start":1,"from_end":15,"to_start":44538981,"to_end":44538995,"ori":-1}]}}"#,
+        ));
+        assert_eq!(tx.spliced_seq(), Some("GGAATGCCCTAATTT"));
+        assert_eq!(transcript_from(&minimal("")).spliced_seq(), None);
     }
 }

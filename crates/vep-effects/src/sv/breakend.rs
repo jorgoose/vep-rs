@@ -8,7 +8,7 @@
 //! mate breakpoint is on a different chromosome or distant position
 //! and is handled as a separate variant record.
 //!
-//! Consequence logic (mirrors Perl VEP `StructuralVariationOverlapAllele`):
+//! Consequence logic (mirrors Ensembl VEP `StructuralVariationOverlapAllele`):
 //!
 //! - **Within transcript body (exon, intron, or UTR)**: `feature_truncation`
 //!   when the allele's own breakend lies in the body (never for a single
@@ -23,9 +23,7 @@
 
 use super::is_mature_mirna_sv;
 use smallvec::SmallVec;
-use vep_core::consequence::{
-    Consequence, ConsequenceList, FeatureType, Impact, TranscriptConsequence,
-};
+use vep_core::consequence::{Consequence, ConsequenceList, Impact, TranscriptConsequence};
 use vep_core::coordinate::Strand;
 use vep_core::transcript::Transcript;
 use vep_core::variant::InputVariant;
@@ -42,12 +40,10 @@ pub fn calculate(
 ) -> Option<TranscriptConsequence> {
     let bp = variant.start;
     let is_native_single_breakend = variant.is_single_breakend && variant.mate_id.is_none();
+    let max_extend = upstream_distance.max(downstream_distance);
 
-    if bp
-        < transcript
-            .start
-            .saturating_sub(upstream_distance.max(downstream_distance))
-        || bp > transcript.end + upstream_distance.max(downstream_distance)
+    if bp < transcript.start.saturating_sub(max_extend)
+        || bp > transcript.end.saturating_add(max_extend)
     {
         return None;
     }
@@ -63,7 +59,7 @@ pub fn calculate(
 
     let overlaps_transcript = bp >= transcript.start && bp <= transcript.end;
 
-    // Perl VEP adds feature_truncation to an upstream/downstream BND whose mate
+    // Ensembl VEP adds feature_truncation to an upstream/downstream BND whose mate
     // falls inside the transcript body.
     let same_chr_mate = variant
         .mate_chr
@@ -75,16 +71,16 @@ pub fn calculate(
         .map(|mp| mp >= transcript.start && mp <= transcript.end)
         .unwrap_or(false);
 
-    // Perl VEP emits upstream/downstream for a paired allele outside the body only
+    // Ensembl VEP emits upstream/downstream for a paired allele outside the body only
     // when the mate is also within the extended region; otherwise only the
     // single-breakend form gets those consequences.
     let is_paired_bnd = !variant.is_single_breakend && variant.mate_chr.is_some();
-    let max_extend = upstream_distance.max(downstream_distance);
     let mate_near_transcript = variant
         .mate_pos
         .filter(|_| same_chr_mate)
         .map(|mp| {
-            mp >= transcript.start.saturating_sub(max_extend) && mp <= transcript.end + max_extend
+            mp >= transcript.start.saturating_sub(max_extend)
+                && mp <= transcript.end.saturating_add(max_extend)
         })
         .unwrap_or(false);
 
@@ -226,7 +222,7 @@ pub fn calculate(
                 if super::overlaps_polypyrimidine_tract(transcript, bp, bp) {
                     consequences.push(Consequence::SplicePolypyrimidineTractVariant);
                 }
-                if !is_coding && !transcript.is_nmd_transcript() {
+                if !is_coding && !transcript.facts().is_nmd {
                     consequences.push(Consequence::NonCodingTranscriptVariant);
                 }
             }
@@ -251,7 +247,7 @@ pub fn calculate(
     // from the breakend to the record's END when that lies past it.
     let local_end = variant.sv_end.unwrap_or(variant.end).max(bp);
     let local_within_transcript = bp <= transcript.end && local_end >= transcript.start;
-    if transcript.is_nmd_transcript()
+    if transcript.facts().is_nmd
         && local_within_transcript
         && !consequences.is_empty()
         && !consequences.contains(&Consequence::NmdTranscriptVariant)
@@ -276,54 +272,19 @@ pub fn calculate(
 
     consequences.sort_by_key(|c| c.rank());
 
-    Some(TranscriptConsequence {
-        transcript_id: transcript.stable_id.clone(),
-        feature_start: transcript.start,
-        feature_end: transcript.end,
-        gene_id: transcript.gene_stable_id.clone(),
-        gene_symbol: transcript.gene_symbol.clone(),
-        gene_symbol_source: transcript.gene_symbol_source.clone(),
-        hgnc_id: transcript.hgnc_id.clone(),
+    let mut tc = TranscriptConsequence {
         consequences,
         impact,
-        biotype: Some(transcript.biotype.clone()),
-        canonical: transcript.canonical,
         cdna_position,
         cds_position,
         protein_position,
-        amino_acids: None,
-        codons: None,
-        protein_id: if is_coding {
-            transcript.protein_id.clone()
-        } else {
-            None
-        },
         distance,
-        strand: match transcript.strand {
-            Strand::Forward => 1,
-            Strand::Reverse => -1,
-        },
-        exon: None,
-        intron: None,
-        hgvsc: None,
-        hgvsp: None,
-        hgvs_offset: None,
-        sift: None,
-        polyphen: None,
-        domains: vec![],
-        feature_type: FeatureType::Transcript,
-        flags: transcript.flags.clone(),
-        tsl: transcript.tsl,
-        mane_select: transcript.mane_select.clone(),
-        mane_plus_clinical: transcript.mane_plus_clinical.clone(),
-        appris: transcript.appris.clone(),
-        ccds: transcript.ccds.clone(),
-        swissprot: transcript.swissprot.clone(),
-        trembl: transcript.trembl.clone(),
-        refseq: transcript.refseq.clone(),
-        plugin_data: indexmap::IndexMap::new(),
-        loftee_ctx: None,
-    })
+        ..TranscriptConsequence::for_transcript(transcript)
+    };
+    if !is_coding {
+        tc.protein_id = None;
+    }
+    Some(tc)
 }
 
 /// The mate-side row of a paired breakend: `transcript` lies on the mate chromosome
@@ -495,6 +456,7 @@ mod tests {
     use super::*;
     use crate::consequences::EffectsConfig;
     use crate::test_helpers::make_test_transcript;
+    use vep_core::consequence::FeatureType;
     use vep_core::variant::VariantClass;
 
     /// Build a BND variant at a given position.
@@ -539,7 +501,7 @@ mod tests {
     #[test]
     fn test_bnd_upstream_paired_with_mate_inside_gets_truncation_and_upstream() {
         // Paired BND upstream of transcript, mate falls inside transcript body.
-        // Perl VEP: emits feature_truncation + upstream_gene_variant together.
+        // Ensembl VEP: emits feature_truncation + upstream_gene_variant together.
         let tx = make_test_transcript(); // 25_000_000 - 25_006_000
         let mut v = make_bnd(24_999_000); // 1000bp upstream
         v.mate_chr = Some("21".into());
@@ -552,7 +514,7 @@ mod tests {
         );
         assert!(
             tc.consequences.contains(&Consequence::UpstreamGeneVariant),
-            "Paired BND with mate inside should also get upstream_gene_variant (Perl VEP parity)"
+            "Paired BND with mate inside should also get upstream_gene_variant (Ensembl VEP parity)"
         );
         assert_eq!(tc.impact, Impact::HIGH);
         assert_eq!(tc.distance, Some(1000));
@@ -561,7 +523,7 @@ mod tests {
     #[test]
     fn test_bnd_upstream_paired_with_mate_outside_returns_none() {
         // Paired BND upstream of transcript, mate also outside → no consequences at all.
-        // Perl VEP: paired alleles outside the transcript body with no mate inside
+        // Ensembl VEP: paired alleles outside the transcript body with no mate inside
         // produce no transcript-level consequence.
         let tx = make_test_transcript();
         let mut v = make_bnd(24_999_000); // 1000bp upstream
@@ -659,7 +621,7 @@ mod tests {
         let tx = make_test_transcript();
         let v = make_bnd(25_001_000); // Middle of intron 1
         let tc = calculate(&v, &tx, 5000, 5000).unwrap();
-        // Perl VEP adds feature_truncation for all breakpoints within the
+        // Ensembl VEP adds feature_truncation for all breakpoints within the
         // transcript body, including introns.
         assert!(tc.consequences.contains(&Consequence::FeatureTruncation));
         assert!(tc.consequences.contains(&Consequence::IntronVariant));
@@ -671,7 +633,7 @@ mod tests {
     fn test_bnd_intron_near_donor_splice_site() {
         let tx = make_test_transcript();
         // Intron 1 starts at 25_000_300. Position +0 from donor = splice donor site.
-        // Perl VEP does not add splice_donor_variant for SVs, only polypyrimidine tract.
+        // Ensembl VEP does not add splice_donor_variant for SVs, only polypyrimidine tract.
         let v = make_bnd(25_000_300);
         let tc = calculate(&v, &tx, 5000, 5000).unwrap();
         assert!(tc.consequences.contains(&Consequence::FeatureTruncation));
@@ -680,7 +642,7 @@ mod tests {
         assert!(!tc.consequences.contains(&Consequence::IntronVariant));
         assert!(
             !tc.consequences.contains(&Consequence::SpliceDonorVariant),
-            "BNDs should not get splice_donor_variant (Perl VEP parity)"
+            "BNDs should not get splice_donor_variant (Ensembl VEP parity)"
         );
         assert_eq!(tc.impact, Impact::HIGH);
     }
@@ -689,7 +651,7 @@ mod tests {
     fn test_bnd_intron_near_acceptor_splice_site() {
         let tx = make_test_transcript();
         // Intron 1 ends at 25_001_999. Position at end = splice acceptor site.
-        // Perl VEP does not add splice_acceptor_variant for SVs.
+        // Ensembl VEP does not add splice_acceptor_variant for SVs.
         let v = make_bnd(25_001_999);
         let tc = calculate(&v, &tx, 5000, 5000).unwrap();
         assert!(tc.consequences.contains(&Consequence::FeatureTruncation));
@@ -698,7 +660,7 @@ mod tests {
         assert!(
             !tc.consequences
                 .contains(&Consequence::SpliceAcceptorVariant),
-            "BNDs should not get splice_acceptor_variant (Perl VEP parity)"
+            "BNDs should not get splice_acceptor_variant (Ensembl VEP parity)"
         );
         assert_eq!(tc.impact, Impact::HIGH);
     }
@@ -777,7 +739,7 @@ mod tests {
     #[test]
     fn test_bnd_intron_no_splice_donor_reverse_strand() {
         // Reverse strand: donor is at intron END (25_001_999).
-        // Perl VEP does not add splice_donor_variant for SVs.
+        // Ensembl VEP does not add splice_donor_variant for SVs.
         let mut tx = make_test_transcript();
         tx.strand = Strand::Reverse;
         if let Some(ref mut vefc) = tx.vefc {
@@ -795,7 +757,7 @@ mod tests {
         assert!(!tc.consequences.contains(&Consequence::IntronVariant));
         assert!(
             !tc.consequences.contains(&Consequence::SpliceDonorVariant),
-            "BNDs should not get splice_donor_variant (Perl VEP parity)"
+            "BNDs should not get splice_donor_variant (Ensembl VEP parity)"
         );
     }
 
@@ -892,7 +854,7 @@ mod tests {
 
         let v = make_bnd(25_001_000); // Intron 1
         let tc = calculate(&v, &tx, 5000, 5000).unwrap();
-        // Perl VEP adds feature_truncation for all BND positions within the
+        // Ensembl VEP adds feature_truncation for all BND positions within the
         // transcript body, including introns of non-coding transcripts.
         assert!(tc.consequences.contains(&Consequence::FeatureTruncation));
         assert!(tc.consequences.contains(&Consequence::IntronVariant));
@@ -953,13 +915,13 @@ mod tests {
     fn test_bnd_no_splice_donor_sub_terms() {
         let tx = make_test_transcript();
         // Intron 1 starts at 25_000_300. Position +4 = donor 5th base.
-        // Perl VEP does not add splice_donor_5th_base or splice_region for SVs.
+        // Ensembl VEP does not add splice_donor_5th_base or splice_region for SVs.
         let v = make_bnd(25_000_304);
         let tc = calculate(&v, &tx, 5000, 5000).unwrap();
         assert!(
             !tc.consequences
                 .contains(&Consequence::SpliceDonor5thBaseVariant),
-            "BNDs should not get splice sub-terms (Perl VEP parity)"
+            "BNDs should not get splice sub-terms (Ensembl VEP parity)"
         );
         assert!(!tc
             .consequences
@@ -971,17 +933,17 @@ mod tests {
     fn test_bnd_no_splice_donor_region() {
         let tx = make_test_transcript();
         // Intron 1 starts at 25_000_300. Position +3 = donor region.
-        // Perl VEP does not add splice_donor_region or splice_region for SVs.
+        // Ensembl VEP does not add splice_donor_region or splice_region for SVs.
         let v = make_bnd(25_000_303);
         let tc = calculate(&v, &tx, 5000, 5000).unwrap();
         assert!(
             !tc.consequences
                 .contains(&Consequence::SpliceDonorRegionVariant),
-            "BNDs should not get splice_donor_region (Perl VEP parity)"
+            "BNDs should not get splice_donor_region (Ensembl VEP parity)"
         );
         assert!(
             !tc.consequences.contains(&Consequence::SpliceRegionVariant),
-            "BNDs should not get splice_region_variant (Perl VEP parity)"
+            "BNDs should not get splice_region_variant (Ensembl VEP parity)"
         );
     }
 
@@ -1004,6 +966,26 @@ mod tests {
         assert_eq!(tc.biotype.as_deref(), Some("protein_coding"));
         assert!(tc.canonical);
         assert_eq!(tc.feature_type, FeatureType::Transcript);
+    }
+
+    #[test]
+    fn test_bnd_row_takes_span_rank_strand_and_gated_protein_id() {
+        let mut tx = make_test_transcript();
+        tx.strand = Strand::Reverse;
+        tx.id_rank = 7;
+        let v = make_bnd(25_001_000); // Intron 1
+        let tc = calculate(&v, &tx, 5000, 5000).unwrap();
+        assert_eq!(tc.strand, -1);
+        assert_eq!((tc.feature_start, tc.feature_end), (tx.start, tx.end));
+        assert_eq!(tc.id_rank, 7);
+        assert_eq!(tc.protein_id.as_deref(), Some("ENSP00000000001"));
+
+        tx.coding_region_start = None;
+        let tc = calculate(&v, &tx, 5000, 5000).unwrap();
+        assert_eq!(
+            tc.protein_id, None,
+            "has_cds() reads coding_region_start, so a transcript without one reports no protein id however it names one"
+        );
     }
 
     #[test]
@@ -1099,6 +1081,36 @@ mod tests {
             vec![Consequence::UpstreamGeneVariant]
         );
         assert_eq!(tc.distance, Some(3000));
+    }
+
+    /// A mate 5,500 bp before the transcript under `--distance 6000` gets the
+    /// distance row, `upstream_gene_variant` with DISTANCE 5500, as a mate within
+    /// the default window does, and no row under the default 5,000. Ensembl VEP
+    /// writes no row for that mate at any `--distance` above 5,000: the flag
+    /// rewrites `$UPSTREAM_DISTANCE` and `$DOWNSTREAM_DISTANCE` (ensembl-vep
+    /// BaseRunner.pm:511-512), while `_close_to_feature` admits a bracket allele
+    /// through the compile-time `MAX_DISTANCE_FROM_TRANSCRIPT` of 5,000
+    /// (StructuralVariationOverlap.pm:157, Utils/VariationEffect.pm:60), so the
+    /// mate's overlap carries no allele, which also withholds the intergenic row
+    /// (StructuralVariationFeature.pm:679), and the record leaves the output. The
+    /// window here follows the flag.
+    #[test]
+    fn test_paired_mate_within_a_widened_distance_gets_the_distance_row() {
+        let tx = make_test_transcript(); // forward strand, 25_000_000-25_006_000
+        let v = make_cross_chromosome_bnd(25_000_000 - 5_500);
+        let widened = EffectsConfig {
+            upstream_distance: 6_000,
+            downstream_distance: 6_000,
+            ..Default::default()
+        };
+        let tc = calculate_paired_mate(&v, &tx, &widened).unwrap();
+        assert_eq!(
+            tc.consequences.to_vec(),
+            vec![Consequence::UpstreamGeneVariant]
+        );
+        assert_eq!(tc.distance, Some(5_500));
+        assert_eq!(tc.impact, Impact::MODIFIER);
+        assert!(calculate_paired_mate(&v, &tx, &EffectsConfig::default()).is_none());
     }
 
     #[test]
@@ -1252,13 +1264,13 @@ mod tests {
             version: Some(1),
             db_id: None,
             gene_stable_id: "ENSG_MIRNA_001".into(),
+            gene_version: None,
             chr: "21".into(),
             start: 1000,
             end: 1100,
             strand: Strand::Forward,
             biotype: "miRNA".into(),
             source: "Ensembl".into(),
-            description: None,
             gene_symbol: Some("MIR21".into()),
             gene_symbol_source: Some("HGNC".into()),
             hgnc_id: None,
@@ -1274,6 +1286,7 @@ mod tests {
             swissprot: None,
             trembl: None,
             uniparc: None,
+            uniprot_isoform: None,
             exons,
             introns: vec![],
             cdna_coding_start: None,
@@ -1286,6 +1299,7 @@ mod tests {
             cdna_sequence: None,
             protein_sequence: None,
             flags: Arc::from([]),
+            gencode_basic: false,
             gencode_primary: false,
             attributes: vec![Attribute {
                 code: "miRNA".into(),
@@ -1293,6 +1307,7 @@ mod tests {
             }],
             vefc: Some(vefc),
             derived: Default::default(),
+            id_rank: 0,
         }
     }
 

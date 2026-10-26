@@ -20,10 +20,9 @@ pub use annotator::{
     AnnotationResources, AnnotationStats, Annotator, PredictionConfig, RawRow,
 };
 pub use config::Config;
-pub use pick::{apply_filters, FilterConfig};
-pub use transcript_index::{
-    LazyTranscriptIndexes, MaterializedTranscriptIndexes, TranscriptIndexImpl,
-};
+pub use pick::{apply_to_batch, apply_to_record, FilterConfig, PickCriterion};
+pub use row_filter::RowFilters;
+pub use transcript_index::{LazyTranscriptIndexes, MaterializedTranscriptIndexes, TranscriptSet};
 
 // The per-variant data type and core consequence types are re-exported so
 // callers can construct and inspect annotations without a direct `vep-core`
@@ -36,14 +35,32 @@ pub use vep_core::variant::InputVariant;
 pub use vep_io::output::json::JsonOutputFormatter;
 
 pub mod annotator;
+pub mod argv;
+pub mod cache_resolve;
 pub mod config;
+pub(crate) mod delimiter;
 pub mod dylib_plugins;
+pub mod filter_set;
+pub mod frequency_filter;
+pub mod individuals;
+pub mod input_shape;
 pub mod json_cache;
+pub mod nearest;
+pub mod option_rules;
+pub mod output_compress;
 pub mod pick;
 pub(crate) mod pipeline;
+pub(crate) mod render;
+pub mod row_filter;
 pub mod runner;
+pub mod sv_source;
 pub mod transcript_index;
+pub mod transcript_lookup;
+pub(crate) mod validate;
 pub mod variation_matcher;
+pub mod variation_name_index;
+pub mod variation_source;
 pub mod vcf_parser;
+pub mod warnings;
 
 pub mod args;

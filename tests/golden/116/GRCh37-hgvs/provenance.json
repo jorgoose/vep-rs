@@ -14,7 +14,7 @@
  },
  "vep_command": "vep -i variants.vcf -o <out> --offline --cache --dir_cache <cache> --cache_version 116 --species homo_sapiens --assembly GRCh37 --format vcf --buffer_size 5000 --fork 1 --no_stats --quiet --force_overwrite --hgvs --fasta reference.fa [--tab|--vcf|--json]",
  "perl_cache": "homo_sapiens/116_GRCh37",
- "fasta": "GRCh37 chromosome 21, complete, from Homo_sapiens.GRCh37.75.dna.primary_assembly.fa (reference.fa.gz beside this file, with the .fai of the plain file)",
+ "fasta": "GRCh37 chromosome 21, complete, from Homo_sapiens.GRCh37.75.dna.primary_assembly.fa (reference.fa.gz beside this file, compressed with bgzip, with reference.fa.gz.fai and reference.fa.gz.gzi for the compressed file and reference.fa.fai for its decompressed form); Ensembl VEP received it as --fasta, and the golden run of vep-rs reads it with no --fasta as the indexed .fa.gz found in its cache directory, where the golden test runner places the file with its indexes (fasta_in_cache in the manifest)",
  "input": "variants.vcf: chromosome 21 records from ClinVar GRCh37 (ID the ClinVar VariationID) and gnomAD v2.1.1, weighted towards the protein-level consequence terms the manifest's focus_terms name; the manifest's records list carries every line",
  "generator": "scripts/golden/prune_json_cache.py --gzip --drop sorted_exons --drop protein_features --drop protein_function_predictions --perl-info <cache>/info.txt --cache-version 116; scripts/golden/build_golden_corpus.py classify --field HGVSc --field HGVSp",
  "sha256": {
@@ -31,6 +31,24 @@
   "shards": 28,
   "spans_by_chromosome": {
    "21": 293
+  }
+ },
+ "flag_sets": {
+  "hgvsg": {
+   "vep_image": "ensemblorg/ensembl-vep@sha256:5c57abdc40b637cac198370b4c114777fa24de3336141fdf09d2b0c43cd4b8da",
+   "vep_image_tag": "ensemblorg/ensembl-vep:release_116.2",
+   "vep_version_reported": "ensembl-vep          : 116.2",
+   "cache_version": 116,
+   "vep_command": "vep -i variants.vcf -o <out> --offline --cache --dir_cache <cache> --cache_version 116 --species homo_sapiens --assembly GRCh37 --format vcf --buffer_size 5000 --fork 1 --no_stats --quiet --force_overwrite --hgvs --hgvsg --fasta reference.fa [--tab|--vcf|--json]",
+   "perl_cache": "homo_sapiens/116_GRCh37",
+   "fasta": "reference.fa.gz beside this file, decompressed, on both sides",
+   "input": "variants.vcf",
+   "sha256": {
+    "default.txt": "238871ec102c61d2ee1c34eaf79181ead6b04459dc3162cc7b573ff6184e99f2",
+    "tab.txt": "f61b72557ab37a6437538b443c49e498a393ed58f2e59b15c685cf231c034616",
+    "vcf.vcf": "40bb7a8cae281f8112d0041af30b2ef3b141a03495038f6eb9fe69bd174d221b",
+    "json.jsonl": "feda83240f92e687fd2c0e9d366cae39a1d123c7483879dc3e4e10d0bb1c68e8"
+   }
   }
  }
 }

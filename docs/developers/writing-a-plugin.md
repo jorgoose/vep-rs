@@ -33,16 +33,32 @@ exists at `Name`, otherwise as `libName.so` and then `libName.dylib` under
 The string a plugin returns from `vep_plugin_name` appears only in log and error
 messages.
 
-A name that resolves to neither is reported with the message below, and the run
-continues without it, which is Ensembl VEP's default without `--safe`:
+`--dir_plugins` defaults to `<--dir>/Plugins`, as in Ensembl VEP. When
+`--plugin` names a plugin and the directory does not exist, the run writes this
+message to the warnings file; under `--safe` it is an error:
 
 ```text
-plugin 'Name' not found as a built-in or as a dylib under --dir_plugins; skipped
+Plugins directory '<dir>' not found.
 ```
 
+A name that resolves to neither a built-in nor a library is written to the
+warnings file as `Failed to load plugin Name: Name is not a built-in plugin and
+no libName.so or libName.dylib is under <dir>`. The run continues without it,
+which is Ensembl VEP's default. Under `--safe` it is an error, as Ensembl VEP's
+is.
+
 A file that exists but does not open as a shared library, lacks one of the eight
-symbols, reports an ABI version other than 1, or returns non-zero from
-`vep_plugin_init` aborts the run before annotation starts.
+symbols or reports an ABI version other than 1 is dropped with a warning. The warnings
+file records it as `Failed to compile plugin Name: <reason>` and the run continues
+without it, as Ensembl VEP's does when a plugin module fails to compile. Under
+`--safe` it is an error, as Ensembl VEP's is.
+
+A plugin whose `vep_plugin_create` returns NULL or whose `vep_plugin_init`
+returns non-zero is written to the warnings file as `Failed to instantiate
+plugin Name: <reason>` and the run continues without it, as Ensembl VEP's does
+when a plugin's constructor dies. A built-in plugin whose parameters it cannot
+use (a scores file that does not open) is dropped the same way. Under `--safe`
+either is an error, as Ensembl VEP's is.
 
 ### The C ABI (version 1)
 
@@ -63,7 +79,7 @@ Returns `1`; any other value is a load error.
 extern "C" fn() -> *mut c_void
 ```
 
-Returns an opaque instance pointer; NULL is a load error.
+Returns an opaque instance pointer; NULL is a failed instantiation (above).
 
 #### `vep_plugin_destroy`
 
@@ -126,9 +142,13 @@ is never passed to a plugin.
 
 The two JSON documents are the serde serialization of `TranscriptConsequence`
 (`crates/vep-core/src/consequence.rs`) and `InputVariant`
-(`crates/vep-core/src/variant.rs`). The Rust field names are the JSON keys, and
-those two structs are the authoritative schema. Absent optional values are
-`null`.
+(`crates/vep-core/src/variant.rs`), and those two structs with their serde
+attributes are the authoritative schema. No field is renamed, so a JSON key is
+the Rust field name. A field marked `#[serde(skip)]` (`id_rank`,
+`record_span_in_cds`, `raw_input_bytes`, `split_first_feature_rowless`,
+`reference_row_shift_allele`) never appears, a field marked
+`skip_serializing_if` is left out when it is `None`, empty or zero, and every
+other absent optional value is `null`.
 
 **The consequence document.** Every field a plugin will find:
 
@@ -143,13 +163,19 @@ those two structs are the authoritative schema. Absent optional values are
 | `biotype`                                          | Transcript biotype                                                                           | `"protein_coding"`                                 |
 | `canonical`                                        | Whether the transcript is canonical                                                          | `true`                                             |
 | `cdna_position`, `cds_position`, `protein_position` | Positions, as strings                                                                        | `"428"`, `"301-303"`                               |
+| `cdna_total`, `cds_total`, `protein_total`         | The lengths `--total_length` appends to those positions; see below                           |                                                    |
+| `own_span_positions`                               | On an allele of a `--minimal` split, the three positions of the allele's own trimmed span, where the columns above carry the record span's; present only then | `{"cdna": "439", "cds": "87", "protein": "29"}` |
 | `amino_acids`                                      | Amino acid change                                                                            | `"A/V"`                                            |
 | `codons`                                           | Codon change                                                                                 | `"gCc/gTc"`                                        |
 | `protein_id`                                       | Ensembl protein ID                                                                           |                                                    |
 | `distance`                                         | Distance to the transcript, for upstream and downstream consequences                         | `4123`                                             |
 | `strand`                                           | Transcript strand                                                                            | `1`, `-1`                                          |
 | `exon`, `intron`                                   | Exon or intron number over the total                                                         | `"3/5"`, `"2/4"`                                   |
-| `hgvsc`, `hgvsp`                                   | HGVS coding and protein notations                                                            |                                                    |
+| `hgvsc`, `hgvsp`                                   | HGVS coding and protein notations, as the output prints them before escaping; `--hgvsp_use_prediction` and `--remove_hgvsp_version` shape `hgvsp` here too |  |
+| `hgvs_offset`                                      | The signed number of bases the HGVS notations were shifted along the transcript; `null` when nothing shifted |                                   |
+| `shift_length`                                     | The bases `--shift_3prime 1` moved the allele along the transcript; `0` otherwise            | `0`                                                |
+| `shifted_allele`                                   | Under `--shift_3prime 1`, the inserted bases rotated along the shift, the `Allele` a coding row prints; present only on such a row | `"GAA"`                                            |
+| `used_ref`                                         | Under `--use_transcript_ref`, the reference allele the row was analysed against, on the variant's strand: the transcript's inside its exons, the input's elsewhere; present only on a sequence variant's row under the flag | `"A"`                             |
 | `sift`, `polyphen`                                 | Prediction and score                                                                         | `"deleterious(0.01)"`                              |
 | `domains`                                          | Array of `[source, id]` pairs                                                                | `[["Pfam", "PF00080"]]`                            |
 | `feature_type`                                     | The feature kind                                                                             | `"Transcript"`, `"RegulatoryFeature"`, `"MotifFeature"` |
@@ -157,20 +183,37 @@ those two structs are the authoritative schema. Absent optional values are
 | `tsl`                                              | Transcript Support Level                                                                     | `1`                                                |
 | `mane_select`, `mane_plus_clinical`                | MANE transcript IDs, when the transcript carries the tag                                     |                                                    |
 | `appris`                                           | APPRIS annotation                                                                            | `"principal1"`                                     |
-| `ccds`, `swissprot`, `trembl`, `refseq`            | Cross-references                                                                             |                                                    |
+| `ccds`                                             | CCDS cross-reference                                                                         |                                                    |
+| `gencode_primary`                                  | `true` on a transcript of the GENCODE primary set                                            | `true`                                             |
+| `swissprot`, `trembl`, `uniparc`, `uniprot_isoform` | UniProt cross-references: Swiss-Prot, TrEMBL, UniParc and isoform accessions                 |                                                    |
+| `refseq`                                           | RefSeq cross-reference                                                                       |                                                    |
+| `transcript_version`, `gene_version`               | The transcript's and the gene's stable-id versions                                           |                                                    |
+| `gene_phenotype`                                   | `true` when the gene has a phenotype association                                             | `true`                                             |
+| `mirna`                                            | The `miRNA_stem` and `miRNA_loop` terms the variant overlaps on a miRNA transcript; empty elsewhere | `["miRNA_stem"]`                            |
+| `cdna_length`                                      | The transcript's spliced length                                                              |                                                    |
+| `cds_length`                                       | The translateable sequence's length; present for a translated transcript                     |                                                    |
+| `source_cache`                                     | `"Ensembl"` or `"RefSeq"`; present for a merged cache's transcript                           | `"Ensembl"`                                        |
 | `feature_start`, `feature_end`                     | Genomic span of the feature, 1-based inclusive; both `0` when unknown                        |                                                    |
 | `plugin_data`                                      | The fields the built-in plugins have already written to this consequence; present only when non-empty | `{"REVEL_score": "0.931"}`                |
 | `loftee_ctx`                                       | The exon/intron model; present only when LoFTEE is enabled                                   |                                                    |
+
+`cdna_total`, `cds_total` and `protein_total` are the lengths `--total_length`
+appends to the three positions. Each is present only when its rule holds,
+whatever the flag: the cDNA total wherever the variant overlaps an exon, the
+coding and peptide totals where the variant lies in the coding region and the
+cache carries the sequence.
 
 **The variant document.** The sequence-variant fields:
 
 | Field                                                                 | Meaning                                                                                     | Example                                                   |
 | --------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- | --------------------------------------------------------- |
 | `chr`                                                                 | Chromosome, normalized                                                                      | `"21"`                                                    |
-| `original_chr`                                                        | Chromosome as input                                                                         | `"chr21"`                                                 |
+| `original_chr`                                                        | The name the record prints: as input, or `"MT"` for a bare `M` the cache knows only as `MT` | `"chr21"`, `"MT"`                                         |
+| `input_chr`                                                           | The input's `"M"` behind such a rename; absent otherwise                                    | `"M"`                                                     |
 | `start`, `end`                                                        | 1-based inclusive; `end` is `start - 1` for an insertion                                    | 9068417                                                 |
 | `strand`                                                              | Strand                                                                                      | `"Forward"`, `"Reverse"`                                  |
 | `allele_string`                                                       | Alleles in VEP form                                                                         | `"A/G"`, `"AC/-"`, `"-/TT"`                               |
+| `written_case_allele_string`                                          | The record's allele string after the anchor chop and any `--minimal` trim, in the case the input wrote it; present only when a base is lower case | `"ca/-"`                                     |
 | `ref_allele`, `alt_alleles`                                           | Serialized as arrays of byte values, so read `allele_string` for the sequences              | `[65]`                                                    |
 | `allele_index`                                                        | Which ALT of the record this allele is                                                      | `0`                                                       |
 | `allele_num`                                                          | The ALLELE_NUM a breakpoint record prints; see below                                        | `0`                                                       |
@@ -178,10 +221,16 @@ those two structs are the authoritative schema. Absent optional values are
 | `variant_class`                                                       | Variant class                                                                               | `"Snv"`, `"Insertion"`, `"Deletion"`, `"StructuralDeletion"` |
 | `transcript_consequences`                                             | The variant's whole list, so the variant document repeats every consequence                 |                                                           |
 | `most_severe_consequence`                                             | The most severe consequence across all transcripts                                          | `"MissenseVariant"`                                       |
-| `colocated_variants`, `existing_variation`                            | Co-located known variants and their IDs                                                     |                                                           |
+| `colocated_variants`                                                  | Co-located known variants                                                                   |                                                           |
+| `hgvsg`                                                               | The allele's HGVS genomic notation; present under `--hgvsg` when the allele has one         |                                                           |
+| `existing_variation`                                                  | The co-located known variants' IDs                                                          |                                                           |
 | `plugin_data`                                                         | Variant-level built-in fields; present only when non-empty                                  | `{"CADD_PHRED": "23.1"}`                                  |
-| `minimised`, `original_allele_string`, `original_start`, `original_end` | Whether a multi-allelic record was minimised, and the alleles and coordinates before it     |                                                           |
-| `raw_input`, `input_record`                                           | The input line, and the ordinal of the record it came from                                  |                                                           |
+| `minimised`, `original_allele_string`, `original_start`, `original_end` | Whether the record was minimised under `--minimal`, and the alleles and coordinates before it; on an allele of a split multi-allelic record the record's span |                                                           |
+| `rejoin_key_prefix`                                                   | On an allele after the first of a `--minimal` split, the trimmed allele string and `_` the output sorts its rows by; present only then | `"-/A_"`                                                 |
+| `intergenic_shift`                                                    | The bases `--shift_3prime 1` moved an insertion or deletion that overlaps no transcript; present only then |                                             |
+| `raw_input`, `input_record`                                           | The input line as [the JSON output's `input`](../output/json.md#the-record-object) stores it (trailing empty columns dropped, a structural record's QUAL, FILTER and INFO filled with `.`), and the ordinal of the record it came from | |
+| `summary_terms`                                                       | The `--summary` or `--most_severe` row's terms; present on the one allele of a record that carries that row |                                            |
+| `intergenic_pick`                                                     | Whether a `--flag_pick` variant marked the allele's intergenic row                          | `true`                                                    |
 | `uploaded_allele_string`, `record_allele_string_multi`, `input_line_name` | The `Uploaded_variation` helpers; see below                                             |                                                           |
 
 `allele_num` is the ALLELE_NUM a breakpoint record prints when it is not
@@ -189,9 +238,10 @@ those two structs are the authoritative schema. Absent optional values are
 `<BND>`'s allele 2 behind the reference base. It is absent for every other
 record.
 
-`id` is the first `;`-joined ID of a VCF record as written, `.` and `0`
-included, or the whole ID column of an Ensembl-format line. It is `null` when
-the column or its first `;`-element is empty, so `;rs2` gives `null`.
+`id` is the first `;`-joined ID of a VCF record as written (`.` and `0`
+included), the whole ID column of an Ensembl-format line, or the identifier of
+an identifier-list input (`--format id`). It is `null` when the column or its
+first `;`-element is empty, so `;rs2` gives `null`.
 
 `input_line_name` is the `CHROM_POS_REF/ALT` name built from the input line,
 present for VCF and Ensembl-format input.
@@ -273,7 +323,7 @@ entire variant buffer (`--buffer_size`, default 5000):
 5. Index returned records by position
 6. Match each variant against the indexed records
 
-Perl VEP's `BaseVepTabixPlugin` runs one tabix query per variant whenever a
+Ensembl VEP's `BaseVepTabixPlugin` runs one tabix query per variant whenever a
 plugin sets no region expansion, as its CADD and gnomADc plugins do. The batched
 strategy replaces that with one query per merged region. Its contribution to run
 time is not separately measured: the published wall-time measurements were taken
@@ -381,7 +431,7 @@ fn annotate(
 
 ## Plugin concordance testing
 
-`scripts/concordance/run_concordance.sh` runs Perl VEP (in Docker) and vep-rs on
+`scripts/concordance/run_concordance.sh` runs Ensembl VEP (in Docker) and vep-rs on
 the same inputs with the same plugins and compares each plugin's fields. Every
 run needs four inputs, and it exits 1 before running anything when one is
 missing:
@@ -467,9 +517,8 @@ Perl container; `LOFTEE_DATA_DIR` overrides the default data location,
 (GRCh37) runs the splice-prediction layer by default and vep-rs does not
 implement it.
 
-vep-rs reads the plain `human_ancestor.fa`, so decompress the upstream bgzipped
-file and re-index it (`bgzip -d`, then `samtools faidx`). The harness hands
-Perl's `LoF` plugin the bgzipped `human_ancestor.fa.gz`, and
+The harness hands vep-rs the plain `human_ancestor.fa` and Perl's `LoF` plugin
+the bgzipped `human_ancestor.fa.gz` (vep-rs reads either form), and
 `setup_plugin_data.sh` reports the directory READY only when the plain file, the
 compressed copy and all three indexes are present. The `END_TRUNC` cutoff
 differs in sign between the two upstream branches (`-58` on `grch38`, `+180` on

@@ -1,10 +1,12 @@
 # Parquet format
 
-This page describes the Parquet output, a vep-rs extension with no Ensembl VEP counterpart: its layout, its schema, the two row shapes and the writer's choices. Selected with `--output_format parquet`. The run writes a TSV intermediate, one row per allele x transcript consequence in VEP's row order, and post-processes it to Parquet through the `duckdb` CLI. The intermediate is deleted on success unless the hidden `--keep_intermediate` flag is given. With `-o STDOUT` the TSV intermediate is streamed to stdout and no Parquet is written.
+This page describes the Parquet output, a vep-rs extension with no Ensembl VEP counterpart: its layout, its schema, the two row shapes and the writer's choices. Selected with `--output_format parquet`. The run writes a TSV intermediate at `<output>.tsv.tmp`, one row per allele x transcript consequence in VEP's row order, and post-processes it to Parquet through the `duckdb` CLI. The intermediate is deleted on success unless the hidden `--keep_intermediate` flag is given.
+
+The output is a directory, so `-o STDOUT` is refused (`ERROR: [output] --output_format parquet needs a file path: Parquet cannot be written to STDOUT`). `--fields` and `--compress_output` are refused with it too: the column set is fixed, and the files carry their own compression. `--no_headers` leaves the intermediate's column line in place, since DuckDB reads the schema from it.
 
 ## Requirements
 
-The `duckdb` CLI, 1.2 or newer, must be on `PATH`. Install it with `brew install duckdb` on macOS, or from the CLI archive at <https://duckdb.org/docs/installation/> (on Linux the `duckdb_cli-linux-*.zip` release asset). vep-rs checks for it after the FASTA, the plugins and the variation cache are loaded and before the first variant is read. It fails there when `duckdb` is missing or too old, so no annotation is spent on a run it cannot finalize.
+The `duckdb` CLI, 1.3.2 or newer, must be on `PATH`. Install it with `brew install duckdb` on macOS, or from the CLI archive at <https://duckdb.org/docs/installation/> (on Linux the `duckdb-cli-linux-*.tar.gz` release asset; 1.x releases shipped `duckdb_cli-linux-*.zip`). vep-rs checks for it after the FASTA, the plugins and the variation cache are loaded and before the first variant is read. It fails there when `duckdb` is missing or too old, so no annotation is spent on a run it cannot finalize.
 
 ## Directory layout
 
@@ -25,7 +27,7 @@ read_parquet('out.parquet/**/*.parquet', hive_partitioning=false)
 
 ## Schema
 
-Five key columns, then exactly the `--tab` columns in `--tab` order:
+Five key columns, then exactly the default `--tab` columns in `--tab` order:
 
 | Column                                        | Type    | Notes                                     |
 | --------------------------------------------- | ------- | ----------------------------------------- |
@@ -37,7 +39,7 @@ Five key columns, then exactly the `--tab` columns in `--tab` order:
 | `DISTANCE`                                    | INTEGER |                                           |
 | `STRAND`                                      | TINYINT |                                           |
 
-In the allele columns (`ref`, `alt`, `Allele`) a `-` is a real allele, a deletion's ALT or an insertion's REF, and is kept.
+In the allele columns (`ref`, `alt`, `Allele`, and `GIVEN_REF` and `USED_REF` under `--use_transcript_ref`) a `-` is a real allele, a deletion's ALT or an insertion's REF, and is kept.
 
 ## Row shape (`--parquet_shape`)
 

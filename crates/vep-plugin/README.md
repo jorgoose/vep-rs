@@ -15,7 +15,8 @@ live in [docs/plugins.md](../../docs/plugins.md); this page describes the crate.
 
 Follow `--plugin target/debug/examples/libecho_plugin.so,hello`, the crate's own example
 plugin passed by path with one parameter. `PluginRegistry::load_from_args` splits the argument
-at its first comma into the name or path and the parameter list `["hello"]`. The private
+on every comma, as Perl's `split` reads it (a trailing empty field is no parameter), into the
+name or path and the parameter list `["hello"]`. The private
 `resolve_plugin_path` keeps the first token because a file exists at it; a bare name is instead
 searched under `--dir_plugins` as `lib<name>.so` and then `lib<name>.dylib`, and a name that
 resolves to neither is a `PluginError::Load` reading `plugin '<name>' not found`. The resolved
@@ -107,9 +108,9 @@ cargo doc --no-deps -p vep-plugin
 `tests/echo_roundtrip.rs` loads it; a `cargo test -p vep-plugin --test echo_roundtrip` filter
 alone does not build the example, and the test fails with a message saying so. The example
 build writes `libecho_plugin.so` on Linux and `libecho_plugin.dylib` on macOS, the file the
-worked example in docs/plugins.md passes to `vep --plugin`. The repository's standard
-commands (`cargo test --workspace`, `cargo clippy`, `cargo fmt`) are in the
-[contributing guide](../../CONTRIBUTING.md).
+worked example in docs/developers/writing-a-plugin.md passes to `vep --plugin`. The
+repository's standard commands (`cargo test --workspace`, `cargo clippy`, `cargo fmt`) are in
+the [contributing guide](../../CONTRIBUTING.md).
 
 ## Related
 
@@ -121,8 +122,8 @@ commands (`cargo test --workspace`, `cargo clippy`, `cargo fmt`) are in the
   built-in claimed and merges each `run` result into `plugin_data`.
 - [`vep-builtins`](../vep-builtins/README.md): the compiled-in plugins the runner resolves
   before falling back to this crate.
-- [docs/plugins.md](../../docs/plugins.md): the plugin matrix, the ABI table, the JSON field
-  lists and the worked example.
-- [docs/cli-reference.md](../../docs/cli-reference.md): the `--plugin` and `--dir_plugins`
-  flags.
+- [docs/plugins.md](../../docs/plugins.md): the plugin matrix.
+- [docs/developers/writing-a-plugin.md](../../docs/developers/writing-a-plugin.md): the ABI
+  signatures, the JSON field lists and the worked example.
+- [docs/cli/plugins.md](../../docs/cli/plugins.md): the `--plugin` and `--dir_plugins` flags.
 - [Root README](../../README.md).

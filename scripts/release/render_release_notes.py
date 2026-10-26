@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """Render the GitHub release body for a vep-rs version from the repository's own files.
 
-The page, every header `##`, in this order: the hand-written opener, then `## Highlights` and
-`## Upgrade notes` when `.github/release-notes/vX.Y.Z.md` carries them (its lines are the only
-hand-written ones); the version's CHANGELOG.md section with each `###` kind header raised to `##`;
-`## Concordance and wall time` from the release and population provenance records; `## Install`
-from SHA256SUMS, the build and the workspace rust-version; `## Cite` from CITATION.cff; and the
-full-changelog footer. A page runs about 60 lines; one over 80 is refused.
+The page, every header `##`, in this order: the hand-written opener, then `## Highlights` when
+`.github/release-notes/vX.Y.Z.md` carries it (its lines are the only hand-written ones); the notes, in one
+of two shapes: a notes file with `## What changed, by area` renders that section (one bullet per area, its
+changes nested under it as `  - ` bullets, each breaking one beginning `Breaking:` and first in its area)
+and its optional `## Security and robustness`, `## Dependencies and tooling` and `## Removed` sections as
+written, while a notes file without it renders its optional `## Upgrade notes` and then the version's
+CHANGELOG.md section with each `###` kind header raised to `##`; `## Concordance and wall time` from the
+release and population provenance records; `## Install` from SHA256SUMS, the glibc floors
+`check_glibc_floor.py --json` measured on the Linux archives, the build and the workspace rust-version;
+`## Cite` from CITATION.cff; and the full-changelog footer. A page over `LINE_CAP` lines is refused.
 
 usage: render_release_notes.py --repo DIR --version X.Y.Z --previous vX.Y.Z --commit SHA
-                               --toolchain 1.97.1 --sha256sums FILE [--notes FILE]
+                               --toolchain 1.97.1 --sha256sums FILE --glibc-floors FILE [--notes FILE]
                                [--changelog-section NAME] [--date YYYY-MM-DD] [--out FILE]
 
 A dry run before the CHANGELOG has the version's dated section passes
@@ -22,27 +26,62 @@ import argparse
 import json
 import re
 import sys
+from collections.abc import Iterator
 from decimal import ROUND_CEILING, ROUND_HALF_UP, Decimal, InvalidOperation
+from itertools import pairwise
 from pathlib import Path
+from typing import NamedTuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "concordance"))
 from reference_release import release_from_provenance  # noqa: E402  (one reading of a reference's release for every script)
 
 REPO_URL = "https://github.com/natera-open-source/vep-rs"
 CONCEPT_DOI = "10.5281/zenodo.22837896"
-LINE_CAP = 80
+LINE_CAP = 400
+AREA_NAME_CAP = 60
 SCORED = ("s01", "s02", "s03", "s04", "s05", "s06", "s07", "s08")
+MEASURED_CPU = {"arm64": "neoverse-v1", "x86_64": "x86-64-v3"}
+
+
+class Target(NamedTuple):
+    """One binary archive: the platform it runs on, its CPU floor with the processors that meet it, the
+    architecture its wall time is recorded under when the record times it, and for a generic build the
+    `target_cpu` its campaign cells carry and the measured archive it is compared with."""
+
+    platform: str
+    cpu: str
+    arch: str | None = None
+    target_cpu: str | None = None
+    generic_of: str | None = None
+
+
 TARGETS = {
-    "x86_64-unknown-linux-gnu": (
-        "Linux x86_64, glibc 2.39 or later",
-        "x86-64-v3 (AVX2, BMI2, FMA: Intel Haswell 2013 or later, AMD Zen or later)",
+    "x86_64-unknown-linux-gnu": Target(
+        "Linux x86_64", "x86-64-v3 (AVX2, BMI2, FMA: Intel Haswell 2013 or later, AMD Zen or later)", "x86_64"
     ),
-    "aarch64-unknown-linux-gnu": (
-        "Linux aarch64, glibc 2.39 or later",
+    "x86_64-unknown-linux-gnu-v2": Target(
+        "Linux x86_64",
+        "x86-64-v2 (SSE4.2, POPCNT: Intel Nehalem 2008 or later, AMD Bulldozer 2011 or later, and VMs that hide AVX2)",
+        "x86_64",
+        "x86-64-v2",
+        "x86_64-unknown-linux-gnu",
+    ),
+    "aarch64-unknown-linux-gnu": Target(
+        "Linux aarch64",
         "Armv8.4-A with SVE (Arm Neoverse V1 or later: AWS Graviton3 and later, not Graviton2, Ampere Altra or Raspberry Pi)",
+        "arm64",
     ),
-    "aarch64-apple-darwin": ("macOS 11 or later on Apple silicon", "any Apple M-series"),
+    "aarch64-unknown-linux-gnu-generic": Target(
+        "Linux aarch64",
+        "Armv8.0-A with NEON (any 64-bit Arm: AWS Graviton2, Ampere Altra, Raspberry Pi, Apple silicon under Linux)",
+        "arm64",
+        "generic",
+        "aarch64-unknown-linux-gnu",
+    ),
+    "aarch64-apple-darwin": Target("macOS 11 or later on Apple silicon", "any Apple M-series"),
 }
+LINUX = tuple(t for t, target in TARGETS.items() if target.arch)
+GENERIC_SUITE = "s02"
 SUITE_LABELS = {
     "s01": ("ClinVar full", "GRCh37"),
     "s02": ("ClinVar full", "GRCh38"),
@@ -60,9 +99,26 @@ ARCH_LABELS = {"arm64": "ARM", "x86_64": "x86"}
 SV_SETS = (("clinvar_sv_", "ClinVar SV"), ("gnomad_sv_", "gnomAD SV"), ("1kg_sv_", "1000 Genomes SV"))
 SYNTHETIC = re.compile(r"^\d{2}_")
 SYNTHETIC_FILES = 13
-LIST_ITEM = re.compile(r"^\s*(?:[-*+]|\d+\.)\s")
+LIST_ITEM = re.compile(r"^\s*(?:[-*+]|\d+\.)(?:\s|$)")
 BULLET = re.compile(r"[-*] ")
+NEST = "  "
+BREAKING = re.compile(r"(?:\*\*Breaking:\*\*|Breaking:)(?!\*)")
+BREAKING_LIKE = re.compile(r"[*_`~\[]*breaking(?:[ -]changes?)?[*_`~\]]*\s*:[*_`~]*", re.IGNORECASE)
+DASH = re.compile(r"-(?: |$)")
+AREAS = "What changed, by area"
+COMPANIONS = ("Security and robustness", "Dependencies and tooling", "Removed")
+HAND_SECTIONS = {
+    "Highlights": "highlights",
+    "Upgrade notes": "upgrade",
+    AREAS: "areas",
+    COMPANIONS[0]: "security",
+    COMPANIONS[1]: "dependencies",
+    COMPANIONS[2]: "removed",
+}
 SENTENCE_END = re.compile(r"[.!?][\"'`)\]]*(?=\s|$)")
+GENERATION = re.compile(r"^[a-z]+(\d+)")
+NEWEST_CLASS = "the newest available class per architecture"
+WALL_TIME = "the population record's wall_time.vep_rs"
 
 
 def fail(message: str) -> None:
@@ -112,15 +168,24 @@ def changelog_section(text: str, name: str) -> tuple[str, str | None]:
     return body, m.group(1)
 
 
-def unwrap_bullets(text: str) -> str:
-    """Join each list item's wrapped continuation lines (indented, not list items themselves, outside a
-    fenced block) into its line, so the page carries one physical line per bullet in the changelog's words."""
-    out: list[str] = []
+def fenced_lines(text: str) -> Iterator[tuple[str, bool]]:
+    """Each line of `text` with whether it lies in a fenced code block, the fence lines themselves counted
+    as fenced: a list-looking line inside a fence is code, never a bullet."""
     fenced = False
     for line in text.split("\n"):
         if line.lstrip().startswith(("```", "~~~")):
             fenced = not fenced
-        elif (
+            yield line, True
+        else:
+            yield line, fenced
+
+
+def unwrap_bullets(text: str) -> str:
+    """Join each list item's wrapped continuation lines (indented, not list items themselves, outside a
+    fenced block) into its line, so the page carries one physical line per bullet in the changelog's words."""
+    out: list[str] = []
+    for line, fenced in fenced_lines(text):
+        if (
             not fenced
             and out
             and line.startswith("  ")
@@ -155,22 +220,46 @@ def kind_blocks(section: str) -> list[str]:
     return blocks
 
 
+def changelog_entries(section: str) -> int:
+    """How many changes a CHANGELOG section lists: its bullets outside fenced blocks less the area groups, a
+    group being a bullet at the margin whose next bullet is nested under it."""
+    bullets = [line for line, fenced in fenced_lines(unwrap_bullets(section)) if not fenced and LIST_ITEM.match(line)]
+    groups = sum(1 for bullet, nxt in pairwise(bullets) if BULLET.match(bullet) and nxt.startswith(NEST))
+    return len(bullets) - groups
+
+
 def hand_written(path: Path) -> dict[str, str]:
-    """The maintainer's lines: the opener paragraph, then the optional `## Highlights` and
-    `## Upgrade notes` sections, each bullet on one line; any other section is an error."""
-    out = {"opener": "", "highlights": "", "upgrade": ""}
+    """The maintainer's lines: the opener paragraph, then the optional sections of HAND_SECTIONS, each
+    bullet on one line; any other section, one written twice, or one with nothing under its header is an
+    error (an empty section would otherwise vanish from the page, and an empty area section would flip the
+    page to the shape without it)."""
+    out = {"opener": "", **{key: "" for key in HAND_SECTIONS.values()}}
     if not path.exists():
         return out
     text = re.sub(r"^# .*\n", "", path.read_text(), count=1)
     parts = re.split(r"^## ", text, flags=re.MULTILINE)
     out["opener"] = parts[0].strip()
+    seen: set[str] = set()
     for part in parts[1:]:
         title, _, body = part.partition("\n")
-        key = {"Highlights": "highlights", "Upgrade notes": "upgrade"}.get(title.strip())
+        title = title.strip()
+        key = HAND_SECTIONS.get(title)
         if key is None:
-            fail(f"unknown section '## {title.strip()}' in {path}")
-        out[key] = unwrap_bullets(body.strip("\n")).strip()
+            fail(f"unknown section '## {title}' in {path}")
+        if key in seen:
+            fail(f"'## {title}' appears twice in {path}")
+        seen.add(key)
+        out[key] = strip_blank_lines(unwrap_bullets(body))
+        if not out[key]:
+            fail(f"'## {title}' in {path} has nothing under its header")
     return out
+
+
+def strip_blank_lines(text: str) -> str:
+    """`text` without its leading and trailing blank lines and trailing spaces, the first line's indentation
+    kept: a section opening with a nested bullet stays one, to be refused by name rather than read as a
+    bullet at the margin."""
+    return re.sub(r"\A(?:[ \t]*\n)+", "", text.rstrip())
 
 
 def bullets_only(name: str, body: str, notes: Path) -> list[str]:
@@ -180,10 +269,85 @@ def bullets_only(name: str, body: str, notes: Path) -> list[str]:
     return lines
 
 
+def nested_bullets(name: str, body: str, notes: Path) -> list[tuple[str, list[str]]]:
+    """A section's bullets as (text, nested texts): a bullet at the margin, then the `  - ` bullets under
+    it. Refused: a line that is not a `-` bullet (a `*` marker beside a `-` one renders as two lists), a
+    bullet with no text, a nested bullet with none at the margin above it, a bullet indented other than
+    two spaces, and a third level."""
+    items: list[tuple[str, list[str]]] = []
+    for line in body.splitlines():
+        if not line.strip():
+            continue
+        text = line.lstrip(" ")
+        indent = len(line) - len(text)
+        if not DASH.match(text):
+            fail(f"'## {name}' in {notes} is bullets only, each a '-' bullet")
+        entry = text[1:].strip()
+        if not entry:
+            fail(f"'## {name}' in {notes} has a bullet with no text")
+        if indent == 0:
+            items.append((entry, []))
+        elif indent == len(NEST):
+            if not items:
+                fail(f"'## {name}' in {notes} opens with a nested bullet; a nested bullet sits under one at the margin")
+            items[-1][1].append(entry)
+        elif indent >= 2 * len(NEST):
+            fail(f"'## {name}' in {notes} nests a bullet three levels deep; two is the most")
+        else:
+            fail(f"'## {name}' in {notes} indents a bullet by {indent}; a nested bullet is indented two spaces")
+    return items
+
+
+def breaking_first(entries: list[str], where: str, notes: Path) -> None:
+    """Every entry beginning `Breaking:` (bold or plain) comes before the first that does not; a mark in
+    another dress (`BREAKING:`, `**Breaking**:`, `Breaking :`, `Breaking change:`, `[Breaking]:`) is
+    refused rather than read as plain, so the order rule cannot be slipped by a misspelling."""
+    plain_seen = False
+    for entry in entries:
+        if BREAKING.match(entry):
+            if plain_seen:
+                fail(f"{where} in {notes} lists a Breaking: bullet after one that is not")
+        elif near_miss := BREAKING_LIKE.match(entry):
+            fail(f"{where} in {notes} marks a breaking change as '{near_miss.group()}'; the mark is Breaking:")
+        else:
+            plain_seen = True
+
+
+def check_by_area(hand: dict[str, str], notes: Path) -> None:
+    """The page by area: `## What changed, by area` is one bullet per area, the area's name at most
+    AREA_NAME_CAP characters and carrying no breaking mark in any dress (the mark goes on a change under it),
+    with at least one change nested under it and its breaking changes first;
+    `## Security and robustness`, `## Dependencies and tooling` and `## Removed` are bullets, nested at
+    most one level, breaking ones first in every list; `## Upgrade notes` has no place on it, since each
+    breaking change is marked where it sits, and the three companion sections have none without it, since
+    the page then carries the CHANGELOG kinds."""
+    if hand["areas"]:
+        if hand["upgrade"]:
+            fail(f"'## Upgrade notes' and '## {AREAS}' in {notes} are two shapes of one page")
+        for name, changes in nested_bullets(AREAS, hand["areas"], notes):
+            if len(name) > AREA_NAME_CAP:
+                fail(f"the area '{name}' in {notes} is {len(name)} characters; at most {AREA_NAME_CAP}")
+            if BREAKING_LIKE.match(name):
+                fail(f"the area '{name}' in {notes} carries a breaking mark; the mark goes on a change under it")
+            if not changes:
+                fail(f"the area '{name}' in {notes} has no bullets")
+            breaking_first(changes, f"the area '{name}'", notes)
+    for title in COMPANIONS:
+        body = hand[HAND_SECTIONS[title]]
+        if not body:
+            continue
+        if not hand["areas"]:
+            fail(f"'## {title}' in {notes} needs '## {AREAS}'; without it the page lists the CHANGELOG kinds")
+        items = nested_bullets(title, body, notes)
+        breaking_first([text for text, _ in items], f"'## {title}'", notes)
+        for text, nested in items:
+            breaking_first(nested, f"'## {title}' under '{text}'", notes)
+
+
 def check_hand_written(hand: dict[str, str], section: str, notes: Path) -> None:
     """The opener is one paragraph of at most two sentences and 50 words; Highlights, when present, is two
-    to four bullets over a CHANGELOG section of at least three; Upgrade notes, when present, is one to five
-    bullets with every `**Breaking:**` bullet before the first that is not."""
+    to four bullets over a CHANGELOG section of at least three changes; Upgrade notes, when present, is
+    bullets with every `Breaking:` bullet before the first that is not; then the page by area's rules."""
     opener = hand["opener"]
     if not opener:
         fail("the release-notes file needs an opener paragraph")
@@ -199,17 +363,13 @@ def check_hand_written(hand: dict[str, str], section: str, notes: Path) -> None:
         lines = bullets_only("Highlights", hand["highlights"], notes)
         if not 2 <= len(lines) <= 4:
             fail(f"'## Highlights' in {notes} has {len(lines)} bullets; two to four")
-        changes = sum(1 for line in unwrap_bullets(section).splitlines() if BULLET.match(line))
+        changes = changelog_entries(section)
         if changes < 3:
             fail(f"'## Highlights' needs at least three CHANGELOG bullets; the section has {changes}")
     if hand["upgrade"]:
         lines = bullets_only("Upgrade notes", hand["upgrade"], notes)
-        if not 1 <= len(lines) <= 5:
-            fail(f"'## Upgrade notes' in {notes} has {len(lines)} bullets; one to five")
-        breaking = [line[2:].startswith("**Breaking:**") for line in lines]
-        first_plain = breaking.index(False) if False in breaking else len(breaking)
-        if any(breaking[first_plain:]):
-            fail(f"'## Upgrade notes' in {notes} lists a **Breaking:** bullet after one that is not")
+        breaking_first([line[2:].strip() for line in lines], "'## Upgrade notes'", notes)
+    check_by_area(hand, notes)
 
 
 def read_doi(cff: Path, version: str) -> str | None:
@@ -344,26 +504,45 @@ def reference_release(release: dict, pop: dict, population: dict) -> str:
     return next(iter(named.values()))
 
 
-def wall_time_sums(population: dict) -> dict[tuple[str, str], Decimal]:
+def released_wall_time(population: dict) -> dict:
+    """The population record's `wall_time.vep_rs` block, the released binary's whole-genome wall time; the
+    record's `wall_time` and the block are refused by name when absent, and the block when not an object."""
+    (wall_time,) = required(population, ("wall_time",), "the population record")
+    (vep_rs,) = required(wall_time, ("vep_rs",), "the population record's wall_time")
+    if not isinstance(vep_rs, dict):
+        fail(f"{WALL_TIME} is not an object")
+    return vep_rs
+
+
+def timed_cells(population: dict) -> list:
+    """The released binary's per-chromosome cells, `per_cell` of its wall-time block; refused by name when
+    absent or not a list."""
+    (cells,) = required(released_wall_time(population), ("per_cell",), WALL_TIME)
+    if not isinstance(cells, list):
+        fail(f"{WALL_TIME}.per_cell is not a list")
+    return cells
+
+
+def wall_time_sums(cells: list) -> dict[tuple[str, str], Decimal]:
     """Per (dataset, arch), the sum of the per-chromosome wall-time medians of the released binary; a cell's
     dataset, arch or median is refused by name when absent, and its median when it is not a finite number."""
     sums: dict[tuple[str, str], Decimal] = {}
-    for index, cell in enumerate(population["wall_time"]["vep_rs"]["per_cell"]):
-        where = f"the population record's wall_time.vep_rs.per_cell[{index}]"
+    for index, cell in enumerate(cells):
+        where = f"{WALL_TIME}.per_cell[{index}]"
         dataset, arch, median = required(cell, ("dataset", "arch", "median_sec"), where)
         key = (dataset, arch)
         sums[key] = sums.get(key, Decimal(0)) + median_seconds(median, where)
     return sums
 
 
-def peak_rss_gb(population: dict) -> str:
+def peak_rss_gb(cells: list) -> str:
     """The largest per-chromosome median peak RSS of the released binary, the record's MB over 1000 in GB
     rounded up to one decimal, so the stated bound is never below a measured cell; the README's own reading
     of the same field. A cell's peak is refused by name when absent or not a finite number, as is a record
     with no cells."""
     peaks: list[Decimal] = []
-    for index, cell in enumerate(population["wall_time"]["vep_rs"]["per_cell"]):
-        where = f"the population record's wall_time.vep_rs.per_cell[{index}]"
+    for index, cell in enumerate(cells):
+        where = f"{WALL_TIME}.per_cell[{index}]"
         (value,) = required(cell, ("peak_rss_mb_median",), where)
         try:
             peak = Decimal(str(value))
@@ -373,8 +552,48 @@ def peak_rss_gb(population: dict) -> str:
             fail(f"{where} carries a peak_rss_mb_median that is not finite: {value!r}")
         peaks.append(peak)
     if not peaks:
-        fail("the population record's wall_time.vep_rs.per_cell is empty")
+        fail(f"{WALL_TIME}.per_cell is empty")
     return str((max(peaks) / 1000).quantize(Decimal("0.1"), rounding=ROUND_CEILING))
+
+
+def instance_types(block, where: str) -> dict[str, str]:
+    """A record's instance type per architecture, `arm64` and `x86_64`; either is refused by name when absent
+    or not a string."""
+    types = dict(zip(ARCH_LABELS, required(block, tuple(ARCH_LABELS), where)))
+    for arch, instance_type in types.items():
+        if not isinstance(instance_type, str):
+            fail(f"{where} carries {arch} that is not a string: {instance_type!r}")
+    return types
+
+
+def generation(instance_type: str, where: str) -> int:
+    """The generation of an instance type, the number after its family letters (`c9gd.8xlarge` is the 9th);
+    a type whose name carries none is refused by name."""
+    m = GENERATION.match(instance_type)
+    if not m:
+        fail(f"{where} names the instance type {instance_type!r}, whose name carries no generation number")
+    return int(m.group(1))
+
+
+def class_names(types: dict[str, str]) -> str:
+    """The pair of classes a measurement ran on: `c9gd.8xlarge` (ARM) and `c8id.8xlarge` (x86)."""
+    return " and ".join(f"`{types[arch]}` ({label})" for arch, label in ARCH_LABELS.items())
+
+
+def pair_label(types: dict[str, str], where: str) -> str:
+    """The label of a pair of classes of different generations, so the ARM and x86 columns are not read as a
+    same-generation comparison; empty for a pair of one generation."""
+    return NEWEST_CLASS if generation(types["arm64"], where) != generation(types["x86_64"], where) else ""
+
+
+def classes_clause(types: dict[str, str], where: str) -> str:
+    """The pair of classes mid-sentence, the label set off by commas when the pair carries one:
+    "`c9gd.8xlarge` (ARM) and `c8id.8xlarge` (x86), the newest available class per architecture,"."""
+    label = pair_label(types, where)
+    names = class_names(types)
+    if label:
+        return f"{names}, {label},"
+    return names
 
 
 def short_label(label: str) -> str:
@@ -398,12 +617,21 @@ def whole_genome_row(label: str, entry: dict, arm: Decimal, x86: Decimal, where:
     return f"| {label} | {f1_9(*raw)} | {f1_9(*adjusted)} | {whole_seconds(arm)} | {whole_seconds(x86)} |"
 
 
-def whole_genome_setup(population: dict) -> tuple[dict, dict[str, str], dict[tuple[str, str], Decimal], list[str]]:
-    """Where both pages' whole-genome tables start: the released binary's wall-time block, its instance type
-    per architecture, the per-(dataset, arch) sums of its per-chromosome medians and the table's header rows."""
-    vep_rs = population["wall_time"]["vep_rs"]
+def whole_genome_setup(population: dict) -> tuple[int, int, dict[str, str], dict[tuple[str, str], Decimal], list[str]]:
+    """Where both pages' whole-genome tables start: the released binary's clones per cell and its threads, its
+    instance type per architecture, the per-(dataset, arch) sums of its per-chromosome medians and the table's
+    header rows; the clone count, the thread count and the instance types are refused by name when absent, and
+    the counts when not integers."""
+    types, clones = required(released_wall_time(population), ("instance_types", "n_clones_per_cell"), WALL_TIME)
+    (fork,) = required(population, ("fork",), "the population record")
     header = ["| Dataset | Raw F1 | Adjusted F1 | ARM (s) | x86 (s) |", "| --- | --- | --- | --- | --- |"]
-    return vep_rs, vep_rs["instance_types"], wall_time_sums(population), header
+    return (
+        integer(clones, "n_clones_per_cell", WALL_TIME),
+        integer(fork, "fork", "the population record"),
+        instance_types(types, f"{WALL_TIME}.instance_types"),
+        wall_time_sums(timed_cells(population)),
+        header,
+    )
 
 
 def dataset_wall_time(dataset: str, sums: dict[tuple[str, str], Decimal]) -> tuple[Decimal, Decimal]:
@@ -450,21 +678,43 @@ def int_triple(block, keys: tuple[str, str, str], where: str) -> tuple[int, int,
     return integer(i, keys[0], where), integer(a, keys[1], where), integer(b, keys[2], where)
 
 
-def whole_file_aggregate(release: dict, suite: str, arch: str) -> dict:
-    """The release record's `per_cell_aggregates` entry of one ClinVar cell and architecture, the released
-    binary's whole-file wall time; refused when absent or repeated, as is a `per_cell_aggregates` that is
-    not a list of objects."""
+def whole_file_aggregate(release: dict, suite: str, arch: str, target_cpu: str | None = None) -> dict:
+    """The release record's `per_cell_aggregates` entry of one ClinVar cell and architecture: the measured
+    binary's whole-file wall time, or a generic build's when `target_cpu` names one; refused when absent or
+    repeated, as is a `per_cell_aggregates` that is not a list of objects."""
     entries = release.get("per_cell_aggregates")
     if not isinstance(entries, list) or not all(isinstance(a, dict) for a in entries):
         fail("the release record's per_cell_aggregates is not a list of objects")
-    hits = [
+    hits = cell_aggregates(release, suite, arch, target_cpu)
+    if len(hits) != 1:
+        build = f" of the {target_cpu} build" if target_cpu else ""
+        fail(f"the release record has {len(hits)} per_cell_aggregates entries for {suite} on {arch}{build}; one is read")
+    return hits[0]
+
+
+def cell_aggregates(release: dict, suite: str, arch: str, target_cpu: str | None) -> list[dict]:
+    """The `per_cell_aggregates` entries timing vep-rs built for `target_cpu` on one suite and architecture. A
+    block that is not a list, and an entry that is not an object, contribute nothing: `whole_file_aggregate`
+    refuses those by name first, and `generic_wall_time` reads an empty result as a build not measured."""
+    entries = release.get("per_cell_aggregates")
+    if not isinstance(entries, list):
+        return []
+    return [
         a
         for a in entries
-        if a.get("suite_id") == suite and a.get("arch") == arch and a.get("engine", "vep_rs") == "vep_rs"
+        if isinstance(a, dict) and a.get("suite_id") == suite and a.get("arch") == arch and is_vep_rs(a, target_cpu)
     ]
-    if len(hits) != 1:
-        fail(f"the release record has {len(hits)} per_cell_aggregates entries for {suite} on {arch}; one is read")
-    return hits[0]
+
+
+def is_vep_rs(aggregate: dict, target_cpu: str | None) -> bool:
+    """Whether an aggregate times vep-rs built for `target_cpu`: an entry without `target_cpu` is the measured
+    build, the one the archives without a CPU suffix carry; a generic build's cells name their `target_cpu`."""
+    if aggregate.get("engine", "vep_rs") != "vep_rs":
+        return False
+    cpu = aggregate.get("target_cpu")
+    if target_cpu is None:
+        return cpu is None or cpu == MEASURED_CPU.get(aggregate.get("arch"))
+    return cpu == target_cpu
 
 
 def whole_file_wall_time(release: dict, suite: str, arch: str) -> tuple[Decimal, str, int]:
@@ -541,10 +791,10 @@ def six_dataset_blocks(
     of all six) under a caption naming the reference release, both protocols, the instance types and the
     peak memory, then the structural-variant F1 table (per assembly the ClinVar, gnomAD and 1000 Genomes
     sets and the synthetic files pooled) under the caption that the paper's figures stay as published.
-    `All six` carries no wall time: the ClinVar whole-file medians were measured on another instance class
-    and protocol than the per-chromosome sums, so their sum is not a figure. A record's chromosome 21 cells
-    render no row."""
-    vep_rs, types, sums, rows = whole_genome_setup(population)
+    `All six` carries no wall time: the ClinVar whole-file medians and the per-chromosome sums are two protocols,
+    so their sum is not a figure; the caption says whether the two also ran on different classes. A record's
+    chromosome 21 cells render no row."""
+    clones, fork, types, sums, rows = whole_genome_setup(population)
     raw: list[tuple[int, int, int]] = []
     adjusted: list[tuple[int, int, int]] = []
     datasets = pop["per_dataset"]
@@ -562,7 +812,7 @@ def six_dataset_blocks(
         adjusted.append(adjusted_counts)
         rows.append(whole_genome_row(short_label(str(label)), r, arm, x86, where))
     clinvar_types: dict[str, set[str]] = {"arm64": set(), "x86_64": set()}
-    clones: dict[tuple[str, str], int] = {}
+    clinvar_clones: dict[tuple[str, str], int] = {}
     for suite, label in CLINVAR.items():
         cell, where = conc[suite], f"concordance.{suite}"
         i, a, b = int_triple(cell, ("intersection", "perl", "rust"), where)
@@ -570,23 +820,28 @@ def six_dataset_blocks(
         raw.append((i, a, b))
         adjusted.append(adj)
         medians: dict[str, str] = {}
-        for arch, instance_types in clinvar_types.items():
+        for arch, seen in clinvar_types.items():
             seconds, instance_type, n_clones = whole_file_wall_time(release, suite, arch)
             medians[arch] = whole_seconds(seconds)
-            instance_types.add(instance_type)
-            clones[(suite, arch)] = n_clones
+            seen.add(instance_type)
+            clinvar_clones[(suite, arch)] = n_clones
         rows.append(f"| {label} | {f1_9(i, a, b)} | {f1_9(*adj)} | {medians['arm64']} | {medians['x86_64']} |")
     rows.append(f"| All six | {pooled_f1(raw)} | {pooled_f1(adjusted)} | | |")
+    clinvar_pair = {arch: one(seen, f"{ARCH_LABELS[arch]} instance types") for arch, seen in clinvar_types.items()}
+    if clinvar_pair == types:
+        clinvar_classes = "the same classes for the ClinVar files, another protocol"
+    else:
+        clinvar_classes = (
+            f"{classes_clause(clinvar_pair, 'the release record')} for the ClinVar files, another instance class and protocol"
+        )
     caption = (
         f"Whole genome against Ensembl VEP {reference_release(release, pop, population)}: the population datasets "
         "one run per chromosome, each ClinVar release one genome-wide file; wall time is the sum of the "
-        f"per-chromosome medians of {int(vep_rs['n_clones_per_cell'])} machines at {int(population['fork'])} threads on "
-        f"`{types['arm64']}` (ARM) and `{types['x86_64']}` (x86) for the population datasets, and the whole-file "
-        f"median of {clone_count_clause(clones)} machines on `{one(clinvar_types['arm64'], 'ARM instance types')}` (ARM) "
-        f"and `{one(clinvar_types['x86_64'], 'x86 instance types')}` (x86) for the ClinVar files, another instance class "
-        "and protocol, so the `All six` row carries no wall time; peak memory at most "
-        f"{peak_rss_gb(population)} GB on any chromosome; tuple counts, per-chromosome rows and per-file counts are in "
-        f"the [provenance records]({REPO_URL}/tree/v{version}/{record_dir})."
+        f"per-chromosome medians of {clones} machines at {fork} threads on "
+        f"{classes_clause(types, WALL_TIME)} for the population datasets, and the whole-file "
+        f"median of {clone_count_clause(clinvar_clones)} machines on {clinvar_classes}, so the `All six` row carries "
+        f"no wall time; peak memory at most {peak_rss_gb(timed_cells(population))} GB on any chromosome; tuple counts, "
+        f"per-chromosome rows and per-file counts are in the [provenance records]({REPO_URL}/tree/v{version}/{record_dir})."
     )
     sv_caption = (
         "Structural-variant file sets measured on the released binary against the same reference, each set's files "
@@ -611,12 +866,15 @@ def measurements_blocks(repo: Path, version: str) -> list[str]:
     population = load_population_record(repo, version)
     if six_dataset_shape(release, conc):
         return six_dataset_blocks(release, conc, pop, population, record_dir, version)
-    vep_rs, types, sums, rows = whole_genome_setup(population)
+    clones, fork, types, sums, rows = whole_genome_setup(population)
+    generation_label = pair_label(types, WALL_TIME)
+    classes = class_names(types)
+    if generation_label:
+        classes = f"{classes}, {generation_label}"
     caption = (
         f"Whole genome against Ensembl VEP {comparator_version(population, pop, release)}, one run per chromosome; "
-        f"wall time is the sum of the per-chromosome medians of {int(vep_rs['n_clones_per_cell'])} machines "
-        f"at {int(population['fork'])} threads on `{types['arm64']}` (ARM) and `{types['x86_64']}` (x86); "
-        f"peak memory at most {peak_rss_gb(population)} GB on any chromosome; tuple counts and "
+        f"wall time is the sum of the per-chromosome medians of {clones} machines at {fork} threads on {classes}; "
+        f"peak memory at most {peak_rss_gb(timed_cells(population))} GB on any chromosome; tuple counts and "
         f"per-chromosome rows are in the [provenance records]({REPO_URL}/tree/v{version}/{record_dir})."
     )
     total_arm = total_x86 = Decimal(0)
@@ -656,16 +914,64 @@ def read_sums(path: Path) -> dict[str, str]:
     return out
 
 
+def read_floors(path: Path | None, archives: list[str]) -> dict[str, str]:
+    """The glibc floor `check_glibc_floor.py --json` measured for each Linux archive, {archive: version};
+    refused when the file is absent, when a Linux archive in SHA256SUMS has no entry, when an entry names an
+    archive SHA256SUMS lacks, or when a floor is not a version."""
+    if path is None:
+        fail("Linux archives need --glibc-floors, the file check_glibc_floor.py --json writes")
+    if not path.exists():
+        fail(f"no glibc floors at {path}")
+    floors = json.loads(path.read_text())
+    if not isinstance(floors, dict):
+        fail(f"{path} is not an object")
+    missing = [n for n in archives if n not in floors]
+    if missing:
+        fail(f"{path} has no glibc floor for {missing}")
+    extra = [n for n in floors if n not in archives]
+    if extra:
+        fail(f"{path} names {extra}, archives SHA256SUMS lacks")
+    for name, floor in floors.items():
+        if not isinstance(floor, str) or not re.fullmatch(r"\d+(\.\d+)+", floor):
+            fail(f"{path} carries a glibc floor for {name} that is not a version: {floor!r}")
+    return floors
+
+
+def generic_wall_time(release: dict, target: Target) -> str:
+    """How a generic build's wall time compares with the measured archive's on the campaign's generic cell, the
+    genome-wide ClinVar GRCh38 file: the ratio of the two medians when the record carries the generic build's
+    aggregate, else that it was not measured."""
+    if not cell_aggregates(release, GENERIC_SUITE, target.arch, target.target_cpu):
+        return f"wall time against the {MEASURED_CPU[target.arch]} build not measured"
+    where = f"the per_cell_aggregates entry for {GENERIC_SUITE} on {target.arch} of the {target.target_cpu} build"
+    (generic,) = required(whole_file_aggregate(release, GENERIC_SUITE, target.arch, target.target_cpu), ("median_sec",), where)
+    reference, _, _ = whole_file_wall_time(release, GENERIC_SUITE, target.arch)
+    if reference == 0:
+        fail(f"the measured build's {GENERIC_SUITE} median on {target.arch} is zero")
+    ratio = (median_seconds(generic, where) / reference).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return f"{ratio} times the {MEASURED_CPU[target.arch]} build's wall time on {CLINVAR[GENERIC_SUITE]}"
+
+
 def install_bullets(
-    version: str, sums: dict[str, str], commit: str, toolchain: str, rust_version: str, version_doi: str | None
+    version: str,
+    sums: dict[str, str],
+    floors_path: Path | None,
+    release: dict,
+    commit: str,
+    toolchain: str,
+    rust_version: str,
+    version_doi: str | None,
 ) -> str:
-    """One bullet per binary archive in the order of TARGETS, then the archive contents and the source build,
-    the container image, the build and its attestation, and the source archive. Every target's archive and
-    the source archive must be in SHA256SUMS, and every binary archive there must be a known target."""
+    """One bullet per binary archive in the order of TARGETS, each with its platform, the glibc floor measured on
+    its binaries (Linux) and its CPU floor, a generic build's with its wall time against the measured archive;
+    then the archive contents and the source build, the container image, the build and its attestation, and
+    the source archive. Every measured target's archive and the source archive must be in SHA256SUMS, a generic
+    build's archive is listed when present, and every binary archive there must be a known target."""
     tag = f"v{version}"
     dl = f"{REPO_URL}/releases/download/{tag}"
     prefix, suffix = f"vep-{version}-", ".tar.gz"
-    missing = [t for t in TARGETS if f"{prefix}{t}{suffix}" not in sums]
+    archive = {t: f"{prefix}{t}{suffix}" for t in TARGETS}
+    missing = [t for t, target in TARGETS.items() if target.generic_of is None and archive[t] not in sums]
     if missing:
         fail(f"SHA256SUMS lacks the archive for {missing}")
     unknown = [
@@ -676,19 +982,33 @@ def install_bullets(
     src = f"vep-rs-{version}.tar.gz"
     if src not in sums:
         fail(f"SHA256SUMS lacks {src}")
-    bullets = [
-        f"- [`{prefix}{triple}{suffix}`]({dl}/{prefix}{triple}{suffix}): {platform}, {floor}; "
-        f"sha256 `{sums[f'{prefix}{triple}{suffix}']}`"
-        for triple, (platform, floor) in TARGETS.items()
-    ]
+    present = [t for t in TARGETS if archive[t] in sums]
+    floors = read_floors(floors_path, [archive[t] for t in present if t in LINUX])
+    bullets = []
+    for t in present:
+        target = TARGETS[t]
+        clauses = [target.platform]
+        if t in LINUX:
+            clauses.append(f"glibc {floors[archive[t]]} or later")
+        clauses.append(target.cpu)
+        if target.generic_of:
+            clauses.append(generic_wall_time(release, target))
+        bullets.append(f"- [`{archive[t]}`]({dl}/{archive[t]}): {', '.join(clauses)}; sha256 `{sums[archive[t]]}`")
+    if any(TARGETS[t].generic_of for t in present):
+        image = (
+            "linux/amd64 and linux/arm64: the `x86-64-v2` and the generic aarch64 binaries, which run on almost every "
+            f"64-bit host; the single-platform tags `{version}-x86-64-v3` and `{version}-neoverse-v1` carry the measured "
+            "binaries; every image adds the `duckdb` CLI that Parquet output needs"
+        )
+    else:
+        image = "linux/amd64: the x86_64 binaries with the `duckdb` CLI that Parquet output needs"
     doi = f"; version DOI [{version_doi}](https://doi.org/{version_doi})" if version_doi else ""
     bullets += [
         f"- Each archive unpacks to `vep-{version}-<target>/` holding `vep`, `vep-cache-builder` and "
         "`vep-cache-converter`; a binary below its CPU floor aborts with an illegal-instruction fault, so on "
         f"such a host build from source (Rust {rust_version} or later), which compiles for the machine it runs "
         'on: `RUSTFLAGS="-C target-cpu=native" cargo build --release --locked`',
-        f"- Container image: `docker pull ghcr.io/natera-open-source/vep-rs:{version}` (linux/amd64: the x86_64 "
-        "binaries with the `duckdb` CLI that Parquet output needs)",
+        f"- Container image: `docker pull ghcr.io/natera-open-source/vep-rs:{version}` ({image})",
         f"- Built by the [release workflow]({REPO_URL}/actions/workflows/release.yml) from tag `{tag}` "
         f"(commit `{commit}`) with Rust {toolchain}; every file in [`SHA256SUMS`]({dl}/SHA256SUMS) carries a "
         "GitHub build-provenance attestation: `gh attestation verify <file> --repo natera-open-source/vep-rs`",
@@ -706,6 +1026,7 @@ def main() -> None:
     ap.add_argument("--commit", required=True)
     ap.add_argument("--toolchain", required=True)
     ap.add_argument("--sha256sums", required=True, type=Path)
+    ap.add_argument("--glibc-floors", type=Path, help="check_glibc_floor.py --json output: the floor per Linux archive")
     ap.add_argument("--notes", type=Path, help=".github/release-notes/vX.Y.Z.md")
     ap.add_argument("--changelog-section", help="defaults to the version")
     ap.add_argument("--date", help="release date; defaults to the CHANGELOG heading's")
@@ -731,13 +1052,20 @@ def main() -> None:
     blocks = [hand["opener"]]
     if hand["highlights"]:
         blocks += ["## Highlights", hand["highlights"]]
-    if hand["upgrade"]:
-        blocks += ["## Upgrade notes", hand["upgrade"]]
-    blocks += kind_blocks(section)
+    if hand["areas"]:
+        for title in (AREAS, *COMPANIONS):
+            text = hand[HAND_SECTIONS[title]]
+            if text:
+                blocks += [f"## {title}", text]
+    else:
+        if hand["upgrade"]:
+            blocks += ["## Upgrade notes", hand["upgrade"]]
+        blocks += kind_blocks(section)
     blocks += measurements_blocks(repo, v)
+    release = load_release_record(repo, v)[0]
     blocks += [
         "## Install",
-        install_bullets(v, sums, a.commit, a.toolchain, rust_version.group(1), version_doi),
+        install_bullets(v, sums, a.glibc_floors, release, a.commit, a.toolchain, rust_version.group(1), version_doi),
         "## Cite",
         f"Porter M, Borkowski R. vep-rs, version {v}. {date[:4]}. doi:[{cite_doi}](https://doi.org/{cite_doi})",
         f"**Full changelog**: [CHANGELOG]({REPO_URL}/blob/{tag}/CHANGELOG.md) · "

@@ -1,7 +1,7 @@
 // Copyright (c) 2026-present Natera, Inc.
 // Licensed under the Apache License, Version 2.0 (see LICENSE).
 
-//! Targeted concordance tests against Perl VEP.
+//! Targeted concordance tests against Ensembl VEP.
 //!
 //! Each test targets one divergence shape and asserts the **Perl-correct**
 //! behavior. A test marked `#[ignore]` pins a divergence this crate does not
@@ -178,13 +178,13 @@ fn make_reverse_strand_transcript() -> Transcript {
 
 /// Shift the standard test transcript down to small chr1 coordinates so tests can
 /// build compact temporary FASTA fixtures without needing multi-megabase reference files.
-fn make_compact_test_transcript() -> Transcript {
+pub(crate) fn make_compact_test_transcript() -> Transcript {
     compact_on_chr1(make_test_transcript())
 }
 
 /// Move a transcript built at the standard 25 Mb coordinates down by 24,999,900
 /// onto chromosome 1, so a 7,000-base FASTA covers it.
-fn compact_on_chr1(mut tx: Transcript) -> Transcript {
+pub(crate) fn compact_on_chr1(mut tx: Transcript) -> Transcript {
     let shift = 24_999_900;
 
     tx.chr = "1".into();
@@ -2167,7 +2167,9 @@ fn concordance_hgvsc_perl_reverse_strand_reads_the_slice_from_the_transcript_end
 
 /// The compact forward transcript on a 7,000-base reference: exon 1 is 100..399
 /// with CDS 1 at genomic 150, so genomic `g` in exon 1 is CDS `g - 149`.
-fn hgvsc_fasta_fixture(edits: &[(usize, u8)]) -> (tempfile::TempDir, vep_fasta::IndexedFasta) {
+pub(crate) fn hgvsc_fasta_fixture(
+    edits: &[(usize, u8)],
+) -> (tempfile::TempDir, vep_fasta::IndexedFasta) {
     let mut sequence = vec![b'T'; 7000];
     for &(pos, base) in edits {
         sequence[pos - 1] = base;
@@ -2203,13 +2205,13 @@ fn concordance_hgvsc_perl_insertion_matching_preceding_bases_is_dup() {
 /// duplicates the `G` now before it: `c.63dup`, offset 2.
 #[test]
 fn concordance_hgvsc_perl_shifted_insertion_reports_the_offset() {
-    use crate::hgvs::generate_hgvs;
+    use crate::hgvs::{generate_hgvs, HgvsOptions};
 
     let tx = make_compact_test_transcript();
     let (_dir, fasta) = hgvsc_fasta_fixture(&[(211, b'G'), (212, b'G')]);
 
     let variant = InputVariant::new("1".into(), 211, 210, b"-".to_vec(), b"G".to_vec());
-    let hgvs = generate_hgvs(&variant, &tx, Some(&fasta));
+    let hgvs = generate_hgvs(&variant, &tx, Some(&fasta), HgvsOptions::default());
     assert_eq!(hgvs.hgvsc.as_deref(), Some("ENST00000000001.1:c.63dup"));
     assert_eq!(hgvs.offset, Some(2));
 }
@@ -2218,19 +2220,19 @@ fn concordance_hgvsc_perl_shifted_insertion_reports_the_offset() {
 /// `G` at 212 moves one base and is `c.62_63del`, offset 1.
 #[test]
 fn concordance_hgvsc_perl_shifted_deletion_reports_the_offset() {
-    use crate::hgvs::generate_hgvs;
+    use crate::hgvs::{generate_hgvs, HgvsOptions};
 
     let tx = make_compact_test_transcript();
     let (_dir, fasta) = hgvsc_fasta_fixture(&[(210, b'G'), (211, b'G'), (212, b'G')]);
 
     let variant = InputVariant::new("1".into(), 210, 211, b"GG".to_vec(), b"-".to_vec());
-    let hgvs = generate_hgvs(&variant, &tx, Some(&fasta));
+    let hgvs = generate_hgvs(&variant, &tx, Some(&fasta), HgvsOptions::default());
     assert_eq!(hgvs.hgvsc.as_deref(), Some("ENST00000000001.1:c.62_63del"));
     assert_eq!(hgvs.offset, Some(1));
 
     // No matching base after the deletion: it stays put and no offset is emitted.
     let (_dir, fasta) = hgvsc_fasta_fixture(&[(210, b'G'), (211, b'G')]);
-    let hgvs = generate_hgvs(&variant, &tx, Some(&fasta));
+    let hgvs = generate_hgvs(&variant, &tx, Some(&fasta), HgvsOptions::default());
     assert_eq!(hgvs.hgvsc.as_deref(), Some("ENST00000000001.1:c.61_62del"));
     assert_eq!(hgvs.offset, None);
 }
@@ -2241,13 +2243,13 @@ fn concordance_hgvsc_perl_shifted_deletion_reports_the_offset() {
 /// at CDS 62.
 #[test]
 fn concordance_hgvsc_perl_reverse_strand_shift_has_negative_offset() {
-    use crate::hgvs::generate_hgvs;
+    use crate::hgvs::{generate_hgvs, HgvsOptions};
 
     let tx = compact_on_chr1(make_descending_reverse_strand_transcript());
     let (_dir, fasta) = hgvsc_fasta_fixture(&[(5989, b'C'), (5990, b'C')]);
 
     let variant = InputVariant::new("1".into(), 5991, 5990, b"-".to_vec(), b"C".to_vec());
-    let hgvs = generate_hgvs(&variant, &tx, Some(&fasta));
+    let hgvs = generate_hgvs(&variant, &tx, Some(&fasta), HgvsOptions::default());
     assert_eq!(hgvs.hgvsc.as_deref(), Some("ENST00000000001.1:c.62dup"));
     assert_eq!(hgvs.offset, Some(-2));
 }
@@ -2500,7 +2502,8 @@ fn concordance_hgvsp_h19_intronic_deletion_shifted_into_the_cds_has_no_hgvsp() {
             &annotated,
             Some((&shifted, 25_002_000, 25_002_001)),
             &tx,
-            None
+            None,
+            false
         ),
         None
     );
@@ -2535,7 +2538,8 @@ fn concordance_hgvsp_h20_straddling_deletion_is_a_frameshift_on_its_shifted_span
             &annotated,
             Some((&shifted, 25_002_000, 25_002_007)),
             &tx,
-            None
+            None,
+            false
         )
         .as_deref(),
         Some("Ala84GlyfsTer?")
@@ -2565,7 +2569,7 @@ fn concordance_hgvsp_h21_start_codon_reads_met_in_the_transcript_peptide() {
 /// local start and writes it back only after both loops, so its leading-stop
 /// return (`=`) discards the increment and the notation keeps start 282 and end
 /// 283; `_get_hgvs_protein_type` then reads `AX` against `AXG` as `delins` and
-/// the formatter prints the range. A port that moved `start` in place printed
+/// the formatter prints the range. Advancing `start` in place instead prints
 /// `Ala283delinsAlaTer`.
 #[test]
 fn concordance_hgvsp_h22_clip_leading_stop_return_keeps_start() {
@@ -3722,7 +3726,7 @@ fn concordance_frameshift_stop_gained_multicodon_span() {
     );
 }
 
-// start_lost / start_retained_variant asymmetry: Perl VEP's
+// start_lost / start_retained_variant asymmetry: Ensembl VEP's
 // `VariationEffect::inframe_insertion` returns 0 when start_lost fires, so the
 // Met-loss gate in classify_inframe_indel_by_peptide suppresses
 // inframe_insertion, while `inframe_deletion` has no start_lost gate: an inframe
@@ -4383,7 +4387,7 @@ fn concordance_five_prime_utr_deletion_destroying_atg_emits_start_lost() {
 }
 
 // Frameshift / inframe preserved across a splice. The predicate these
-// reproduce is Perl VEP's own, in `Utils::VariationEffect`; each case below
+// reproduce is Ensembl VEP's own, in `Utils::VariationEffect`; each case below
 // states the span shape it pins.
 //
 // Test transcript layout:
@@ -5681,7 +5685,7 @@ fn with_cds_start_at_cdna_49(mut tx: Transcript) -> Transcript {
 ///   exon 2 (cDNA 301..600)  = 25_003_701..25_004_000
 ///   exon 3 (cDNA 601..2601) = 25_000_000..25_002_000
 /// CDS cDNA 51..900, so the coding region is 25_001_701..25_005_950.
-fn make_descending_reverse_strand_transcript() -> Transcript {
+pub(crate) fn make_descending_reverse_strand_transcript() -> Transcript {
     let mut tx = make_test_transcript();
     tx.strand = Strand::Reverse;
     let blocks: [(u64, u64); 3] = [

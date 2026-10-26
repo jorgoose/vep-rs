@@ -6,7 +6,7 @@
 
 `convert-plugin-data` follows one data line from the input file to a verified store. `read_tabix_records` opens the input through a BGZF (blocked gzip) reader, keeps the most recent `#` header line as the column names, and parses each data line into a `TabixRecord`: the chromosome from `--chr-col`, the start from `--start-col` (plus one when `--zero-based` is set), the end from `--end-col` or equal to the start when that flag is absent or the column does not parse, the raw columns, and a shared pointer to the header. A line with fewer columns than `--chr-col` or `--start-col` needs is skipped; a start that is not an integer is an error. Records are grouped by chromosome in a `BTreeMap`, so chromosomes come out in string order (`1`, `10`, `11`, `2`), and each group is sorted by `(start, end)`. `BinaryStoreWriter::write` from `vep-builtins` then writes the column table and the records to the `--output` path and the chromosome and position index to the same path with the extension `.vpdi`. Unless `--no-verify` is set, `verify_concordance` reopens the store through `BinaryAnnotator`, the reader the plugins use at runtime, queries every record's start position when the file holds at most 1,000 records or `--verify-all` is set, otherwise a random sample of 1,000 record positions, and compares record count, column count and every column value against the parsed source; the first ten mismatches are printed and any mismatch is a non-zero exit.
 
-The cache mode follows one region file. `convert_cache` creates the output directory, then `copy_info_json` reads `info.json`, parses it, logs its `species` and `assembly`, and writes the text unchanged; a missing or unparseable `info.json` is an error. `convert_data_files` runs once for `transcripts/` and once for `variations/`: it lists the directory in file-name order, takes each `.json` file, and `parse_region_filename` splits the stem at its last underscore into chromosome and range, so `LRG_485_1-1000000` yields the LRG (Locus Reference Genomic) sequence name `LRG_485` as its chromosome; a stem that does not fit is skipped with a warning. The content must parse as a JSON array (anything else is skipped with a warning); its length is counted and the text is written unchanged to `<output>/transcripts/<chr>/<start>-<end>.json`, the shard layout `vep-cli` enumerates. A missing `variations/` directory is a warning, not an error. `--region-size` is parsed and ignored: the bounds come from the file names.
+The cache mode follows one region file. `convert_cache` creates the output directory, then `copy_info_json` reads `info.json`, parses it, checks what the runtime's cache resolution reads (an object with a non-empty `species` and `assembly`, and a `contig_order` or `variation_cols` that is a list of strings when present), logs its `species` and `assembly`, writes the text unchanged and copies `chr_synonyms.txt` beside it when the source has one; a missing, unparseable or unusable `info.json` is an error. `convert_data_files` runs over `transcripts/`: it lists the directory in file-name order, takes each `.json` file, and `parse_region_filename` splits the stem at its last underscore into chromosome and range, so `LRG_485_1-1000000` yields the LRG (Locus Reference Genomic) sequence name `LRG_485` as its chromosome; a stem that does not fit is skipped with a warning. The content must parse as JSON (a parse failure is an error) and be an array (anything else is skipped with a warning); its length is counted and the text is written unchanged to `<output>/transcripts/<chr>/<start>-<end>.json`, the shard layout `vep-cli` enumerates. `copy_variation_files` runs over `variations/`, which holds the files the Ensembl VEP dumper writes: `all_vars.gz` with its `.csi` or `.tbi` index, or `{start}-{end}_var.gz` region files, under `variations/<chr>/`, or carrying a `{chr}_` prefix directly under `variations/`. `split_flat_variation_name` finds the chromosome in a flat name by trying each underscore until what follows is a variation file name, and each file is copied byte for byte to `<output>/variations/<chr>/`; any other name, flat or under `<chr>/`, is skipped with a warning. An `all_vars.gz` without its index is an error, as is a `.json` file under `variations/`: the annotator reads the dumper's files only. A missing `variations/` directory is a warning, not an error. `CacheManifest::write` then lists every file of the output directory, the manifest itself excepted, in `CHECKSUMS.sha256`, the file `vep-cli` checks each cache file it reads against. `--region-size` is parsed and ignored: the bounds come from the file names.
 
 ## Modules
 
@@ -23,10 +23,15 @@ The functions of `main.rs`:
 | `convert_plugin_data`   | Drives read, write and verification for one plugin data file; logs record counts, sizes and timings.        |
 | `read_tabix_records`    | Streams the BGZF input into `TabixRecord`s grouped by chromosome and sorted by position.                    |
 | `verify_concordance`    | Reopens the store with `BinaryAnnotator` and compares sampled or all positions against the source records.  |
-| `convert_cache`         | Creates the output directory, then runs `copy_info_json` and `convert_data_files` for both subdirectories.  |
-| `copy_info_json`        | Parses `info.json`, logs `species` and `assembly`, copies it unchanged.                                     |
+| `convert_cache`         | Creates the output directory, then runs `copy_info_json`, `convert_data_files` over `transcripts/` and `copy_variation_files` over `variations/`, and last writes `CHECKSUMS.sha256` over every file of the output directory (`vep_core::cache_manifest::CacheManifest::write`). |
+| `copy_info_json`        | Parses and checks `info.json`, logs `species` and `assembly`, copies it unchanged with `chr_synonyms.txt`.  |
+| `validate_info`         | Checks that `info.json` is an object with a non-empty `species` and `assembly`, and that `contig_order` and `variation_cols`, when present, are lists of strings. |
 | `convert_data_files`    | Re-shelves each `{chr}_{start}-{end}.json` region file as `<chr>/<start>-<end>.json`, counting entries.     |
 | `parse_region_filename` | Splits a region file stem at its last underscore into `(chromosome, start, end)`.                           |
+| `copy_variation_files`  | Copies `all_vars.gz` with its index, or the `_var.gz` region files, into `variations/<chr>/`; refuses a `.json` and an unindexed `all_vars.gz`. |
+| `variation_file_kind`   | The `VariationFileKind` a name denotes: `all_vars.gz`, its `.csi` or `.tbi` index, or a `<start>-<end>_var.gz` region file; none for any other name. |
+| `json_shard_error`      | The error refusing a `.json` file under `variations/`.                                                      |
+| `split_flat_variation_name` | Splits a flat `{chr}_<variation file>` name into the chromosome and the file's name under `variations/<chr>/`. |
 
 ## Command line
 
@@ -36,8 +41,8 @@ Cache mode (no subcommand):
 
 | Flag                   | Role                                                                                                        |
 | ---------------------- | ----------------------------------------------------------------------------------------------------------- |
-| `--json-dir <JSON_DIR>` | The flat cache: `{chr}_{start}-{end}.json` region files directly under `transcripts/` and `variations/`.    |
-| `--output-dir <OUTPUT_DIR>` | Where the per-chromosome layout and the copied `info.json` are written. Required.                           |
+| `--json-dir <JSON_DIR>` | The flat cache: `{chr}_{start}-{end}.json` region files under `transcripts/`, the dumper's variation files under `variations/`. |
+| `--output-dir <OUTPUT_DIR>` | Where the per-chromosome layout, the copied `info.json` and `chr_synonyms.txt`, then `CHECKSUMS.sha256` are written. Required. |
 | `--region-size <REGION_SIZE>` | Accepted and ignored; region bounds come from the file names. Default `1000000`.                             |
 
 `convert-plugin-data`:
@@ -74,13 +79,13 @@ vep-cache-converter convert-plugin-data \
   --output whole_genome_SNVs.tsv.vpd
 ```
 
-The unit tests cover `parse_region_filename`. The workspace's standard build, test, lint and format commands are in [the contributing guide](../../CONTRIBUTING.md).
+The unit tests cover `parse_region_filename`, `variation_file_kind`, `split_flat_variation_name`, `copy_variation_files` and `copy_info_json`. The workspace's standard build, test, lint and format commands are in [the contributing guide](../../CONTRIBUTING.md).
 
 ## Related
 
 - [`vep-builtins`](../vep-builtins/README.md): `tabix::TabixRecord`, `binary_store::BinaryStoreWriter` and `binary_store::BinaryAnnotator`, the types the plugin-data path writes and reads back through; its plugins read the `.vpd` store.
 - [`vep-cli`](../vep-cli/README.md): enumerates the `transcripts/<chr>/<start>-<end>.json` shards the cache mode writes. Declared in `Cargo.toml`, not imported by `main.rs`.
-- [`vep-core`](../vep-core/README.md): declared in `Cargo.toml`, not imported by `main.rs`.
+- [`vep-core`](../vep-core/README.md): `cache_manifest::CacheManifest`, whose `write` lists every file of the output directory in `CHECKSUMS.sha256`, and `coordinate::is_cache_path_component`, the check that a chromosome taken from a region file's stem or a `variations/` entry can name one directory of the output.
 - [`vep-cache-builder`](../vep-cache-builder/README.md): writes the per-chromosome layout directly, so a natively built cache needs no conversion.
 - [docs/cache-setup.md](../../docs/cache-setup.md): the routes to the per-chromosome JSON transcript cache the flat copy targets.
 - [docs/plugins/data-files.md § Tabix indexes and `.vpd` stores](../../docs/plugins/data-files.md#tabix-indexes-and-vpd-stores): how a plugin finds a `.vpd` store beside its data file.

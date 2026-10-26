@@ -3,7 +3,7 @@
 
 //! Copy number variation (`<CNV>`, `<CN0>`–`<CN9>`, `<CPX>`) consequence calculation.
 //!
-//! Perl VEP's `VCF.pm` classifies CN alleles by their structural effect:
+//! Ensembl VEP's `VCF.pm` classifies CN alleles by their structural effect:
 //!
 //! - **CN0** → deletion class: transcript_ablation if fully contained, otherwise
 //!   feature_truncation + regional consequences (like `<DEL>`).
@@ -23,14 +23,12 @@ use super::{
     perl_partial_codon,
 };
 use smallvec::{smallvec, SmallVec};
-use vep_core::consequence::{
-    Consequence, ConsequenceList, FeatureType, Impact, TranscriptConsequence,
-};
+use vep_core::consequence::{Consequence, ConsequenceList, Impact, TranscriptConsequence};
 use vep_core::coordinate::Strand;
 use vep_core::transcript::Transcript;
 use vep_core::variant::InputVariant;
 
-/// Structural effect class inferred from the ALT allele, matching Perl VEP's
+/// Structural effect class inferred from the ALT allele, matching Ensembl VEP's
 /// `VCF.pm` classification of CN alleles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CopyNumberClass {
@@ -52,7 +50,7 @@ pub(super) fn is_copy_number_gain(variant: &InputVariant) -> bool {
 /// The copy-number reading of a variant annotated as a copy number variation.
 ///
 /// A variant that carries its record's SO term belongs to a `copy_number_variation`
-/// record, and Perl VEP's `deletion` and `duplication` predicates test that
+/// record, and Ensembl VEP's `deletion` and `duplication` predicates test that
 /// `class_SO_term` alone (VariationEffect.pm), so `<CN0>` beside `<CN2>` is neither
 /// a deletion nor a duplication. The ALT bytes decide only for a variant built
 /// without a record term: CN0 → Deletion, CN2 → Duplication, everything else → Generic.
@@ -96,7 +94,7 @@ pub fn calculate(
     let tx_end = transcript.end;
 
     if sv_end < tx_start.saturating_sub(upstream_distance.max(downstream_distance))
-        || sv_start > tx_end + upstream_distance.max(downstream_distance)
+        || sv_start > tx_end.saturating_add(upstream_distance.max(downstream_distance))
     {
         return None;
     }
@@ -164,7 +162,7 @@ pub fn calculate(
     let is_deletion = cn_class == CopyNumberClass::Deletion;
     let is_duplication = cn_class == CopyNumberClass::Duplication;
 
-    // Perl VEP predicates (only for CN0=deletion and CN2=duplication classes):
+    // Ensembl VEP predicates (only for CN0=deletion and CN2=duplication classes):
     // feature_truncation = within_cdna AND (partial_overlap OR complete_within) AND deletion
     // feature_elongation = within_cdna AND complete_within_feature AND duplication
     let within_cdna = overlaps_any_exon(transcript, sv_start, sv_end);
@@ -245,7 +243,7 @@ pub fn calculate(
     // even when other consequences (intron_variant, etc.) are already present.
     // Perl's within_non_coding_gene excludes mature_miRNA.
     if !is_coding
-        && !transcript.is_nmd_transcript()
+        && !transcript.facts().is_nmd
         && !consequences.iter().any(|c| {
             matches!(
                 c,
@@ -257,7 +255,7 @@ pub fn calculate(
     }
 
     // NMD transcript context is always added alongside other consequences.
-    if transcript.is_nmd_transcript() {
+    if transcript.facts().is_nmd {
         consequences.push(Consequence::NmdTranscriptVariant);
     }
 
@@ -338,45 +336,10 @@ fn build_consequence(
     distance: Option<u64>,
 ) -> TranscriptConsequence {
     TranscriptConsequence {
-        transcript_id: transcript.stable_id.clone(),
-        feature_start: transcript.start,
-        feature_end: transcript.end,
-        gene_id: transcript.gene_stable_id.clone(),
-        gene_symbol: transcript.gene_symbol.clone(),
-        gene_symbol_source: transcript.gene_symbol_source.clone(),
-        hgnc_id: transcript.hgnc_id.clone(),
         consequences,
         impact,
-        biotype: Some(transcript.biotype.clone()),
-        canonical: transcript.canonical,
-        cdna_position: None,
-        cds_position: None,
-        protein_position: None,
-        amino_acids: None,
-        codons: None,
-        protein_id: transcript.protein_id.clone(),
         distance,
-        strand: transcript.strand.as_i8(),
-        exon: None,
-        intron: None,
-        hgvsc: None,
-        hgvsp: None,
-        hgvs_offset: None,
-        sift: None,
-        polyphen: None,
-        domains: Vec::new(),
-        feature_type: FeatureType::Transcript,
-        flags: transcript.flags.clone(),
-        tsl: transcript.tsl,
-        mane_select: transcript.mane_select.clone(),
-        mane_plus_clinical: transcript.mane_plus_clinical.clone(),
-        appris: transcript.appris.clone(),
-        ccds: transcript.ccds.clone(),
-        swissprot: transcript.swissprot.clone(),
-        trembl: transcript.trembl.clone(),
-        refseq: transcript.refseq.clone(),
-        plugin_data: indexmap::IndexMap::new(),
-        loftee_ctx: None,
+        ..TranscriptConsequence::for_transcript(transcript)
     }
 }
 
@@ -388,6 +351,7 @@ mod tests {
     use crate::sv::tests::make_mature_mirna_transcript;
     use crate::test_helpers::make_test_transcript;
 
+    use vep_core::consequence::FeatureType;
     use vep_core::variant::VariantClass;
 
     /// Helper: build a CNV variant with specified alt allele and sv_end.
@@ -614,7 +578,7 @@ mod tests {
 
     #[test]
     fn test_cn2_full_containment_transcript_amplification() {
-        // CN2 is classified as duplication in Perl VEP, so it gets
+        // CN2 is classified as duplication in Ensembl VEP, so it gets
         // transcript_amplification when fully containing.
         let tx = make_test_transcript();
         let v = make_cnv(b"<CN2>", 24_999_000, 25_007_000);
@@ -630,7 +594,7 @@ mod tests {
 
     #[test]
     fn test_cn3_full_containment_context_term_only() {
-        // CN3 is generic copy_number_variation in Perl VEP, so it gets the context
+        // CN3 is generic copy_number_variation in Ensembl VEP, so it gets the context
         // term only when fully containing (no transcript_amplification).
         let tx = make_test_transcript();
         let v = make_cnv(b"<CN3>", 24_999_000, 25_007_000);
@@ -661,7 +625,7 @@ mod tests {
     #[test]
     fn test_generic_cnv_fully_contains_coding_transcript() {
         // Generic CNV (unknown copy number) that fully contains a coding transcript.
-        // Perl VEP: coding_transcript_variant as the sole consequence.
+        // Ensembl VEP: coding_transcript_variant as the sole consequence.
         let tx = make_test_transcript();
         let v = make_cnv(b"<CNV>", 24_999_000, 25_007_000);
         let result = calculate(&v, &tx, 5000, 5000);

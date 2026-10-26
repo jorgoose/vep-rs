@@ -60,7 +60,8 @@ heading-split-level = 3
 "/intended-divergences.html#defect-b-start_lost-and-start_retained_variant-are-both-written-for-one-allele" = "divergences/defect-b.html#defect-b-start_lost-and-start_retained_variant-are-both-written-for-one-allele"
 "/intended-divergences.html#3-start_lost-and-start_retained_variant-emitted-together" = "divergences/defect-b.html#3-start_lost-and-start_retained_variant-emitted-together"
 "/intended-divergences.html#4-class-3-on-the-structural-variant-sets" = "divergences/defect-b.html#4-class-3-on-the-structural-variant-sets"
-"/intended-divergences.html#defect-c-restated-for-release-116-a-record-marked-skipped-is-dropped-before-annotation" = "divergences/defect-c.html#defect-c-restated-for-release-116-a-record-marked-skipped-is-dropped-before-annotation"
+"/intended-divergences.html#defect-c-restated-for-release-116-a-record-marked-skipped-is-dropped-before-annotation" = "divergences/defect-c.html#defect-c-a-record-marked-skipped-is-dropped-before-annotation"
+"/divergences/defect-c.html#defect-c-restated-for-release-116-a-record-marked-skipped-is-dropped-before-annotation" = "defect-c.html#defect-c-a-record-marked-skipped-is-dropped-before-annotation"
 "/intended-divergences.html#5-a-record-ensembl-vep-drops-before-annotation" = "divergences/defect-c.html#5-a-record-ensembl-vep-drops-before-annotation"
 "/intended-divergences.html#defect-p-the-tests-after-the-chromosome-aware-overlap-compare-chromosome-names-the-overlap-did-not-resolve" = "divergences/defect-p.html#defect-p-the-tests-after-the-chromosome-aware-overlap-compare-chromosome-names-the-overlap-did-not-resolve"
 "/intended-divergences.html#23-a-bracket-breakends-own-end-rows-lost-to-the-first-transcript-that-reaches-it" = "divergences/defect-p.html#23-a-bracket-breakends-own-end-rows-lost-to-the-first-transcript-that-reaches-it"
@@ -151,7 +152,7 @@ heading-split-level = 3
 "/intended-divergences.html#122-the-record" = "divergences/cnv-tr.html#122-the-record"
 "/intended-divergences.html#123-what-each-engine-writes" = "divergences/cnv-tr.html#123-what-each-engine-writes"
 "/intended-divergences.html#124-why-ensembl-vep-writes-that" = "divergences/cnv-tr.html#124-why-ensembl-vep-writes-that"
-"/intended-divergences.html#125-why-vep-rs-keeps-the-symbolic-reading-and-why-ensembl-veps-reading-is-not-a-defect" = "divergences/cnv-tr.html#125-why-vep-rs-keeps-the-symbolic-reading-and-why-ensembl-veps-reading-is-not-a-defect"
+"/intended-divergences.html#125-why-vep-rs-keeps-the-symbolic-reading-and-why-ensembl-veps-reading-is-not-a-defect" = "divergences/cnv-tr.html#125-why-the-symbolic-reading-stands-and-why-ensembl-veps-reading-is-not-a-defect"
 "/intended-divergences.html#126-try-it-yourself" = "divergences/cnv-tr.html#126-try-it-yourself"
 "/intended-divergences.html#127-how-the-comparator-treats-this-class" = "divergences/cnv-tr.html#127-how-the-comparator-treats-this-class"
 "/intended-divergences.html#131-what-a-reader-needs-to-know-first" = "divergences/defect-f.html#131-what-a-reader-needs-to-know-first"
@@ -231,11 +232,12 @@ heading-split-level = 3
 "/index.html#authors" = "https://github.com/natera-open-source/vep-rs#authors"
 "/index.html#disclaimer" = "https://github.com/natera-open-source/vep-rs#disclaimer"
 
-# Cache setup: a retired heading id.
+# Cache setup: the page itself, and the SIFT and PolyPhen page.
 "/cache-setup.html#cache-setup-building-or-converting-the-json-transcript-cache" = "cache-setup.html"
+"/cache-setup.html#sift-and-polyphen-predictions" = "cache-predictions.html"
 
 # README sections shown on the Benchmarks, Getting started and Project pages.
-"/index.html#current-release-v040" = "benchmarks/current-release.html#current-release-v040"
+"/index.html#current-release-v040" = "benchmarks/current-release.html#current-release-v050"
 "/index.html#whole-genome-concordance" = "benchmarks/current-release.html#whole-genome-concordance"
 "/index.html#whole-genome-wall-time" = "benchmarks/current-release.html#whole-genome-wall-time"
 "/index.html#structural-variants" = "benchmarks/current-release.html#structural-variants"

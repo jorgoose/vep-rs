@@ -1,8 +1,10 @@
-"""Tests for render_release_notes.py on two input shapes: the repository's own 0.3.2 inputs (the release and
+"""Tests for render_release_notes.py on three inputs: the repository's own 0.3.2 inputs (the release and
 population records, the CHANGELOG section, CITATION.cff, Cargo.toml and the published SHA256SUMS digests),
-copied into a scratch repository that each test may edit, and release and population records of the
-six-dataset shape that the tests build under the same version. The scratch release-notes file keeps the
-repository file's Upgrade notes under an opener within the renderer's budget."""
+copied into a scratch repository that each test may edit; release and population records of the
+six-dataset shape that the tests build under the same version, on the instance classes and clone count a
+test names; and the repository's own 0.4.0 inputs, whose rendering is the published 0.4.0 page. The scratch
+release-notes file keeps the repository file's Upgrade notes under an opener within the renderer's budget; the
+tests of the page by area write their own notes file over the same scratch repository."""
 
 from __future__ import annotations
 
@@ -80,14 +82,21 @@ def fixture_repo(tmp_path: Path) -> Path:
         shutil.copy(record, repo / "docs" / "concordance-provenance" / record.name)
     write_notes(repo, OPENER, f"Upgrade notes\n\n{repository_upgrade_notes()}")
     (repo / "SHA256SUMS").write_text("".join(f"{d}  {n}\n" for n, d in DIGESTS.items()))
+    write_floors(repo, {n: "2.39" for n in DIGESTS if "linux-gnu" in n})
     return repo
+
+
+def write_floors(repo: Path, floors: dict[str, str]) -> None:
+    """The measured glibc floor per Linux archive, the file check_glibc_floor.py --json writes."""
+    (repo / "glibc-floors.json").write_text(json.dumps(floors))
 
 
 def render(repo: Path, *extra: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, str(SCRIPT), "--repo", str(repo), "--version", VERSION, "--previous", PREVIOUS,
-         "--commit", COMMIT, "--toolchain", TOOLCHAIN, "--sha256sums", str(repo / "SHA256SUMS"), *extra],
-        capture_output=True, text=True,
+         "--commit", COMMIT, "--toolchain", TOOLCHAIN, "--sha256sums", str(repo / "SHA256SUMS"),
+         "--glibc-floors", str(repo / "glibc-floors.json"), *extra],
+        check=False, capture_output=True, text=True,
     )
 
 
@@ -146,6 +155,10 @@ def population_record(repo: Path = ROOT) -> dict:
     return json.loads(next((repo / "docs" / "concordance-provenance").glob(f"*-population-v{VERSION}.json")).read_text())
 
 
+def declared_msrv(repo: Path) -> str:
+    return re.search(r'^rust-version = "([^"]+)"', (repo / "Cargo.toml").read_text(), re.MULTILINE).group(1)
+
+
 def expected_whole_genome_rows(repo: Path = ROOT) -> list[str]:
     pop = release_record(repo)["population_concordance"]
     cells = population_record(repo)["wall_time"]["vep_rs"]["per_cell"]
@@ -187,7 +200,7 @@ def changelog_bullets(repo: Path, version: str) -> list[str]:
 
 
 def expected_page(repo: Path) -> str:
-    msrv = re.search(r'^rust-version = "([^"]+)"', (repo / "Cargo.toml").read_text(), re.MULTILINE).group(1)
+    msrv = declared_msrv(repo)
     install = [f"- [`{n}`]({DOWNLOAD}/{n}): {PLATFORMS[n]}; sha256 `{DIGESTS[n]}`" for n in PLATFORMS]
     install += [
         f"- Each archive unpacks to `vep-{VERSION}-<target>/` holding `vep`, `vep-cache-builder` and `vep-cache-converter`; "
@@ -232,7 +245,7 @@ def test_the_0_3_2_page_renders_from_the_repository_files(tmp_path: Path) -> Non
     assert page(repo) == expected_page(repo)
 
 
-def test_the_page_runs_about_sixty_lines_and_is_refused_over_eighty(tmp_path: Path) -> None:
+def test_the_page_runs_about_sixty_lines_and_is_refused_over_four_hundred(tmp_path: Path) -> None:
     repo = fixture_repo(tmp_path)
     lines = page(repo).splitlines()
     assert len(lines) <= 60
@@ -242,9 +255,15 @@ def test_the_page_runs_about_sixty_lines_and_is_refused_over_eighty(tmp_path: Pa
     assert not [l for l in lines if l.startswith((">", "<"))]
     assert "**Full changelog**" not in "\n".join(lines[:-1])
     assert lines[-1].startswith("**Full changelog**: ")
-    write_changelog(repo, "### Changed\n\n" + "".join(f"- Change number {i}.\n" for i in range(45)))
-    m = re.search(r"the page is (\d+) lines; the cap is 80", error(repo))
-    assert m and int(m.group(1)) > 80
+
+    def changed_bullets(n: int) -> None:
+        write_changelog(repo, "### Changed\n\n" + "".join(f"- Change number {i}.\n" for i in range(n)))
+
+    lines_outside_changed = len(lines) - len(changelog_bullets(repo, VERSION))
+    changed_bullets(400 - lines_outside_changed)
+    assert page(repo).count("\n") == 400
+    changed_bullets(401 - lines_outside_changed)
+    assert error(repo) == f"{ERR}the page is 401 lines; the cap is 400\n"
 
 
 def test_whole_genome_table_derives_every_cell_from_the_records(tmp_path: Path) -> None:
@@ -309,6 +328,10 @@ def test_captions_carry_the_comparator_protocol_memory_and_record_link(tmp_path:
         edit_record(repo, "population", set_peak(mb))
         assert f"peak memory at most {shown} GB on any chromosome" in page(repo), mb
 
+    # The earlier page labels a pair of two generations as the six-dataset page does.
+    edit_record(repo, "population", lambda r: r["wall_time"]["vep_rs"].update(instance_types=NEWEST, n_clones_per_cell=5))
+    assert f"medians of 5 machines at 16 threads on {pair(NEWEST)}, {NEWEST_LABEL}; peak memory at most" in page(repo)
+
 
 def test_the_concordance_caption_reads_the_perl_reference_block_when_a_record_carries_one(tmp_path: Path) -> None:
     """A release scored against a later Ensembl VEP names it in a `perl_reference` block (image, digest,
@@ -320,7 +343,7 @@ def test_the_concordance_caption_reads_the_perl_reference_block_when_a_record_ca
         "image": "ensemblorg/ensembl-vep:release_116.2",
         "digest": "sha256:5c57abdc40b637cac198370b4c114777fa24de3336141fdf09d2b0c43cd4b8da",
         "cache_version": 116,
-        "prefix": "population_r116.2_c116_20261020",
+        "prefix": "population_r116.2_c116_fixture",
     }
 
     def name_the_reference(record: dict) -> None:
@@ -342,7 +365,7 @@ def test_the_concordance_caption_reads_the_perl_reference_block_when_a_record_ca
     assert "Whole genome against Ensembl VEP 116.2," in page(repo)
 
     def prefix_only(record: dict) -> None:
-        record["population_concordance"]["perl_reference"] = {"prefix": "population_r116.2_c116_20261020", "cache_version": 116}
+        record["population_concordance"]["perl_reference"] = {"prefix": "population_r116.2_c116_fixture", "cache_version": 116}
 
     edit_record(repo, "release", prefix_only)
     assert "Whole genome against Ensembl VEP 116.2," in page(repo)
@@ -403,7 +426,7 @@ def test_highlights_is_two_to_four_bullets_over_at_least_three_changes(tmp_path:
     assert "## Highlights\n\n- One.\n- Two.\n\n## Fixed\n" in page(repo)
 
 
-def test_upgrade_notes_are_one_to_five_bullets_with_breaking_ones_first(tmp_path: Path) -> None:
+def test_upgrade_notes_are_bullets_with_breaking_ones_first(tmp_path: Path) -> None:
     repo = fixture_repo(tmp_path)
     write_notes(repo, "A release with nothing to upgrade.")
     body = page(repo)
@@ -413,10 +436,141 @@ def test_upgrade_notes_are_one_to_five_bullets_with_breaking_ones_first(tmp_path
     assert "A release.\n\n## Upgrade notes\n\n- **Breaking:** `--old` is gone; pass `--new`.\n* A cache converted for 0.3.0 is valid.\n\n## Changed\n" in page(repo)
     write_notes(repo, "A release.", "Upgrade notes\n\nNothing breaks.\n- A note.")
     assert "'## Upgrade notes' in" in error(repo) and "is bullets only" in error(repo)
-    write_notes(repo, "A release.", "Upgrade notes\n\n" + "".join(f"- Note {i}.\n" for i in range(6)))
-    assert "has 6 bullets; one to five" in error(repo)
+    # No count bounds the section: six bullets render, as would sixty.
+    six_bullets = "".join(f"- Note {i}.\n" for i in range(6))
+    write_notes(repo, "A release.", f"Upgrade notes\n\n{six_bullets}")
+    assert f"## Upgrade notes\n\n{six_bullets}\n## Changed\n" in page(repo)
     write_notes(repo, "A release.", "Upgrade notes\n\n- A note.\n- **Breaking:** `--old` is gone.")
-    assert "lists a **Breaking:** bullet after one that is not" in error(repo)
+    assert "'## Upgrade notes' in" in error(repo) and "lists a Breaking: bullet after one that is not" in error(repo)
+    write_notes(repo, "A release.", "Upgrade notes\n\n- A note.\n- Breaking: `--old` is gone.")
+    assert "lists a Breaking: bullet after one that is not" in error(repo)
+    write_notes(repo, "A release.", "Upgrade notes\n\n- `Breaking:` `--old` is gone.")
+    assert error(repo) == f"{ERR}'## Upgrade notes' in {notes(repo)} marks a breaking change as '`Breaking:`'; the mark is Breaking:\n"
+    # The mark is read after the bullet's own spacing, as a change under an area is.
+    write_notes(repo, "A release.", "Upgrade notes\n\n- A note.\n-  **Breaking:** `--old` is gone.")
+    assert error(repo) == f"{ERR}'## Upgrade notes' in {notes(repo)} lists a Breaking: bullet after one that is not\n"
+
+
+AREAS = """\
+- Input and formats
+  - Breaking: standard input needs `--format`; a run without it exits 1 with Ensembl VEP's message.
+  - Plain gzip and `.bgz` inputs are read.
+  - `--format guess` detects the format from the first data line.
+- Output
+  - Breaking: `<output>_warnings.txt` is written beside the output; `--warning_file STDERR` keeps the old stream.
+  - **Breaking:** `AF` prints four decimals.
+  - `MAX_AF_POPS` lists every tied population.
+- Caches
+  - Converted caches carry the transcript attributes and the variation files.
+  - Breaking the input into batches of 5000 records stays the default."""
+SECURITY = """\
+- Malformed inputs
+  - A FASTA index whose line length is zero is refused with `ERROR: [fasta]`.
+  - A structural-variant allele of an unknown type is skipped with a warning.
+- Every input line is bounded in length."""
+DEPENDENCIES = "- `rustls` 0.23.46 clears four advisories, none reachable from `vep`.\n- The container image carries the `duckdb` CLI 2.0.0."
+REMOVED = "- `--transcript_index_impl` and the index implementations it selected.\n- The unused second VCF parser."
+ONE_AREA = "What changed, by area\n\n- Output\n  - A change."
+
+
+def test_a_page_by_area_renders_its_sections_as_written_in_place_of_the_kind_lists(tmp_path: Path) -> None:
+    """A notes file with `## What changed, by area` renders that section and its three companions byte for
+    byte, nested bullets and inline `Breaking:` marks included, where the flat page carries Upgrade notes and
+    the CHANGELOG kinds; the rest of the page is the flat page's."""
+    repo = fixture_repo(tmp_path)
+    write_notes(
+        repo, "A release.", "Highlights\n\n- One.\n- Two.", f"What changed, by area\n\n{AREAS}",
+        f"Security and robustness\n\n{SECURITY}", f"Dependencies and tooling\n\n{DEPENDENCIES}", f"Removed\n\n{REMOVED}",
+    )
+    body = page(repo)
+    assert body.startswith(
+        f"A release.\n\n## Highlights\n\n- One.\n- Two.\n\n## What changed, by area\n\n{AREAS}\n\n"
+        f"## Security and robustness\n\n{SECURITY}\n\n## Dependencies and tooling\n\n{DEPENDENCIES}\n\n"
+        f"## Removed\n\n{REMOVED}\n\n## Concordance and wall time\n\n"
+    )
+    assert [l for l in body.splitlines() if l.startswith("#")] == [
+        "## Highlights", "## What changed, by area", "## Security and robustness", "## Dependencies and tooling",
+        "## Removed", "## Concordance and wall time", "## Install", "## Cite",
+    ]
+    assert "## Changed" not in body and "## Upgrade notes" not in body and "###" not in body
+    flat = page(fixture_repo(tmp_path / "flat"))
+    assert body.split("## Concordance and wall time", 1)[1] == flat.split("## Concordance and wall time", 1)[1]
+    # The sections render in the page's order whatever the file's, the companions are each optional, an area
+    # name may run to AREA_NAME_CAP characters, and a change wrapped over two lines is one line on the page.
+    name = "A" * 60
+    write_notes(repo, "A release.", f"Removed\n\n{REMOVED}", f"What changed, by area\n\n- {name}\n  - A change wrapped\n    over two lines.\n  - Another.")
+    assert (
+        f"A release.\n\n## What changed, by area\n\n- {name}\n  - A change wrapped over two lines.\n  - Another.\n\n"
+        f"## Removed\n\n{REMOVED}\n\n## Concordance and wall time\n\n"
+    ) in page(repo)
+
+
+@pytest.mark.parametrize(
+    ("sections", "expected"),
+    [
+        (("What changed, by area\n\n- Output\n  - A change.\n    - A detail.",), "'## What changed, by area' in {notes} nests a bullet three levels deep; two is the most"),
+        (("What changed, by area\n\n- Output\n- Caches\n  - A change.",), "the area 'Output' in {notes} has no bullets"),
+        (("What changed, by area\n\n- Output\n  - A change.\n  - Breaking: a late one.",), "the area 'Output' in {notes} lists a Breaking: bullet after one that is not"),
+        (("What changed, by area\n\n- Output\n  - A change.\n  - **Breaking:** a late one.",), "the area 'Output' in {notes} lists a Breaking: bullet after one that is not"),
+        ((f"What changed, by area\n\n- {'A' * 61}\n  - A change.",), f"the area '{'A' * 61}' in {{notes}} is 61 characters; at most 60"),
+        (("What changed, by area\n\n  - A change with no area.",), "'## What changed, by area' in {notes} opens with a nested bullet; a nested bullet sits under one at the margin"),
+        (("What changed, by area\n\n- Output\n - A change.",), "'## What changed, by area' in {notes} indents a bullet by 1; a nested bullet is indented two spaces"),
+        (("What changed, by area\n\nProse first.\n- Output\n  - A change.",), "'## What changed, by area' in {notes} is bullets only, each a '-' bullet"),
+        (("What changed, by area\n\n* Output\n  - A change.",), "'## What changed, by area' in {notes} is bullets only, each a '-' bullet"),
+        (("What changed, by area\n\n- Output\n  * A change.",), "'## What changed, by area' in {notes} is bullets only, each a '-' bullet"),
+        (("What changed, by area\n",), "'## What changed, by area' in {notes} has nothing under its header"),
+        (("What changed, by area\n\n- \n  - A change.",), "'## What changed, by area' in {notes} has a bullet with no text"),
+        (("What changed, by area\n\n- Output\n  - \n  - A change.",), "'## What changed, by area' in {notes} has a bullet with no text"),
+        (("What changed, by area\n\n- Output\n  -\n  - A change.",), "'## What changed, by area' in {notes} has a bullet with no text"),
+        (("What changed, by area\n\n- Output\n  - A change.\n  - ",), "'## What changed, by area' in {notes} has a bullet with no text"),
+        (("What changed, by area\n\n- Output\n  - A change.\n  - BREAKING: a late one.",), "the area 'Output' in {notes} marks a breaking change as 'BREAKING:'; the mark is Breaking:"),
+        (("What changed, by area\n\n- Output\n  - **Breaking**: a first one.",), "the area 'Output' in {notes} marks a breaking change as '**Breaking**:'; the mark is Breaking:"),
+        (("What changed, by area\n\n- Output\n  - Breaking : a first one.",), "the area 'Output' in {notes} marks a breaking change as 'Breaking :'; the mark is Breaking:"),
+        (("What changed, by area\n\n- Output\n  - A change.\n  - Breaking change: a late one.",), "the area 'Output' in {notes} marks a breaking change as 'Breaking change:'; the mark is Breaking:"),
+        (("What changed, by area\n\n- Output\n  - A change.\n  - [Breaking]: a late one.",), "the area 'Output' in {notes} marks a breaking change as '[Breaking]:'; the mark is Breaking:"),
+        (("What changed, by area\n\n- Output\n  - A change.\n  - ~~Breaking:~~ a late one.",), "the area 'Output' in {notes} marks a breaking change as '~~Breaking:~~'; the mark is Breaking:"),
+        (("What changed, by area\n\n- Breaking: `AF` prints four decimals.\n  - A change.",), "the area 'Breaking: `AF` prints four decimals.' in {notes} carries a breaking mark; the mark goes on a change under it"),
+        (("What changed, by area\n\n- BREAKING: output\n  - A change.",), "the area 'BREAKING: output' in {notes} carries a breaking mark; the mark goes on a change under it"),
+        (("What changed, by area\n\n- Output\n  - **Breaking: an unclosed bold mark.",), "the area 'Output' in {notes} marks a breaking change as '**Breaking:'; the mark is Breaking:"),
+        (("What changed, by area\n\n- Output\n  - Breaking:** an odd close.",), "the area 'Output' in {notes} marks a breaking change as 'Breaking:**'; the mark is Breaking:"),
+        (("Removed\n\n- `--gone`.",), "'## Removed' in {notes} needs '## What changed, by area'; without it the page lists the CHANGELOG kinds"),
+        (("Dependencies and tooling\n\n- A bump.", "Upgrade notes\n\n- A note."), "'## Dependencies and tooling' in {notes} needs '## What changed, by area'; without it the page lists the CHANGELOG kinds"),
+        (("Highlights\n", "Upgrade notes\n\n- A note."), "'## Highlights' in {notes} has nothing under its header"),
+        ((ONE_AREA, "Removed\n"), "'## Removed' in {notes} has nothing under its header"),
+        ((ONE_AREA, "Upgrade notes\n\n- **Breaking:** a note."), "'## Upgrade notes' and '## What changed, by area' in {notes} are two shapes of one page"),
+        ((ONE_AREA, "Removed\n\n- A.\n  - B.\n    - C."), "'## Removed' in {notes} nests a bullet three levels deep; two is the most"),
+        ((ONE_AREA, "Security and robustness\n\n- A note.\n- Breaking: a late one."), "'## Security and robustness' in {notes} lists a Breaking: bullet after one that is not"),
+        ((ONE_AREA, "Removed\n\n- A group.\n  - A plain one.\n  - Breaking: a late one."), "'## Removed' under 'A group.' in {notes} lists a Breaking: bullet after one that is not"),
+        ((ONE_AREA, "Dependencies and tooling\n\nProse.\n- A bump."), "'## Dependencies and tooling' in {notes} is bullets only, each a '-' bullet"),
+        ((ONE_AREA, "Removed\n\n- `--gone`.\n- breaking: a late one."), "'## Removed' in {notes} marks a breaking change as 'breaking:'; the mark is Breaking:"),
+        ((ONE_AREA, ONE_AREA), "'## What changed, by area' appears twice in {notes}"),
+    ],
+)
+def test_a_page_by_area_is_refused_for_each_fault_by_its_line(tmp_path: Path, sections: tuple[str, ...], expected: str) -> None:
+    repo = fixture_repo(tmp_path)
+    write_notes(repo, "A release.", *sections)
+    assert error(repo) == f"{ERR}{expected.format(notes=notes(repo))}\n"
+
+
+def test_a_nested_changelog_keeps_every_bullet_on_the_flat_page_and_counts_its_changes(tmp_path: Path) -> None:
+    """A CHANGELOG kind whose bullets are grouped by area (`- <Area>` with `  - ` entries) renders every line
+    on the flat page, each entry's wrapped lines joined; the Highlights rule counts the entries, not the groups."""
+    repo = fixture_repo(tmp_path)
+    write_notes(repo, "A release.", "Highlights\n\n- One.\n- Two.")
+    write_changelog(
+        repo,
+        "### Changed\n\n- Input and formats\n  - `--format guess` detects the format\n    from the first data line. (#N)\n"
+        "  - Plain gzip is read. (#N)\n  - `.bgz` is read. (#N)\n\n### Removed\n\n- `--gone`. (#N)",
+    )
+    assert (
+        "## Changed\n\n- Input and formats\n  - `--format guess` detects the format from the first data line. (#N)\n"
+        "  - Plain gzip is read. (#N)\n  - `.bgz` is read. (#N)\n\n## Removed\n\n- `--gone`. (#N)\n\n## Concordance"
+    ) in page(repo)
+    write_changelog(repo, "### Changed\n\n- Input and formats\n  - Plain gzip is read. (#N)\n- Output\n  - `AF` prints four decimals. (#N)")
+    assert "needs at least three CHANGELOG bullets; the section has 2" in error(repo)
+    # A list-looking line inside a fenced block under a bullet is code, not a change.
+    write_changelog(repo, "### Changed\n\n- One:\n  ```\n  - a\n  - b\n  ```")
+    assert error(repo) == f"{ERR}'## Highlights' needs at least three CHANGELOG bullets; the section has 1\n"
 
 
 def test_kind_headers_rise_to_level_two_in_file_order_and_an_empty_kind_is_absent(tmp_path: Path) -> None:
@@ -455,7 +609,9 @@ def test_install_lists_every_archive_in_target_order_with_its_digest(tmp_path: P
     assert len(install) == 7 and all(l.startswith("- ") for l in install)
     assert [l.split("`")[1] for l in install[:3]] == list(PLATFORMS)
     assert [l.rsplit("`", 2)[1] for l in install[:3]] == [DIGESTS[n] for n in PLATFORMS]
-    assert install[3].startswith("- Each archive unpacks to `vep-0.3.2-<target>/`") and "Rust 1.88 or later" in install[3]
+    msrv = declared_msrv(repo)
+    assert install[3].startswith("- Each archive unpacks to `vep-0.3.2-<target>/`") and f"Rust {msrv} or later" in install[3]
+    assert [l.split(": ", 1)[1].rsplit("; sha256", 1)[0] for l in install[:3]] == [PLATFORMS[n] for n in PLATFORMS]
     assert install[4] == (
         "- Container image: `docker pull ghcr.io/natera-open-source/vep-rs:0.3.2` (linux/amd64: the x86_64 binaries "
         "with the `duckdb` CLI that Parquet output needs)"
@@ -478,6 +634,131 @@ def test_install_refuses_an_incomplete_or_unknown_sha256sums(tmp_path: Path) -> 
     assert "SHA256SUMS lists ['vep-0.3.2-riscv64gc-unknown-linux-gnu.tar.gz'], archives of no known target" in error(repo)
     sums.unlink()
     assert "no SHA256SUMS at" in error(repo)
+
+
+GENERIC_DIGESTS = {
+    "vep-0.3.2-x86_64-unknown-linux-gnu-v2.tar.gz": "1" * 64,
+    "vep-0.3.2-aarch64-unknown-linux-gnu-generic.tar.gz": "2" * 64,
+}
+GENERIC_PLATFORMS = {
+    "vep-0.3.2-x86_64-unknown-linux-gnu-v2.tar.gz": (
+        "Linux x86_64, glibc 2.17 or later, x86-64-v2 (SSE4.2, POPCNT: Intel Nehalem 2008 or later, AMD Bulldozer 2011 "
+        "or later, and VMs that hide AVX2)"
+    ),
+    "vep-0.3.2-aarch64-unknown-linux-gnu-generic.tar.gz": (
+        "Linux aarch64, glibc 2.17 or later, Armv8.0-A with NEON (any 64-bit Arm: AWS Graviton2, Ampere Altra, "
+        "Raspberry Pi, Apple silicon under Linux)"
+    ),
+}
+
+
+def with_generic_archives(repo: Path, floors: dict[str, str]) -> None:
+    """SHA256SUMS listing the two generic archives beside the three measured ones, with the given floors."""
+    (repo / "SHA256SUMS").write_text("".join(f"{d}  {n}\n" for n, d in {**DIGESTS, **GENERIC_DIGESTS}.items()))
+    write_floors(repo, floors)
+
+
+def install_lines(body: str) -> list[str]:
+    return body.split("## Install\n\n")[1].split("\n\n## Cite")[0].splitlines()
+
+
+def test_install_states_the_glibc_floor_measured_on_each_linux_archive(tmp_path: Path) -> None:
+    repo = fixture_repo(tmp_path)
+    write_floors(repo, {"vep-0.3.2-x86_64-unknown-linux-gnu.tar.gz": "2.17", "vep-0.3.2-aarch64-unknown-linux-gnu.tar.gz": "2.28"})
+    install = install_lines(page(repo))
+    assert "Linux x86_64, glibc 2.17 or later, x86-64-v3" in install[0]
+    assert "Linux aarch64, glibc 2.28 or later, Armv8.4-A with SVE" in install[1]
+    assert "glibc" not in install[2] and install[2].split("`")[1] == "vep-0.3.2-aarch64-apple-darwin.tar.gz"
+
+
+def test_install_refuses_floors_that_are_absent_incomplete_stale_or_not_versions(tmp_path: Path) -> None:
+    repo = fixture_repo(tmp_path)
+    floors = repo / "glibc-floors.json"
+    out = render(repo, "--glibc-floors", str(tmp_path / "absent.json"))
+    assert out.returncode == 1 and "no glibc floors at" in out.stderr
+    write_floors(repo, {"vep-0.3.2-x86_64-unknown-linux-gnu.tar.gz": "2.17"})
+    assert "has no glibc floor for ['vep-0.3.2-aarch64-unknown-linux-gnu.tar.gz']" in error(repo)
+    write_floors(repo, {n: "2.17" for n in DIGESTS if "linux-gnu" in n} | {"vep-0.3.2-riscv64gc-unknown-linux-gnu.tar.gz": "2.17"})
+    assert "names ['vep-0.3.2-riscv64gc-unknown-linux-gnu.tar.gz'], archives SHA256SUMS lacks" in error(repo)
+    write_floors(repo, {n: "2.17" for n in DIGESTS if "linux-gnu" in n} | {"vep-0.3.2-x86_64-unknown-linux-gnu.tar.gz": "glibc 2.17"})
+    assert "carries a glibc floor for vep-0.3.2-x86_64-unknown-linux-gnu.tar.gz that is not a version: 'glibc 2.17'" in error(repo)
+    floors.write_text("[]")
+    assert f"{floors} is not an object" in error(repo)
+    out = subprocess.run(
+        [sys.executable, str(SCRIPT), "--repo", str(repo), "--version", VERSION, "--previous", PREVIOUS, "--commit", COMMIT,
+         "--toolchain", TOOLCHAIN, "--sha256sums", str(repo / "SHA256SUMS")],
+        check=False, capture_output=True, text=True,
+    )
+    assert out.returncode == 1 and "Linux archives need --glibc-floors" in out.stderr
+
+
+def test_generic_archives_follow_their_measured_archive_with_their_own_cpu_floor(tmp_path: Path) -> None:
+    """A release with the two generic builds lists five archives, x86_64 then aarch64 then macOS, each generic
+    archive right after the measured archive of its architecture; a record without the generic builds' cells
+    says their wall time was not measured, and the container bullet names both platforms and the fast tags."""
+    repo = fixture_repo(tmp_path)
+    with_generic_archives(repo, {n: "2.17" for n in {**DIGESTS, **GENERIC_DIGESTS} if "linux-gnu" in n})
+    install = install_lines(page(repo))
+    assert len(install) == 9
+    names = [l.split("`")[1] for l in install[:5]]
+    assert names == [
+        "vep-0.3.2-x86_64-unknown-linux-gnu.tar.gz", "vep-0.3.2-x86_64-unknown-linux-gnu-v2.tar.gz",
+        "vep-0.3.2-aarch64-unknown-linux-gnu.tar.gz", "vep-0.3.2-aarch64-unknown-linux-gnu-generic.tar.gz",
+        "vep-0.3.2-aarch64-apple-darwin.tar.gz",
+    ]
+    for line in install[:5]:
+        name = line.split("`")[1]
+        digest = {**DIGESTS, **GENERIC_DIGESTS}[name]
+        assert line.endswith(f"; sha256 `{digest}`")
+    assert install[1] == (
+        f"- [`vep-0.3.2-x86_64-unknown-linux-gnu-v2.tar.gz`]({DOWNLOAD}/vep-0.3.2-x86_64-unknown-linux-gnu-v2.tar.gz): "
+        f"{GENERIC_PLATFORMS['vep-0.3.2-x86_64-unknown-linux-gnu-v2.tar.gz']}, wall time against the x86-64-v3 build "
+        f"not measured; sha256 `{'1' * 64}`"
+    )
+    assert install[3] == (
+        f"- [`vep-0.3.2-aarch64-unknown-linux-gnu-generic.tar.gz`]({DOWNLOAD}/vep-0.3.2-aarch64-unknown-linux-gnu-generic.tar.gz): "
+        f"{GENERIC_PLATFORMS['vep-0.3.2-aarch64-unknown-linux-gnu-generic.tar.gz']}, wall time against the neoverse-v1 build "
+        f"not measured; sha256 `{'2' * 64}`"
+    )
+    assert install[6] == (
+        "- Container image: `docker pull ghcr.io/natera-open-source/vep-rs:0.3.2` (linux/amd64 and linux/arm64: the "
+        "`x86-64-v2` and the generic aarch64 binaries, which run on almost every 64-bit host; the single-platform tags "
+        "`0.3.2-x86-64-v3` and `0.3.2-neoverse-v1` carry the measured binaries; every image adds the `duckdb` CLI that "
+        "Parquet output needs)"
+    )
+    assert all(l.startswith("- ") for l in install)
+
+
+def generic_cells(record: dict) -> None:
+    """The campaign's generic-build cells: ClinVar GRCh38 on each architecture, named by `target_cpu`, beside the
+    measured build's cells; the measured build's own cells may name their CPU too."""
+    s02 = {a["arch"]: a for a in record["per_cell_aggregates"] if a["suite_id"] == "s02"}
+    record["per_cell_aggregates"] += [
+        {**s02["arm64"], "target_cpu": "generic", "median_sec": 14.0},  # 14.0 / 12.5
+        {**s02["x86_64"], "target_cpu": "x86-64-v2", "median_sec": 24.05},  # 24.05 / 21.2
+    ]
+    s02["arm64"]["target_cpu"] = "neoverse-v1"
+
+
+def test_generic_archives_state_their_wall_time_against_the_measured_build_from_the_record(tmp_path: Path) -> None:
+    repo = six_dataset_repo(tmp_path)
+    with_generic_archives(repo, {n: "2.17" for n in {**DIGESTS, **GENERIC_DIGESTS} if "linux-gnu" in n})
+    before = page(repo)
+    edit_record(repo, "release", generic_cells)
+    body = page(repo)
+    install = install_lines(body)
+    assert "x86-64-v2 (SSE4.2, POPCNT: Intel Nehalem 2008 or later, AMD Bulldozer 2011 or later, and VMs that hide AVX2), 1.13 times the x86-64-v3 build's wall time on ClinVar GRCh38; sha256" in install[1]
+    assert "Apple silicon under Linux), 1.12 times the neoverse-v1 build's wall time on ClinVar GRCh38; sha256" in install[3]
+    # The generic cells change nothing else: the measured build's ClinVar rows and caption read as before.
+    assert concordance_section(body) == concordance_section(before)
+    edit_record(repo, "release", lambda r: r["per_cell_aggregates"].append({**aggregate(r, "s02", "arm64"), "target_cpu": "generic"}))
+    assert "the release record has 2 per_cell_aggregates entries for s02 on arm64 of the generic build; one is read" in error(repo)
+    edit_record(repo, "release", lambda r: r["per_cell_aggregates"].pop())
+    edit_record(repo, "release", lambda r: aggregate(r, "s02", "arm64").update(median_sec=0))
+    assert "the measured build's s02 median on arm64 is zero" in error(repo)
+    edit_record(repo, "release", lambda r: aggregate(r, "s02", "arm64").update(median_sec=12.5))
+    edit_record(repo, "release", lambda r: next(a for a in r["per_cell_aggregates"] if a.get("target_cpu") == "generic").update(median_sec="slow"))
+    assert "the per_cell_aggregates entry for s02 on arm64 of the generic build carries a median_sec that is not a number: 'slow'" in error(repo)
 
 
 def test_cite_and_source_archive_carry_the_version_doi_when_minted(tmp_path: Path) -> None:
@@ -513,10 +794,12 @@ def test_dry_run_renders_the_unreleased_section_with_a_given_date(tmp_path: Path
     assert "vep-rs, version 0.3.2. 2031. doi:" in body
 
 
-def test_the_notes_file_is_an_opener_plus_highlights_and_upgrade_notes_only(tmp_path: Path) -> None:
+def test_the_notes_file_carries_only_the_known_sections(tmp_path: Path) -> None:
     repo = fixture_repo(tmp_path)
     write_notes(repo, "A release.", "Known issues\n\n- An issue.")
     assert "unknown section '## Known issues'" in error(repo)
+    write_notes(repo, "A release.", "Highlights\n\n- One.\n- Two.", "Highlights\n\n- Three.\n- Four.")
+    assert error(repo) == f"{ERR}'## Highlights' appears twice in {notes(repo)}\n"
 
 
 def test_missing_records_or_changelog_section_fail(tmp_path: Path) -> None:
@@ -596,6 +879,14 @@ WALL = {  # dataset: per-chromosome medians on arm64, then on x86_64; the sums c
 CLINVAR_WALL = {("s01", "arm64"): 4.31, ("s01", "x86_64"): 6.9, ("s02", "arm64"): 12.5, ("s02", "x86_64"): 21.2}
 COMPUTE = {"arm64": "c8gd.8xlarge", "x86_64": "c8id.8xlarge"}
 MEMORY = {"arm64": "r8gd.8xlarge", "x86_64": "r8id.8xlarge"}
+# A pair of two generations: a 9th-generation ARM class beside the 8th-generation x86 class.
+NEWEST = {"arm64": "c9gd.8xlarge", "x86_64": "c8id.8xlarge"}
+NEWEST_MEMORY = {"arm64": "r9gd.8xlarge", "x86_64": "r8id.8xlarge"}
+NEWEST_LABEL = "the newest available class per architecture"
+
+
+def pair(types: dict[str, str]) -> str:
+    return f"`{types['arm64']}` (ARM) and `{types['x86_64']}` (x86)"
 
 
 class FileCounts(NamedTuple):
@@ -619,9 +910,10 @@ def sv_files(suite: str) -> dict[str, FileCounts]:
     return out
 
 
-def six_dataset_records() -> tuple[dict, dict]:
+def six_dataset_records(compute: dict[str, str] = COMPUTE, clinvar: dict[str, str] = MEMORY, clones: int = 20) -> tuple[dict, dict]:
     """The release and population records of the six-dataset shape, every float field a coarse or wrong
-    rounding of the counts beside it."""
+    rounding of the counts beside it; the whole genome timed on `compute`, the ClinVar files on `clinvar`,
+    both by `clones` machines per cell."""
     per_dataset = [
         {"dataset": ds, "label": label, "assembly": asm, "perl_tuples": p, "vep_rs_tuples": r, "intersection": i,
          "excluded_perl": xp, "excluded_rust": xr, "raw_f1": 0.5, "adjusted_f1": 0.5}
@@ -644,10 +936,10 @@ def six_dataset_records() -> tuple[dict, dict]:
             },
         }
     aggregates = [
-        {"arch": arch, "suite_id": s, "median_sec": sec, "instance_type": MEMORY[arch], "n_clones": 20}
+        {"arch": arch, "suite_id": s, "median_sec": sec, "instance_type": clinvar[arch], "n_clones": clones}
         for (s, arch), sec in CLINVAR_WALL.items()
     ]
-    aggregates += [{"arch": a, "suite_id": s, "median_sec": 1.5, "instance_type": MEMORY[a], "n_clones": 20} for s in SV_CELLS for a in MEMORY]
+    aggregates += [{"arch": a, "suite_id": s, "median_sec": 1.5, "instance_type": clinvar[a], "n_clones": clones} for s in SV_CELLS for a in clinvar]
     release = {
         "release": TAG, "record": "release-addendum", "concordance": conc, "per_cell_aggregates": aggregates,
         "perl_reference": {
@@ -660,8 +952,8 @@ def six_dataset_records() -> tuple[dict, dict]:
         },
     }
     per_cell = [
-        {"dataset": ds, "label": label, "assembly": asm, "chromosome": str(c), "arch": arch, "instance_type": COMPUTE[arch],
-         "n_clones": 20, "median_sec": sec, "peak_rss_mb_median": 2_501.0 if (ds, c, arch) == ("gnomad_v4.1_genomes", 2, "x86_64") else 1_900.0}
+        {"dataset": ds, "label": label, "assembly": asm, "chromosome": str(c), "arch": arch, "instance_type": compute[arch],
+         "n_clones": clones, "median_sec": sec, "peak_rss_mb_median": 2_501.0 if (ds, c, arch) == ("gnomad_v4.1_genomes", 2, "x86_64") else 1_900.0}
         for ds, label, asm, *_ in POPULATION
         for arch, medians in zip(("arm64", "x86_64"), WALL[ds])
         for c, sec in enumerate(medians, 1)
@@ -669,7 +961,7 @@ def six_dataset_records() -> tuple[dict, dict]:
     population = {
         "release": TAG, "record": "population-measurements", "fork": 16,
         "wall_time": {
-            "vep_rs": {"engine": "vep-rs", "engine_version": TAG, "instance_types": COMPUTE, "n_clones_per_cell": 20, "per_cell": per_cell},
+            "vep_rs": {"engine": "vep-rs", "engine_version": TAG, "instance_types": compute, "n_clones_per_cell": clones, "per_cell": per_cell},
             "ensembl_vep": {"engine": "ensembl_vep", "engine_version": "release_115.2", "instance_types": MEMORY},
         },
         "perl_reference": {**REFERENCE, "prefix": "population_r116.2_c116_fixture"},
@@ -677,14 +969,14 @@ def six_dataset_records() -> tuple[dict, dict]:
     return release, population
 
 
-def six_dataset_repo(tmp_path: Path) -> Path:
+def six_dataset_repo(tmp_path: Path, **shape) -> Path:
     """The 0.3.2 scratch repository with its two records replaced by records of the six-dataset shape under
     the same version: the renderer reads the shape from the record, never from the version."""
     repo = fixture_repo(tmp_path)
     records = repo / "docs" / "concordance-provenance"
     for old in records.glob(f"*-v{VERSION}.json"):
         old.unlink()
-    release, population = six_dataset_records()
+    release, population = six_dataset_records(**shape)
     (records / f"six-dataset-release-v{VERSION}.json").write_text(json.dumps(release))
     (records / f"six-dataset-population-v{VERSION}.json").write_text(json.dumps(population))
     return repo
@@ -694,7 +986,20 @@ def pooled(cells: list[tuple[int, int, int]]) -> str:
     return f1(sum(c[0] for c in cells), sum(c[1] for c in cells), sum(c[2] for c in cells))
 
 
-def expected_six_dataset_section() -> list[str]:
+def expected_caption(clones: int, population_classes: str, clinvar_classes: str) -> str:
+    """The six-dataset caption over the fixture records: `population_classes` is the pair the whole genome was
+    timed on, `clinvar_classes` the pair the ClinVar files were timed on with what differs from the whole-genome
+    measurement."""
+    return (
+        "Whole genome against Ensembl VEP 116.2: the population datasets one run per chromosome, each ClinVar release one "
+        f"genome-wide file; wall time is the sum of the per-chromosome medians of {clones} machines at 16 threads on "
+        f"{population_classes} for the population datasets, and the whole-file median of {clones} machines on "
+        f"{clinvar_classes}, so the `All six` row carries no wall time; peak memory at most 2.6 GB on any chromosome; tuple "
+        f"counts, per-chromosome rows and per-file counts are in the [provenance records]({REPO_URL}/tree/{TAG}/docs/concordance-provenance)."
+    )
+
+
+def expected_six_dataset_section(caption: str | None = None) -> list[str]:
     raw: list[tuple[int, int, int]] = []
     adjusted: list[tuple[int, int, int]] = []
     rows = ["| Dataset | Raw F1 | Adjusted F1 | ARM (s) | x86 (s) |", "| --- | --- | --- | --- | --- |"]
@@ -717,14 +1022,8 @@ def expected_six_dataset_section() -> list[str]:
             raw_files = [(files[n].intersection, files[n].perl, files[n].rust) for n in names]
             adjusted_files = [(files[n].adj_intersection, files[n].adj_perl, files[n].adj_rust) for n in names]
             sv.append(f"| {label} | {assembly} | {pooled(raw_files)} | {pooled(adjusted_files)} |")
-    caption = (
-        "Whole genome against Ensembl VEP 116.2: the population datasets one run per chromosome, each ClinVar release one "
-        "genome-wide file; wall time is the sum of the per-chromosome medians of 20 machines at 16 threads on `c8gd.8xlarge` "
-        "(ARM) and `c8id.8xlarge` (x86) for the population datasets, and the whole-file median of 20 machines on "
-        "`r8gd.8xlarge` (ARM) and `r8id.8xlarge` (x86) for the ClinVar files, another instance class and protocol, so the "
-        "`All six` row carries no wall time; peak memory at most 2.6 GB on any chromosome; tuple counts, per-chromosome rows "
-        f"and per-file counts are in the [provenance records]({REPO_URL}/tree/{TAG}/docs/concordance-provenance)."
-    )
+    if caption is None:
+        caption = expected_caption(20, pair(COMPUTE), f"{pair(MEMORY)} for the ClinVar files, another instance class and protocol")
     sv_caption = (
         "Structural-variant file sets measured on the released binary against the same reference, each set's files pooled by "
         "summed counts; the paper's own figures stay as published in "
@@ -777,6 +1076,37 @@ def test_six_dataset_records_render_six_rows_all_six_and_the_eight_structural_va
 
     edit_record(repo, "release", add_development_cells_and_spoil_floats)
     assert page(repo) == body
+
+
+def test_a_pair_of_two_generations_is_labelled_the_newest_available_class_per_architecture(tmp_path: Path) -> None:
+    """Records timed on a 9th-generation ARM class beside the 8th-generation x86 class, five machines per cell,
+    the ClinVar files on the whole genome's classes: the caption labels the pair, carries the record's clone
+    count and says the ClinVar files differ in protocol alone; a same-generation pair carries no label."""
+    repo = six_dataset_repo(tmp_path, compute=NEWEST, clinvar=NEWEST, clones=5)
+    body = page(repo)
+    section = concordance_section(body)
+    caption, table, sv_caption, sv_table = expected_six_dataset_section(
+        expected_caption(5, f"{pair(NEWEST)}, {NEWEST_LABEL},", "the same classes for the ClinVar files, another protocol")
+    )
+    assert section == f"{caption}\n\n{table}\n\n{sv_caption}\n\n{sv_table}"
+    assert caption.count(NEWEST_LABEL) == 1 and caption.count("5 machines") == 2 and caption.count("c9gd.8xlarge") == 1
+    assert "20 machines" not in section and "another instance class" not in section
+    assert "c8gd" not in section and "r8gd" not in section and "r8id" not in section
+    assert len(body.splitlines()) <= 60
+
+    # The label follows each pair's own generations: the whole genome's pair alone, the ClinVar pair alone, neither.
+    repo = six_dataset_repo(tmp_path / "clinvar-on-the-memory-class", compute=NEWEST, clinvar=MEMORY, clones=5)
+    assert expected_caption(
+        5, f"{pair(NEWEST)}, {NEWEST_LABEL},", f"{pair(MEMORY)} for the ClinVar files, another instance class and protocol"
+    ) in page(repo)
+    repo = six_dataset_repo(tmp_path / "clinvar-on-the-newer-memory-class", clinvar=NEWEST_MEMORY)
+    assert expected_caption(
+        20, pair(COMPUTE), f"{pair(NEWEST_MEMORY)}, {NEWEST_LABEL}, for the ClinVar files, another instance class and protocol"
+    ) in page(repo)
+    repo = six_dataset_repo(tmp_path / "one-generation-throughout", clinvar=COMPUTE)
+    body = page(repo)
+    assert expected_caption(20, pair(COMPUTE), "the same classes for the ClinVar files, another protocol") in body
+    assert NEWEST_LABEL not in body
 
 
 def test_six_dataset_adjusted_f1_is_computed_from_the_adjusted_counts(tmp_path: Path) -> None:
@@ -973,7 +1303,84 @@ def add_an_ensembl_vep_twin(record: dict) -> None:
     record["per_cell_aggregates"].append({**aggregate(record, "s01", "arm64"), "engine": "ensembl_vep", "median_sec": 999})
 
 
+def released(record: dict) -> dict:
+    return record["wall_time"]["vep_rs"]
+
+
+def retime_clinvar(record: dict, arch: str, instance_type: str) -> None:
+    for a in record["per_cell_aggregates"]:
+        if a["arch"] == arch:
+            a["instance_type"] = instance_type
+
+
+RELEASED = "the population record's wall_time.vep_rs"
 SIX_DATASET_PROBES = [  # record kind, its edit, then the exact ERROR line or a line of the page that renders
+    pytest.param(
+        "population", lambda r: drop_keys(r, "wall_time"),
+        ERR + "the population record carries no wall_time", id="no-wall-time",
+    ),
+    pytest.param(
+        "population", lambda r: drop_keys(r["wall_time"], "vep_rs"),
+        ERR + "the population record's wall_time carries no vep_rs", id="no-released-binary-under-wall-time",
+    ),
+    pytest.param(
+        "population", lambda r: r["wall_time"].update(vep_rs=[1]),
+        ERR + f"{RELEASED} is not an object", id="a-wall-time-block-that-is-a-list",
+    ),
+    pytest.param(
+        "population", lambda r: drop_keys(released(r), "instance_types"),
+        ERR + f"{RELEASED} carries no instance_types", id="no-instance-types",
+    ),
+    pytest.param(
+        "population", lambda r: drop_keys(released(r), "n_clones_per_cell"),
+        ERR + f"{RELEASED} carries no n_clones_per_cell", id="no-clone-count",
+    ),
+    pytest.param(
+        "population", lambda r: drop_keys(released(r), "instance_types", "n_clones_per_cell"),
+        ERR + f"{RELEASED} carries no instance_types, n_clones_per_cell", id="neither-instance-types-nor-clone-count",
+    ),
+    pytest.param(
+        "population", lambda r: released(r).update(n_clones_per_cell=5.0),
+        ERR + f"{RELEASED} carries n_clones_per_cell that is not an integer: 5.0", id="a-clone-count-that-is-not-an-integer",
+    ),
+    pytest.param(
+        "population", lambda r: drop_keys(r, "fork"),
+        ERR + "the population record carries no fork", id="no-fork",
+    ),
+    pytest.param(
+        "population", lambda r: r.update(fork="16"),
+        ERR + "the population record carries fork that is not an integer: '16'", id="a-fork-that-is-not-an-integer",
+    ),
+    pytest.param(
+        "population", lambda r: drop_keys(released(r)["instance_types"], "x86_64"),
+        ERR + f"{RELEASED}.instance_types carries no x86_64", id="no-x86-instance-type",
+    ),
+    pytest.param(
+        "population", lambda r: released(r).update(instance_types="c8gd.8xlarge"),
+        ERR + f"{RELEASED}.instance_types carries no arm64, x86_64", id="instance-types-that-are-one-string",
+    ),
+    pytest.param(
+        "population", lambda r: released(r)["instance_types"].update(arm64=7),
+        ERR + f"{RELEASED}.instance_types carries arm64 that is not a string: 7", id="an-instance-type-that-is-not-a-string",
+    ),
+    pytest.param(
+        "population", lambda r: released(r)["instance_types"].update(arm64="metal"),
+        ERR + f"{RELEASED} names the instance type 'metal', whose name carries no generation number",
+        id="an-instance-type-without-a-generation",
+    ),
+    pytest.param(
+        "release", lambda r: retime_clinvar(r, "x86_64", "metal"),
+        ERR + "the release record names the instance type 'metal', whose name carries no generation number",
+        id="a-clinvar-instance-type-without-a-generation",
+    ),
+    pytest.param(
+        "population", lambda r: drop_keys(released(r), "per_cell"),
+        ERR + f"{RELEASED} carries no per_cell", id="no-per-cell",
+    ),
+    pytest.param(
+        "population", lambda r: released(r).update(per_cell={}),
+        ERR + f"{RELEASED}.per_cell is not a list", id="a-per-cell-that-is-an-object",
+    ),
     pytest.param(
         "release", lambda r: aggregate(r, "s01", "arm64").update(n_clones=19),
         (
@@ -1239,3 +1646,81 @@ def test_a_chromosome_peak_rss_that_is_absent_or_not_a_finite_number_is_refused_
     repo = fixture_repo(tmp_path / "empty")
     edit_record(repo, "population", lambda r: r["wall_time"]["vep_rs"]["per_cell"].clear())
     assert error(repo) == f"{ERR}the population record's wall_time.vep_rs.per_cell is empty\n"
+
+
+# The published 0.4.0 release: the tag's commit, the SHA256SUMS digests of its assets, and the concordance section
+# of its page, which this script rendered at that tag from the records the repository carries.
+COMMIT_040 = "f64272326dee8f813a57f9fa832539ccd8067dab"
+DIGESTS_040 = {
+    "vep-0.4.0-aarch64-apple-darwin.tar.gz": "b22283552d1e4c995090025c04dedbc884f1b1afc477ee9f88334f9bb4674fc2",
+    "vep-0.4.0-aarch64-unknown-linux-gnu.tar.gz": "6057da61fb971e4ff822b1fe5c5b2e6c7f251fadedf2737f9b94ac2c195537d0",
+    "vep-0.4.0-x86_64-unknown-linux-gnu.tar.gz": "d72ff534447dd38ceef576c7d51d479cb7af354c09bba42c47f0991343bcb3a8",
+    "vep-rs-0.4.0.tar.gz": "0ff936860386d74d5f532ef86d0b19f4c31eadc90998062d0291c5bc402756ab",
+}
+PUBLISHED_040_CAPTION = (
+    "Whole genome against Ensembl VEP 116.2: the population datasets one run per chromosome, each ClinVar release one "
+    "genome-wide file; wall time is the sum of the per-chromosome medians of 20 machines at 16 threads on `c8gd.8xlarge` "
+    "(ARM) and `c8id.8xlarge` (x86) for the population datasets, and the whole-file median of 20 machines on "
+    "`r8gd.8xlarge` (ARM) and `r8id.8xlarge` (x86) for the ClinVar files, another instance class and protocol, so the "
+    "`All six` row carries no wall time; peak memory at most 2.6 GB on any chromosome; tuple counts, per-chromosome rows "
+    f"and per-file counts are in the [provenance records]({REPO_URL}/tree/v0.4.0/docs/concordance-provenance)."
+)
+PUBLISHED_040_TABLES = """\
+| Dataset | Raw F1 | Adjusted F1 | ARM (s) | x86 (s) |
+| --- | --- | --- | --- | --- |
+| gnomAD v4.1 | 0.999999353 | 1.000000000 | 881 | 1,365 |
+| gnomAD v2.1.1 | 0.999999521 | 1.000000000 | 282 | 472 |
+| 1000 Genomes Phase 3 | 0.999999714 | 1.000000000 | 49 | 76 |
+| 1000 Genomes high-coverage | 0.999991204 | 1.000000000 | 85 | 116 |
+| ClinVar GRCh37 | 0.999979065 | 1.000000000 | 5 | 6 |
+| ClinVar GRCh38 | 0.999972446 | 1.000000000 | 14 | 14 |
+| All six | 0.999998408 | 1.000000000 | | |
+
+Structural-variant file sets measured on the released binary against the same reference, each set's files pooled by \
+summed counts; the paper's own figures stay as published in \
+[docs/published-figures.md](https://github.com/natera-open-source/vep-rs/blob/v0.4.0/docs/published-figures.md).
+
+| File set | Assembly | Raw F1 | Adjusted F1 |
+| --- | --- | --- | --- |
+| ClinVar SV | GRCh37 | 0.999952183 | 1.000000000 |
+| gnomAD SV | GRCh37 | 0.726719694 | 1.000000000 |
+| 1000 Genomes SV | GRCh37 | 1.000000000 | 1.000000000 |
+| Synthetic (13 files) | GRCh37 | 0.986694682 | 1.000000000 |
+| ClinVar SV | GRCh38 | 1.000000000 | 1.000000000 |
+| gnomAD SV | GRCh38 | 0.791428005 | 1.000000000 |
+| 1000 Genomes SV | GRCh38 | 0.989455966 | 1.000000000 |
+| Synthetic (13 files) | GRCh38 | 0.983528044 | 1.000000000 |"""
+
+
+def release_040_repo(tmp_path: Path) -> Path:
+    """The repository's own 0.4.0 inputs in a scratch repository: the release-notes file, the two records,
+    CHANGELOG.md, CITATION.cff and Cargo.toml as they stand, and the published digests."""
+    repo = tmp_path / "repo"
+    (repo / "docs" / "concordance-provenance").mkdir(parents=True)
+    (repo / ".github" / "release-notes").mkdir(parents=True)
+    for rel in ("CHANGELOG.md", "CITATION.cff", "Cargo.toml", ".github/release-notes/v0.4.0.md"):
+        shutil.copy(ROOT / rel, repo / rel)
+    for record in (ROOT / "docs" / "concordance-provenance").glob("*-v0.4.0.json"):
+        shutil.copy(record, repo / "docs" / "concordance-provenance" / record.name)
+    (repo / "SHA256SUMS").write_text("".join(f"{d}  {n}\n" for n, d in DIGESTS_040.items()))
+    write_floors(repo, {n: "2.39" for n in DIGESTS_040 if "linux-gnu" in n})
+    return repo
+
+
+def test_the_0_4_0_records_render_the_published_concordance_section(tmp_path: Path) -> None:
+    """The repository's 0.4.0 records, timed on one generation per pair with the ClinVar files on another class
+    than the whole genome, render the published page's concordance section word for word: the caption without a
+    label, then the two tables."""
+    repo = release_040_repo(tmp_path)
+    out = subprocess.run(
+        [sys.executable, str(SCRIPT), "--repo", str(repo), "--version", "0.4.0", "--previous", "v0.3.2", "--commit", COMMIT_040,
+         "--toolchain", TOOLCHAIN, "--sha256sums", str(repo / "SHA256SUMS"), "--glibc-floors", str(repo / "glibc-floors.json")],
+        capture_output=True, text=True, check=False,
+    )
+    assert out.returncode == 0, out.stderr
+    assert concordance_section(out.stdout) == f"{PUBLISHED_040_CAPTION}\n\n{PUBLISHED_040_TABLES}"
+    assert NEWEST_LABEL not in out.stdout
+    # A flat notes file, Highlights and Upgrade notes without an area section, keeps the published page's shape.
+    assert [l for l in out.stdout.splitlines() if l.startswith("#")] == [
+        "## Highlights", "## Upgrade notes", "## Added", "## Changed", "## Fixed", "## Concordance and wall time", "## Install", "## Cite",
+    ]

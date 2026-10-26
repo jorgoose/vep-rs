@@ -3,7 +3,7 @@
 
 //! Structural deletion (`<DEL>`) consequence calculation.
 //!
-//! Mirrors Perl VEP's `StructuralVariationOverlapAllele` logic for deletions.
+//! Mirrors Ensembl VEP's `StructuralVariationOverlapAllele` logic for deletions.
 //! Assigns consequence terms based on how the deletion span overlaps the
 //! transcript structure (exons, introns, CDS, UTRs).
 //!
@@ -17,9 +17,7 @@ use super::{
     perl_coding_pre_predicate, perl_partial_codon,
 };
 use smallvec::SmallVec;
-use vep_core::consequence::{
-    Consequence, ConsequenceList, FeatureType, Impact, TranscriptConsequence,
-};
+use vep_core::consequence::{Consequence, ConsequenceList, Impact, TranscriptConsequence};
 use vep_core::coordinate::Strand;
 use vep_core::transcript::Transcript;
 use vep_core::variant::{InputVariant, VariantClass};
@@ -37,36 +35,13 @@ pub fn calculate(
     upstream_distance: u64,
     downstream_distance: u64,
 ) -> Option<TranscriptConsequence> {
-    calculate_span(
-        variant,
-        variant.start,
-        variant.sv_end.unwrap_or(variant.end),
-        transcript,
-        upstream_distance,
-        downstream_distance,
-    )
-}
-
-/// [`calculate`] over an explicit deleted span, for a record whose lost bases are a
-/// part of its own span: a `<CNV:TR>` contraction loses the run's tail, not the run.
-/// The region terms read the deleted span; the flank window and DISTANCE read the
-/// record's own span, the Location its row prints, as `distance_to_transcript`
-/// (BaseTranscriptVariation.pm:582-605) reads `$vf->{start}` and `{end}`.
-pub(super) fn calculate_span(
-    variant: &InputVariant,
-    del_start: u64,
-    del_end: u64,
-    transcript: &Transcript,
-    upstream_distance: u64,
-    downstream_distance: u64,
-) -> Option<TranscriptConsequence> {
     let tx_start = transcript.start;
     let tx_end = transcript.end;
-    let span_start = variant.start;
-    let span_end = variant.sv_end.unwrap_or(variant.end);
+    let del_start = variant.start;
+    let del_end = variant.sv_end.unwrap_or(variant.end);
 
-    if span_end < tx_start.saturating_sub(upstream_distance.max(downstream_distance))
-        || span_start > tx_end.saturating_add(upstream_distance.max(downstream_distance))
+    if del_end < tx_start.saturating_sub(upstream_distance.max(downstream_distance))
+        || del_start > tx_end.saturating_add(upstream_distance.max(downstream_distance))
     {
         return None;
     }
@@ -85,7 +60,7 @@ pub(super) fn calculate_span(
         } else {
             (Consequence::DownstreamGeneVariant, downstream_distance)
         };
-        let dist = distance_to_transcript(span_start, span_end, transcript);
+        let dist = distance_to_transcript(del_start, del_end, transcript);
         if dist > flank {
             return None;
         }
@@ -116,7 +91,7 @@ pub(super) fn calculate_span(
     let coding_start = transcript.coding_region_start;
     let coding_end = transcript.coding_region_end;
 
-    // Perl VEP `feature_truncation` predicate for deletions/losses:
+    // Ensembl VEP `feature_truncation` predicate for deletions/losses:
     //   within_cdna(@_) AND (partial_overlap_feature(@_) OR complete_within_feature(@_))
     //   AND (deletion(@_) OR copy_number_loss(@_))
     //
@@ -321,12 +296,7 @@ pub(super) fn calculate_span(
         push_unique(&mut consequences, Consequence::IntronVariant);
     }
 
-    // A `<CNV:TR>` loss reaches this arm, but Ensembl reads a tandem repeat as a
-    // `VariationFeature` carrying the literal allele string (ensembl-vep
-    // `Parser/VCF.pm:530-543`), so the structural tract rule is not its rule.
-    if variant.variant_class != VariantClass::TandemRepeat
-        && overlaps_polypyrimidine_tract(transcript, del_start, del_end)
-    {
+    if overlaps_polypyrimidine_tract(transcript, del_start, del_end) {
         push_unique(
             &mut consequences,
             Consequence::SplicePolypyrimidineTractVariant,
@@ -336,7 +306,7 @@ pub(super) fn calculate_span(
     // Context terms for non-coding transcripts (excluding NMD, handled separately).
     // Perl's within_non_coding_gene: not translation and not mature_miRNA and not non_coding_exon_variant
     if !is_coding
-        && !transcript.is_nmd_transcript()
+        && !transcript.facts().is_nmd
         && !consequences.contains(&Consequence::NonCodingTranscriptExonVariant)
         && !consequences.contains(&Consequence::MatureMirnaVariant)
     {
@@ -345,7 +315,7 @@ pub(super) fn calculate_span(
 
     // NMD transcript context: Perl adds NMD_transcript_variant alongside other
     // consequences (not just as a fallback), e.g., "feature_truncation,coding_sequence_variant,...,NMD_transcript_variant"
-    if transcript.is_nmd_transcript() {
+    if transcript.facts().is_nmd {
         push_unique(&mut consequences, Consequence::NmdTranscriptVariant);
     }
 
@@ -393,40 +363,17 @@ fn build_consequence(
         .unwrap_or(Impact::MODIFIER);
 
     TranscriptConsequence {
-        transcript_id: transcript.stable_id.clone(),
-        feature_start: transcript.start,
-        feature_end: transcript.end,
-        gene_id: transcript.gene_stable_id.clone(),
-        gene_symbol: transcript.gene_symbol.clone(),
-        gene_symbol_source: transcript.gene_symbol_source.clone(),
-        hgnc_id: transcript.hgnc_id.clone(),
         consequences,
         impact,
-        biotype: Some(transcript.biotype.clone()),
-        canonical: transcript.canonical,
-        strand: match transcript.strand {
-            Strand::Forward => 1,
-            Strand::Reverse => -1,
-        },
         distance,
-        feature_type: FeatureType::Transcript,
-        flags: transcript.flags.clone(),
-        tsl: transcript.tsl,
-        mane_select: transcript.mane_select.clone(),
-        mane_plus_clinical: transcript.mane_plus_clinical.clone(),
-        appris: transcript.appris.clone(),
-        ccds: transcript.ccds.clone(),
-        protein_id: transcript.protein_id.clone(),
-        swissprot: transcript.swissprot.clone(),
-        trembl: transcript.trembl.clone(),
-        refseq: transcript.refseq.clone(),
-        ..TranscriptConsequence::default()
+        ..TranscriptConsequence::for_transcript(transcript)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vep_core::consequence::FeatureType;
     use vep_core::variant::{InputVariant, VariantClass};
 
     /// Helper to build a structural deletion variant.
@@ -854,6 +801,28 @@ mod tests {
         );
     }
 
+    /// OverlapPC is `100 * ($overlap_length / $feature_length)` (OutputFactory.pm:2091)
+    /// printed with `%.2f` (`:2094`): a 23-bp and a 49-bp deletion inside a 160-bp
+    /// transcript print `14.37` and `30.63`, the quotient-first roundings of the
+    /// ties 14.375 and 30.625.
+    #[test]
+    fn test_overlap_pc_rounds_a_two_decimal_tie_as_perl_does() {
+        let cds = format!("ATG{}TAA", "GCT".repeat(31));
+        let tx = crate::test_helpers::make_single_exon_transcript(
+            Strand::Forward,
+            &cds,
+            &"A".repeat(31),
+        );
+        assert_eq!(tx.end - tx.start + 1, 160);
+        for (deleted, expected) in [(23, "14.37"), (49, "30.63")] {
+            let v = make_del("21", 40_000_050, 40_000_050 + deleted - 1);
+            let result = calculate(&v, &tx, 5000, 5000).unwrap();
+            let (bp, pc) = result.feature_overlap(v.start, v.end).unwrap();
+            assert_eq!(bp, deleted);
+            assert_eq!(format!("{pc:.2}"), expected);
+        }
+    }
+
     #[test]
     fn test_multiple_consequences_sorted_by_rank() {
         // Del: 25_000_030 - 25_004_500 (covers 5'UTR + CDS + introns + 3'UTR)
@@ -932,6 +901,18 @@ mod tests {
         assert!(result.canonical);
         assert_eq!(result.strand, 1);
         assert_eq!(result.feature_type, FeatureType::Transcript);
+    }
+
+    /// The row carries the transcript's `gencode_primary` bit, which the
+    /// `GENCODE_PRIMARY` column prints as `1` (OutputFactory.pm:1604-1606 at
+    /// release/116.2) on a structural-variant row as on any other.
+    #[test]
+    fn test_gencode_primary_carried_from_transcript() {
+        let v = make_del("21", 24_999_000, 25_007_000);
+        assert!(!calculate(&v, &tx(), 5000, 5000).unwrap().gencode_primary);
+        let mut t = tx();
+        t.gencode_primary = true;
+        assert!(calculate(&v, &t, 5000, 5000).unwrap().gencode_primary);
     }
 
     #[test]
