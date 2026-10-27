@@ -20,7 +20,9 @@
 use std::cmp::Ordering;
 
 use smallvec::SmallVec;
-use vep_core::consequence::{Consequence, ConsequenceList, SourceCache, TranscriptConsequence};
+use vep_core::consequence::{
+    Consequence, ConsequenceList, FeatureType, SourceCache, TranscriptConsequence,
+};
 use vep_core::variant::InputVariant;
 
 use crate::row_filter::{self, RowFilters};
@@ -457,18 +459,20 @@ fn pick_per_gene(
     let mut transcript_rows: Vec<usize> = Vec::new();
     for &c in candidates {
         match rows[c] {
-            Row::Transcript { .. } => transcript_rows.push(c),
-            Row::Intergenic { allele } if record[allele].intergenic_overlap => {
-                transcript_rows.push(c);
+            Row::Transcript { allele, tc }
+                if record[allele].transcript_consequences[tc].feature_type
+                    == FeatureType::Transcript =>
+            {
+                transcript_rows.push(c)
             }
-            Row::Intergenic { .. } => picked.push(c),
+            _ => picked.push(c),
         }
     }
     let gene = |c: usize| match rows[c] {
         Row::Transcript { allele, tc } => {
             record[allele].transcript_consequences[tc].gene_id.as_ref()
         }
-        Row::Intergenic { .. } => "",
+        Row::Intergenic { .. } => unreachable!("only transcript rows are grouped by gene"),
     };
     for group in group_by(&transcript_rows, gene) {
         picked.push(pick_worst(&group, infos, order));
@@ -847,6 +851,66 @@ mod tests {
             kept(&record),
             vec![(0, "ENST1".to_string()), (0, "ENST2".to_string())]
         );
+    }
+
+    /// Rows not against a transcript pass through the per-gene picks untouched
+    /// (`:838-844`): both regulatory rows and the intergenic row survive, and
+    /// only the two G1 transcripts are reduced to one.
+    #[test]
+    fn per_gene_passes_regulatory_and_intergenic_rows_through() {
+        let feature = |id: &str, feature_type, consequence| TranscriptConsequence {
+            transcript_id: id.into(),
+            feature_type,
+            consequences: smallvec![consequence],
+            ..Default::default()
+        };
+        let build = |with_transcripts: bool| {
+            let mut rows = vec![
+                feature(
+                    "ENSR1",
+                    FeatureType::RegulatoryFeature,
+                    Consequence::RegulatoryRegionVariant,
+                ),
+                feature(
+                    "ENSM1",
+                    FeatureType::MotifFeature,
+                    Consequence::TfBindingSiteVariant,
+                ),
+            ];
+            if with_transcripts {
+                rows.push(tc("ENST1", "G1", smallvec![Consequence::MissenseVariant]));
+                rows.push(tc("ENST2", "G1", smallvec![Consequence::SynonymousVariant]));
+            }
+            let mut v = allele(b"G", 0, rows);
+            v.intergenic_overlap = !with_transcripts;
+            vec![v]
+        };
+        for set in [
+            |c: &mut FilterConfig| c.per_gene = true,
+            |c: &mut FilterConfig| c.pick_allele_gene = true,
+        ] {
+            let mut record = build(false);
+            apply_to_record(&mut record, &config(set));
+            assert_eq!(record[0].transcript_consequences.len(), 2);
+            assert!(record[0].intergenic_overlap);
+
+            let mut record = build(true);
+            apply_to_record(&mut record, &config(set));
+            let ids: Vec<&str> = record[0]
+                .transcript_consequences
+                .iter()
+                .map(|t| t.transcript_id.as_ref())
+                .collect();
+            assert_eq!(ids, ["ENSR1", "ENSM1", "ENST1"]);
+        }
+
+        let mut record = build(false);
+        apply_to_record(&mut record, &config(|c| c.flag_pick_allele_gene = true));
+        assert!(record[0]
+            .transcript_consequences
+            .iter()
+            .all(|t| t.flags.iter().any(|f| f == "PICK")));
+        assert!(record[0].intergenic_pick);
     }
 
     /// `--pick_allele_gene` groups on the allele first (`:601-605`), so each
