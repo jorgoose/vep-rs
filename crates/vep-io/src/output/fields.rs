@@ -17,7 +17,7 @@
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 
-use vep_core::consequence::{Consequence, OwnSpanPositions, TranscriptConsequence};
+use vep_core::consequence::{Consequence, FeatureType, OwnSpanPositions, TranscriptConsequence};
 use vep_core::spdi::VrsAllele;
 use vep_core::sv_routing::{perl_split, perl_true};
 use vep_core::terms::Vocabulary;
@@ -290,9 +290,7 @@ const FLAG_FIELD_GROUPS: &[FieldGroup] = &[
     group("overlaps", &["OverlapBP", "OverlapPC"]),
     group("shift_length", &["SHIFT_LENGTH"]),
     group("var_synonyms", &["VAR_SYNONYMS"]),
-    // BIOTYPE leads the regulatory group (Constants.pm:136), so `--regulatory`
-    // without `--biotype` adds the column; the value is written only under
-    // `--biotype` (OutputFactory.pm:1580), so the column prints `-`.
+    // Regulatory BIOTYPE is unconditional; transcript BIOTYPE still needs --biotype.
     group(
         "regulatory",
         &[
@@ -966,8 +964,9 @@ pub type Row<'a> = (&'a InputVariant, Option<&'a TranscriptConsequence>);
 /// The rows one input record produces, in VEP's order: transcript-major (by
 /// transcript id) and allele-minor (the reference row of `--process_ref_homs`
 /// first, then ALT order) across every allele split from the record, then one
-/// intergenic row per allele that overlapped nothing, or the one `--summary` or
-/// `--most_severe` row the record's first allele carries.
+/// intergenic row per allele that overlapped no transcript, including alleles
+/// with regulatory or motif rows, or the one `--summary` or `--most_severe` row
+/// the record's first allele carries.
 /// The alleles of a `--minimal` split sort by the keys Ensembl VEP's rejoin
 /// stores their transcript variations under ([`InputVariant::rejoin_key_prefix`]
 /// before the transcript id), so an allele whose key prefix sorts before the
@@ -998,11 +997,26 @@ pub fn record_rows_into<'a>(record: &[&'a InputVariant], rows: &mut Vec<Row<'a>>
             .then(b.0.reference_allele_row.cmp(&a.0.reference_allele_row))
             .then(a.0.allele_index.cmp(&b.0.allele_index))
     });
+    let intergenic_start = rows.len();
+    for variant in record {
+        if variant.intergenic_overlap {
+            rows.push((variant, None));
+        }
+    }
+    rows[intergenic_start..].sort_by(|a, b| {
+        a.0.rejoin_key_prefix
+            .as_deref()
+            .unwrap_or("")
+            .cmp(b.0.rejoin_key_prefix.as_deref().unwrap_or(""))
+            .then(b.0.reference_allele_row.cmp(&a.0.reference_allele_row))
+            .then(a.0.allele_index.cmp(&b.0.allele_index))
+    });
     // An allele with no feature row writes its intergenic row, or the record's
     // `--summary` or `--most_severe` row, which stands even with no term
     // (OutputFactory.pm:454-458).
     for variant in record {
-        if variant.transcript_consequences.is_empty()
+        if !variant.intergenic_overlap
+            && variant.transcript_consequences.is_empty()
             && (variant.most_severe_consequence.is_some() || variant.summary_terms.is_some())
         {
             rows.push((variant, None));
@@ -1014,6 +1028,11 @@ pub fn record_rows_into<'a>(record: &[&'a InputVariant], rows: &mut Vec<Row<'a>>
 /// ranks when both rows carry one that orders as the key does
 /// ([`orderable_rank`]), else by the keys themselves.
 fn transcript_order(a: &Row<'_>, b: &Row<'_>) -> std::cmp::Ordering {
+    let type_order = (a.1.expect("feature row").feature_type as u8)
+        .cmp(&(b.1.expect("feature row").feature_type as u8));
+    if !type_order.is_eq() {
+        return type_order;
+    }
     match (orderable_rank(a), orderable_rank(b)) {
         (Some(rank_a), Some(rank_b)) => rank_a.cmp(&rank_b),
         _ => rejoin_key(a).cmp(rejoin_key(b)),
@@ -1234,15 +1253,20 @@ fn write_row_field_value(
         "Consequence" => match tc {
             Some(x) => write_terms(out, &x.consequences, options.terms),
             None => {
-                let consequence = variant
-                    .most_severe_consequence
-                    .unwrap_or(Consequence::IntergenicVariant);
+                let consequence = if variant.intergenic_overlap {
+                    Consequence::IntergenicVariant
+                } else {
+                    variant
+                        .most_severe_consequence
+                        .unwrap_or(Consequence::IntergenicVariant)
+                };
                 out.extend_from_slice(options.terms.term(consequence).as_bytes());
             }
         },
         "IMPACT" => {
             let impact = match tc {
                 Some(x) => x.impact,
+                None if variant.intergenic_overlap => Consequence::IntergenicVariant.impact(),
                 None => variant
                     .most_severe_consequence
                     .unwrap_or(Consequence::IntergenicVariant)
@@ -1267,7 +1291,9 @@ fn write_row_field_value(
                 );
             }
         }
-        "BIOTYPE" if !options.biotype => {}
+        "BIOTYPE"
+            if !options.biotype
+                && tc.is_none_or(|x| x.feature_type != FeatureType::RegulatoryFeature) => {}
         "BIOTYPE" => push_opt(out, tc.and_then(|x| x.biotype.as_deref())),
         "EXON" => push_opt(out, tc.and_then(|x| x.exon.as_deref())),
         "INTRON" => push_opt(out, tc.and_then(|x| x.intron.as_deref())),
@@ -1355,6 +1381,11 @@ fn write_row_field_value(
                 out.extend_from_slice(format!("{pc:.2}").as_bytes());
             }
         }
+        "STRAND"
+            if tc.is_some_and(|x| {
+                x.feature_type == FeatureType::RegulatoryFeature
+                    || (variant.is_structural && x.feature_type == FeatureType::MotifFeature)
+            }) => {}
         "STRAND" => {
             if let Some(x) = tc {
                 push_signed(out, i64::from(x.strand));
@@ -1547,11 +1578,16 @@ fn write_row_field_value(
         "FREQS" => push_joined(out, variant.freqs.iter().map(String::as_str), list_sep),
         "SIFT" => push_opt(out, tc.and_then(|x| x.sift.as_deref())),
         "PolyPhen" => push_opt(out, tc.and_then(|x| x.polyphen.as_deref())),
-        "MOTIF_NAME"
-        | "MOTIF_POS"
-        | "HIGH_INF_POS"
-        | "MOTIF_SCORE_CHANGE"
-        | "TRANSCRIPTION_FACTORS" => {}
+        "HIGH_INF_POS" | "MOTIF_SCORE_CHANGE" => {}
+        "TRANSCRIPTION_FACTORS" => {
+            if let Some(factors) = tc.and_then(|row| row.plugin_data.get(field)) {
+                push_joined(
+                    out,
+                    factors.split(',').filter(|factor| !factor.is_empty()),
+                    list_sep,
+                );
+            }
+        }
         "MAX_AF" => {
             if let Some((max, _)) = frequency::max_af(variant, &options.frequency_groups()) {
                 out.extend_from_slice(max.as_bytes());
@@ -1839,6 +1875,9 @@ pub fn empty_value_is_written(
         return false;
     }
     match field {
+        "TRANSCRIPTION_FACTORS" => tc.is_some_and(|row| {
+            row.feature_type == FeatureType::MotifFeature && row.plugin_data.contains_key(field)
+        }),
         "NEAREST" => variant.nearest.as_ref().is_some_and(Vec::is_empty),
         "CLINVAR_SOMATIC_CLASSIFICATION" => {
             options.clinvar_somatic_classification

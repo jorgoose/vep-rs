@@ -20,9 +20,9 @@ vep-rs reads a local cache and never contacts a database. Each database flag is 
 
 ## Consequence terms never assigned
 
-Six regulatory-feature terms need a regulatory-feature cache that is not loaded: `TFBS_ablation`, `TFBS_amplification`, `TF_binding_site_variant`, `regulatory_region_ablation`, `regulatory_region_amplification` and `regulatory_region_variant`. `--regulatory`, alone or through `--everything`, is accepted and warns that regulatory-feature annotation is not implemented.
+All six regulatory and motif consequence terms are supported under `--regulatory` or `--everything` with a converted GRCh38 regulatory cache; see [partial regulatory support](../divergences/regulatory-rows.md).
 
-The root term `sequence_variant` has no predicate, and Ensembl VEP's consequence engine never assigns it either. The other 34 of Ensembl VEP's 41 Sequence Ontology terms are assigned.
+The root term `sequence_variant` has no predicate, and Ensembl VEP's consequence engine never assigns it either. The other 40 of Ensembl VEP's 41 Sequence Ontology terms are assigned.
 
 ## Input formats
 
@@ -73,7 +73,6 @@ The flags below are declared with the description their group page shows, which 
 
 | Flag | Ensembl VEP |
 | --- | --- |
-| `--regulatory` | Reports overlaps with regulatory regions and transcription factor binding sites |
 | `--custom` | Adds annotation from a tabix-indexed or bigWig file |
 | `--no_stats` | Writes no statistics file |
 | `--stats_file` | Names the statistics file |

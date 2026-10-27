@@ -2807,7 +2807,7 @@ fn coordinate_streaming(
                         c.resources.transcripts(),
                     );
                     for chr in chromosomes {
-                        c.resources.transcripts().prewarm(&chr)?;
+                        c.resources.prewarm_chromosome(&chr)?;
                     }
                     let chunk_units = fused_chunk_units(lines.items.len(), c);
                     (lines.seq, split_lines(lines, chunk_units))

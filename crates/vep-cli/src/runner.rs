@@ -1935,6 +1935,10 @@ impl Runner {
         let annotation_resources = AnnotationResources {
             transcripts,
             variation_source,
+            regulatory_source: crate::regulatory::RegulatorySource::open(
+                &self.config,
+                &self.cache,
+            )?,
             sv_source,
             colocation: ColocationRules::from_config(&self.config),
             effects_config,
@@ -2784,6 +2788,7 @@ fn check_gnomad_columns(config: &Config, info: &CacheInfo) -> Result<(), CliErro
 pub(crate) struct AnnotationResources {
     transcripts: Arc<LazyTranscriptIndexes>,
     variation_source: Option<Arc<VariationSource>>,
+    regulatory_source: Option<Arc<crate::regulatory::RegulatorySource>>,
     /// The known structural variants of `--check_svs`, `None` without the flag.
     sv_source: Option<Arc<SvSource>>,
     /// Which known variants of a window co-locate with an input variant.
@@ -2825,6 +2830,17 @@ pub(crate) fn compile_transcript_filter(
 impl AnnotationResources {
     pub(crate) fn transcripts(&self) -> &LazyTranscriptIndexes {
         &self.transcripts
+    }
+
+    /// Materialize chromosome-scoped caches before either streaming or batch workers run.
+    pub(crate) fn prewarm_chromosome(&self, chr: &str) -> anyhow::Result<()> {
+        self.transcripts.prewarm(chr)?;
+        if let Some(source) = &self.regulatory_source {
+            source
+                .prewarm(chr)
+                .map_err(|error| CliError::new("cache", format!("{error:#}")))?;
+        }
+        Ok(())
     }
 
     pub(crate) fn synonyms(&self) -> &ChromosomeSynonyms {
@@ -2928,7 +2944,7 @@ pub(crate) fn prewarm_batch(
     pool: &ThreadPool,
 ) -> anyhow::Result<()> {
     for variant in batch {
-        resources.transcripts.prewarm(&variant.chr)?;
+        resources.prewarm_chromosome(&variant.chr)?;
         if let Some(mate_chr) = variant.mate_chr.as_deref() {
             resources.transcripts.prewarm(mate_chr)?;
         }
@@ -3006,7 +3022,14 @@ pub(crate) fn annotate_one(
         &resources.effects_config,
         transcript_filter,
     );
-    let csq_count = variant.transcript_consequences.len() as u64;
+    if let Some(source) = &resources.regulatory_source {
+        source.annotate(variant);
+        if variant.intergenic_overlap {
+            variant.intergenic_shift = intergenic_shift(variant, &resources.effects_config);
+        }
+    }
+    let csq_count =
+        variant.transcript_consequences.len() as u64 + u64::from(variant.intergenic_overlap);
 
     // Under `--check_frequency` the filter stage co-located the batch before
     // annotation, as Ensembl VEP's variation source runs before its transcripts.
@@ -3418,6 +3441,7 @@ pub(crate) fn annotate_batch_for_test(
     let resources = AnnotationResources {
         transcripts,
         variation_source: None,
+        regulatory_source: None,
         sv_source: None,
         colocation: ColocationRules::default(),
         effects_config: Arc::new(vep_effects::EffectsConfig {
@@ -3475,6 +3499,7 @@ pub(crate) fn default_rows_for_test(
     let resources = AnnotationResources {
         transcripts,
         variation_source,
+        regulatory_source: None,
         sv_source: None,
         colocation: ColocationRules::default(),
         effects_config: Arc::new(vep_effects::EffectsConfig {
@@ -3508,6 +3533,7 @@ pub(crate) fn resources_over(transcripts: Arc<LazyTranscriptIndexes>) -> Annotat
     AnnotationResources {
         transcripts,
         variation_source: None,
+        regulatory_source: None,
         sv_source: None,
         colocation: ColocationRules::default(),
         effects_config: Arc::new(vep_effects::EffectsConfig {
@@ -5770,6 +5796,7 @@ mod tests {
         let resources = AnnotationResources {
             transcripts,
             variation_source: None,
+            regulatory_source: None,
             sv_source: None,
             colocation: ColocationRules::default(),
             effects_config,
@@ -5827,6 +5854,7 @@ mod tests {
         let resources = AnnotationResources {
             transcripts,
             variation_source: None,
+            regulatory_source: None,
             sv_source: None,
             colocation: ColocationRules::default(),
             effects_config,
@@ -5884,6 +5912,7 @@ mod tests {
             let resources = AnnotationResources {
                 transcripts: Arc::new(LazyTranscriptIndexes::from_indexes(by_chr)),
                 variation_source: None,
+                regulatory_source: None,
                 sv_source: None,
                 colocation: ColocationRules::default(),
                 effects_config: Arc::new(vep_effects::EffectsConfig::default()),

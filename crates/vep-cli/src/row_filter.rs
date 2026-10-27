@@ -86,10 +86,15 @@ pub fn apply_to_record(record: &mut [InputVariant], filters: RowFilters) {
             .any(|(v, has_alternate)| writes_a_row(v, *has_alternate, filters, true));
     for (variant, has_alternate) in record.iter_mut().zip(feature_has_alternate) {
         variant.split_first_feature_rowless = first_feature_rowless;
-        if filters.no_intergenic && variant.transcript_consequences.is_empty() {
+        if filters.no_intergenic
+            && (variant.transcript_consequences.is_empty() || variant.intergenic_overlap)
+        {
+            variant.transcript_consequences.clear();
+            variant.intergenic_overlap = false;
             variant.most_severe_consequence = None;
         }
         if filters.coding_only {
+            variant.intergenic_overlap = false;
             if variant.reference_allele_row && !has_alternate {
                 variant.transcript_consequences.clear();
             }
@@ -120,6 +125,9 @@ fn writes_a_row(
     if variant.no_allele {
         return false;
     }
+    if filters.no_intergenic && variant.intergenic_overlap {
+        return false;
+    }
     if variant.transcript_consequences.is_empty() {
         return !filters.no_intergenic
             && !filters.coding_only
@@ -147,6 +155,11 @@ pub(crate) fn settle_verdict(variant: &mut InputVariant) {
             .transcript_consequences
             .iter()
             .flat_map(|tc| tc.consequences.iter().copied())
+            .chain(
+                variant
+                    .intergenic_overlap
+                    .then_some(Consequence::IntergenicVariant),
+            )
             .collect::<Vec<_>>(),
     );
 }

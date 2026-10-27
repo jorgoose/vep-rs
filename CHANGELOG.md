@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `--regulatory` (and `--everything`) annotates regulatory and motif features from a reconverted GRCh38 cache; motif score changes and cell-type activity remain unsupported. (#78)
+
 ### Changed
 
 - The README states fastVEP and Ensembl VEP ClinVar times with ratios, drops vep-rs v0.4.0's re-scored rows, places Installation and Quick start before the figures and indexes the documentation site. (#77)

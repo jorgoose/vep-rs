@@ -203,11 +203,7 @@ impl Corpus {
     }
 }
 
-/// The mask class of a corpus run under `--regulatory` (which `--everything`
-/// switches on): vep-rs annotates no regulatory feature, so the reference's
-/// `RegulatoryFeature` and `MotifFeature` rows are dropped before the
-/// comparison, in every format ([`apply_masks`]), and the notice vep-rs writes
-/// to its warnings file about the exclusion is expected ([`compare_warnings`]).
+/// Excludes regulatory rows from legacy corpus caches lacking converted shards.
 pub const REGULATORY_FEATURE_ROWS: &str = "regulatory_feature_rows";
 
 /// The mask class of a run whose list-valued columns carry the same items in
@@ -251,11 +247,8 @@ const REGULATORY_JSON_ARRAYS: [&str; 2] = [
     "regulatory_feature_consequences",
     "motif_feature_consequences",
 ];
-/// The phrase of the warnings-file line vep-rs writes when `--regulatory` is on
-/// (`crates/vep-cli/src/config.rs`, the notice `--everything` implies):
-/// [`REGULATORY_FEATURE_ROWS`] requires the line and compares the rest of the
-/// file without it.
-const REGULATORY_NOTICE: &str = "regulatory-feature annotation is not implemented";
+/// The missing-regulatory-cache notice expected for legacy regulatory-masked corpora.
+const REGULATORY_NOTICE: &str = "no regulatory data is available in the cache";
 
 /// Applies a run's mask classes to the reference entries of one format.
 /// Under [`REGULATORY_FEATURE_ROWS`] the default and tab rows and the VCF CSQ

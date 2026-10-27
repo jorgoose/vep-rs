@@ -231,37 +231,45 @@ impl Row {
 /// below the id's first. An allele whose chromosome has no transcripts has no
 /// row.
 fn record_rows(record: &[InputVariant]) -> Vec<Row> {
-    let mut transcript_rows: Vec<(usize, usize)> = Vec::new();
+    let mut rows = Vec::new();
     for (allele, variant) in record.iter().enumerate() {
         for tc in 0..variant.transcript_consequences.len() {
-            transcript_rows.push((allele, tc));
+            rows.push(Row::Transcript { allele, tc });
+        }
+        if variant.intergenic_overlap {
+            rows.push(Row::Intergenic { allele });
         }
     }
-    let feature_key = |&(allele, tc): &(usize, usize)| {
-        let variant = &record[allele];
+    let feature_key = |row: &Row| {
+        let variant = &record[row.allele()];
+        let id = match *row {
+            Row::Transcript { tc, .. } => {
+                variant.transcript_consequences[tc].transcript_id.as_ref()
+            }
+            Row::Intergenic { .. } => "",
+        };
         variant
             .rejoin_key_prefix
             .as_deref()
             .unwrap_or("")
             .bytes()
-            .chain(variant.transcript_consequences[tc].transcript_id.bytes())
+            .chain(id.bytes())
     };
-    transcript_rows.sort_by(|a, b| {
+    rows.sort_by(|a, b| {
         feature_key(a)
             .cmp(feature_key(b))
             .then_with(|| {
-                record[b.0]
+                record[b.allele()]
                     .reference_allele_row
-                    .cmp(&record[a.0].reference_allele_row)
+                    .cmp(&record[a.allele()].reference_allele_row)
             })
-            .then_with(|| a.0.cmp(&b.0))
+            .then_with(|| a.allele().cmp(&b.allele()))
     });
-    let mut rows: Vec<Row> = transcript_rows
-        .into_iter()
-        .map(|(allele, tc)| Row::Transcript { allele, tc })
-        .collect();
     for (allele, variant) in record.iter().enumerate() {
-        if variant.transcript_consequences.is_empty() && variant.most_severe_consequence.is_some() {
+        if !variant.intergenic_overlap
+            && variant.transcript_consequences.is_empty()
+            && variant.most_severe_consequence.is_some()
+        {
             rows.push(Row::Intergenic { allele });
         }
     }
@@ -450,14 +458,17 @@ fn pick_per_gene(
     for &c in candidates {
         match rows[c] {
             Row::Transcript { .. } => transcript_rows.push(c),
+            Row::Intergenic { allele } if record[allele].intergenic_overlap => {
+                transcript_rows.push(c);
+            }
             Row::Intergenic { .. } => picked.push(c),
         }
     }
     let gene = |c: usize| match rows[c] {
         Row::Transcript { allele, tc } => {
-            record[allele].transcript_consequences[tc].gene_id.clone()
+            record[allele].transcript_consequences[tc].gene_id.as_ref()
         }
-        Row::Intergenic { .. } => unreachable!("only transcript rows are grouped by gene"),
+        Row::Intergenic { .. } => "",
     };
     for group in group_by(&transcript_rows, gene) {
         picked.push(pick_worst(&group, infos, order));
@@ -503,7 +514,11 @@ fn pick_family(record: &mut [InputVariant], config: &FilterConfig) {
                 PickInfo::of_transcript(&record[allele].transcript_consequences[tc])
             }
             Row::Intergenic { allele } => {
-                PickInfo::defaults(record[allele].most_severe_consequence.as_slice())
+                PickInfo::defaults(if record[allele].intergenic_overlap {
+                    &[Consequence::IntergenicVariant]
+                } else {
+                    record[allele].most_severe_consequence.as_slice()
+                })
             }
         })
         .collect();
@@ -548,10 +563,11 @@ fn pick_family(record: &mut [InputVariant], config: &FilterConfig) {
 /// left with no row loses its consequence verdict so no writer prints one for it.
 fn retain_rows(record: &mut [InputVariant], rows: &[Row], picked: &[usize]) {
     for (allele, variant) in record.iter_mut().enumerate() {
+        let keeps_intergenic = picked
+            .iter()
+            .any(|&c| rows[c] == Row::Intergenic { allele });
+        variant.intergenic_overlap &= keeps_intergenic;
         if variant.transcript_consequences.is_empty() {
-            let keeps_intergenic = picked
-                .iter()
-                .any(|&c| rows[c] == Row::Intergenic { allele });
             if !keeps_intergenic {
                 variant.most_severe_consequence = None;
             }
@@ -595,6 +611,9 @@ fn summarise(record: &mut [InputVariant], most_severe_only: bool) {
             Row::Transcript { allele, tc } => {
                 &record[allele].transcript_consequences[tc].consequences
             }
+            Row::Intergenic { allele } if record[allele].intergenic_overlap => {
+                &[Consequence::IntergenicVariant]
+            }
             Row::Intergenic { allele } => record[allele].most_severe_consequence.as_slice(),
         };
         terms.extend_from_slice(row_terms);
@@ -609,6 +628,7 @@ fn summarise(record: &mut [InputVariant], most_severe_only: bool) {
     }
     for variant in record.iter_mut() {
         variant.transcript_consequences.clear();
+        variant.intergenic_overlap = false;
         variant.most_severe_consequence = None;
         variant.intergenic_pick = false;
     }
@@ -1113,6 +1133,57 @@ mod tests {
         );
     }
 
+    #[test]
+    fn regulatory_and_intergenic_rows_participate_in_summaries() {
+        for most_severe in [true, false] {
+            for with_transcript in [false, true] {
+                let regulatory = TranscriptConsequence {
+                    transcript_id: "ENSR1".into(),
+                    feature_type: FeatureType::RegulatoryFeature,
+                    consequences: smallvec![Consequence::RegulatoryRegionVariant],
+                    ..Default::default()
+                };
+                let mut rows = vec![regulatory];
+                if with_transcript {
+                    rows.push(tc("ENST1", "G1", smallvec![Consequence::MissenseVariant]));
+                }
+                let mut variant = allele(b"G", 0, rows);
+                variant.intergenic_overlap = !with_transcript;
+                variant.most_severe_consequence = Some(if with_transcript {
+                    Consequence::MissenseVariant
+                } else {
+                    Consequence::RegulatoryRegionVariant
+                });
+                let mut record = vec![variant];
+                apply_to_record(
+                    &mut record,
+                    &config(|c| {
+                        c.most_severe = most_severe;
+                        c.summary = !most_severe;
+                    }),
+                );
+                let mut expected: ConsequenceList = if with_transcript {
+                    smallvec![
+                        Consequence::MissenseVariant,
+                        Consequence::RegulatoryRegionVariant
+                    ]
+                } else {
+                    smallvec![
+                        Consequence::RegulatoryRegionVariant,
+                        Consequence::IntergenicVariant
+                    ]
+                };
+                if most_severe {
+                    expected.truncate(1);
+                }
+                assert_eq!(record[0].most_severe_consequence, expected.first().copied());
+                assert_eq!(record[0].summary_terms.as_ref(), Some(&expected));
+                assert!(record[0].transcript_consequences.is_empty());
+                assert!(!record[0].intergenic_overlap);
+            }
+        }
+    }
+
     /// `--summary` beside `--most_severe`, a pair `--safe` lets through
     /// (`Config.pm:961`), lists every term: `summary_only` routes on either flag
     /// (`:387`) and tests `summary` first (`:436`), `most_severe` in its `else`
@@ -1160,35 +1231,6 @@ mod tests {
         assert_eq!(
             record[0].summary_terms.as_deref(),
             Some(&[Consequence::IntronVariant][..])
-        );
-    }
-
-    /// The summary modes read transcript and intergenic rows alone: the
-    /// regulatory and motif rows Ensembl VEP's `summary_only` would also fold in
-    /// (`:431`, over every overlap allele) do not exist in vep-rs, which is why
-    /// the `most-severe-with-regulatory` corpus row documents a subset.
-    #[test]
-    fn most_severe_documents_the_regulatory_exclusion() {
-        let mut record = vec![allele(b"G", 0, vec![])];
-        apply_to_record(&mut record, &config(|c| c.most_severe = true));
-        assert_eq!(
-            record[0].summary_terms.as_deref(),
-            Some(&[Consequence::IntergenicVariant][..]),
-            "an intergenic record summarises to its intergenic term"
-        );
-        let regulatory = [
-            Consequence::TfbsAblation,
-            Consequence::TfbsAmplification,
-            Consequence::TfBindingSiteVariant,
-            Consequence::RegulatoryRegionAblation,
-            Consequence::RegulatoryRegionAmplification,
-            Consequence::RegulatoryRegionVariant,
-        ];
-        assert!(
-            regulatory
-                .iter()
-                .all(|c| c.rank() > Consequence::DownstreamGeneVariant.rank()),
-            "every regulatory term ranks below the transcript terms, so it would change a summary only when no transcript row remains"
         );
     }
 

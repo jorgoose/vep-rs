@@ -10,9 +10,9 @@ Planned for the next release, 0.6.0.
 
 ## Regulatory and motif features
 
-`--regulatory`, alone or through `--everything`, is accepted and warns that regulatory-feature annotation is not implemented: the motif columns stay empty, no `RegulatoryFeature` or `MotifFeature` row is written, and the six regulatory consequence terms are never assigned ([the divergence page](../divergences/regulatory-rows.md) states it). `--cell_type` is refused as an unknown argument. `--regulatory_gff` and `--extended_promoters` are each refused with an error naming the flag; the error for `--regulatory_gff` begins `ERROR: [cli] --regulatory_gff is not supported: it would annotate regulatory features and motifs from a GFF3 file in place of the cache`.
+`--regulatory`, alone or through `--everything`, supports cached GRCh38 regulatory regions and binding motifs after conversion of an Ensembl cache containing regulatory data. It writes `RegulatoryFeature` and `MotifFeature` rows; a cache without regulatory data retains the warning and produces no such rows. See [the partial-support page](../divergences/regulatory-rows.md) for supported fields and consequences.
 
-Planned for the next release, 0.6.0.
+Motif score changes (`MOTIF_SCORE_CHANGE`), high-information positions (`HIGH_INF_POS`) and cell activity are not computed. `--cell_type` is refused as an unknown argument; `--regulatory_gff` and `--extended_promoters` are refused. Regulatory annotation from GFF and extended promoters are not supported.
 
 ## Custom annotation sources
 

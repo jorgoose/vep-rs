@@ -50,7 +50,7 @@ Every text format opens with a header block. `--no_headers` suppresses it whole,
 | 3   | Allele             | The ALT allele of this row; a structural variant prints the SO term of its class (see below)   |
 | 4   | Gene               | Ensembl gene stable ID                                                                          |
 | 5   | Feature            | Ensembl transcript stable ID                                                                    |
-| 6   | Feature_type       | `Transcript`, or `-` on an intergenic row; VEP's `RegulatoryFeature` and `MotifFeature` rows are not produced |
+| 6   | Feature_type       | `Transcript`, `RegulatoryFeature`, `MotifFeature`, or `-` on an intergenic row; regulatory and motif rows require `--regulatory` and a converted regulatory cache |
 | 7   | Consequence        | SO consequence term(s), comma-separated                                                         |
 | 8   | cDNA_position      | Position or range in the cDNA; `?` for an unmappable end                                        |
 | 9   | CDS_position       | Position or range in the coding sequence                                                        |
@@ -170,7 +170,7 @@ The value is the shortest gap between the variant and the transcript: the smalle
 
 `FLAGS` lists every `cds_` transcript attribute (`cds_start_NF,cds_end_NF`).
 
-**OverlapBP** and **OverlapPC** appear on every structural variant row that overlaps its feature, breakends excepted, in the default Extra column and in JSON (`bp_overlap`, `percentage_overlap`). `--overlaps` adds them as columns to the `tab` and `vcf` outputs, as in Ensembl VEP, and to Parquet. They are reported on transcript rows only: Ensembl VEP also reports them on regulatory-feature and motif-feature rows, and regulatory annotation is not implemented.
+**OverlapBP** and **OverlapPC** appear on every structural variant row that overlaps its transcript, breakends excepted, in the default Extra column and in JSON (`bp_overlap`, `percentage_overlap`). `--overlaps` adds them as columns to `tab`, `vcf` and Parquet. They are reported on transcript rows only; Ensembl VEP also reports them on regulatory-feature and motif-feature rows.
 
 ### ENSP
 

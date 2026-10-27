@@ -145,9 +145,13 @@ pub(crate) fn render_default_record<'a>(
             None => {
                 // Intergenic: no feature columns, the most severe consequence, and
                 // an Extra column carrying IMPACT alone (no STRAND), as VEP does.
-                let consequence = variant
-                    .most_severe_consequence
-                    .unwrap_or(Consequence::IntergenicVariant);
+                let consequence = if variant.intergenic_overlap {
+                    Consequence::IntergenicVariant
+                } else {
+                    variant
+                        .most_severe_consequence
+                        .unwrap_or(Consequence::IntergenicVariant)
+                };
                 out.extend_from_slice(b"\t-\t-\t-\t");
                 out.extend_from_slice(plan.options.terms.term(consequence).as_bytes());
                 out.extend_from_slice(b"\t-\t-\t-\t-\t-\t");
@@ -155,7 +159,16 @@ pub(crate) fn render_default_record<'a>(
             Some(tc) => {
                 out.push(b'\t');
                 write_encoded(out, |out| {
-                    write_versioned_id(out, &tc.gene_id, tc.gene_version, plan.options.gene_version)
+                    if tc.gene_id.is_empty() {
+                        out.push(b'-');
+                    } else {
+                        write_versioned_id(
+                            out,
+                            &tc.gene_id,
+                            tc.gene_version,
+                            plan.options.gene_version,
+                        );
+                    }
                 });
                 out.push(b'\t');
                 write_encoded(out, |out| {

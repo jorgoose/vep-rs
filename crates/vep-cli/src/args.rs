@@ -616,8 +616,7 @@ pub struct Args {
     /// --numbers, --domains, --regulatory, --canonical, --protein, --biotype, --af, --af_1kg,
     /// --af_gnomade, --af_gnomadg, --max_af, --pubmed, --uniprot, --mane, --tsl, --appris,
     /// --variant_class, --gene_phenotype and --mirna, each overriding an explicit value as in Ensembl VEP.
-    /// Every column of Ensembl VEP's --everything except the regulatory columns: --regulatory is
-    /// switched on and annotates nothing, so no RegulatoryFeature or MotifFeature row is written
+    /// Includes cache-backed regulatory and motif rows; motif scores and cell-type activity are omitted
     #[arg(help_heading = "Output Control", short = 'e', long)]
     pub everything: bool,
 
@@ -780,7 +779,7 @@ pub struct Args {
     #[arg(help_heading = "Output Control", long)]
     pub domains: bool,
 
-    /// Accepted for VEP compatibility; regulatory-feature annotation is not implemented and the flag warns
+    /// Annotate overlaps with cached regulatory and motif features; warns when the cache has no regulatory data
     #[arg(help_heading = "Output Control", long)]
     pub regulatory: bool,
 
@@ -800,7 +799,7 @@ pub struct Args {
 
     /// Add the OverlapBP and OverlapPC columns to the tab, VCF and Parquet outputs: the
     /// bases of a structural variant inside the transcript and the percentage of the
-    /// transcript they cover (transcript rows only; regulatory features are not annotated)
+    /// transcript they cover (also reported for cached regulatory and motif features)
     #[arg(help_heading = "Output Control", long)]
     pub overlaps: bool,
 

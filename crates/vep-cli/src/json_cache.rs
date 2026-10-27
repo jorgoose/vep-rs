@@ -199,7 +199,7 @@ where
 
 /// Deserialize a string straight into the shared `Arc<str>` the `Transcript`
 /// field holds, without an intermediate `String`.
-fn deserialize_arc_str<'de, D>(deserializer: D) -> Result<Arc<str>, D::Error>
+pub(crate) fn deserialize_arc_str<'de, D>(deserializer: D) -> Result<Arc<str>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -222,7 +222,9 @@ where
     deserializer.deserialize_str(ArcStrVisitor)
 }
 
-fn deserialize_optional_arc_str<'de, D>(deserializer: D) -> Result<Option<Arc<str>>, D::Error>
+pub(crate) fn deserialize_optional_arc_str<'de, D>(
+    deserializer: D,
+) -> Result<Option<Arc<str>>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {

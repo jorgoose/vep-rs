@@ -38,6 +38,7 @@ pub(crate) const HGVS_NEEDS_FASTA: &str = "Cannot generate HGVS coordinates (--h
 pub struct AnnotationResources {
     pub transcripts: Arc<LazyTranscriptIndexes>,
     pub variation_source: Option<Arc<VariationSource>>,
+    pub regulatory_source: Option<Arc<crate::regulatory::RegulatorySource>>,
     /// The known structural variants of `--check_svs <file>`, `None` without
     /// the flag.
     pub sv_source: Option<Arc<SvSource>>,
@@ -304,6 +305,7 @@ impl Annotator {
             AnnotationResources {
                 transcripts,
                 variation_source,
+                regulatory_source: crate::regulatory::RegulatorySource::open(config, &cache)?,
                 sv_source,
                 colocation: ColocationRules::from_config(config),
                 effects_config,
@@ -745,6 +747,13 @@ pub fn annotate_batch(
             &resources.transcripts,
         );
     }
+    if let Some(source) = &resources.regulatory_source {
+        for variant in batch.iter() {
+            if let Err(error) = source.prewarm(&variant.chr) {
+                failure.record(format!("{error:#}"));
+            }
+        }
+    }
     if let Some(source) = &resources.variation_source {
         if let Err(error) = source.prefetch(batch.iter().map(|v| (v.chr.as_str(), v.start, v.end)))
         {
@@ -797,6 +806,13 @@ pub fn annotate_batch(
             &resources.effects_config,
             transcript_filter,
         );
+        if let Some(source) = &resources.regulatory_source {
+            source.annotate(variant);
+            if variant.intergenic_overlap {
+                variant.intergenic_shift =
+                    crate::runner::intergenic_shift(variant, &resources.effects_config);
+            }
+        }
 
         if let Some(source) = &resources.variation_source {
             variation_matcher::annotate_colocated(variant, source, &resources.colocation, failure);
@@ -823,7 +839,11 @@ pub fn annotate_batch(
             .par_iter_mut()
             .map(|variant| {
                 annotate_one(variant);
-                (1u64, variant.transcript_consequences.len() as u64)
+                (
+                    1u64,
+                    variant.transcript_consequences.len() as u64
+                        + u64::from(variant.intergenic_overlap),
+                )
             })
             .reduce(|| (0u64, 0u64), |a, b| (a.0 + b.0, a.1 + b.1));
         AnnotationStats {
@@ -835,7 +855,8 @@ pub fn annotate_batch(
         for variant in batch.iter_mut() {
             annotate_one(variant);
             stats.variants_processed += 1;
-            stats.consequences_calculated += variant.transcript_consequences.len() as u64;
+            stats.consequences_calculated += variant.transcript_consequences.len() as u64
+                + u64::from(variant.intergenic_overlap);
         }
         stats
     };
@@ -883,6 +904,7 @@ mod tests {
         let resources = AnnotationResources {
             transcripts,
             variation_source: None,
+            regulatory_source: None,
             sv_source: None,
             colocation: ColocationRules::default(),
             effects_config: Arc::new(vep_effects::EffectsConfig::default()),
@@ -1239,6 +1261,7 @@ mod tests {
         let resources = AnnotationResources {
             transcripts: Arc::new(LazyTranscriptIndexes::empty()),
             variation_source: Some(Arc::new(source)),
+            regulatory_source: None,
             sv_source: None,
             colocation: ColocationRules::default(),
             effects_config: Arc::new(vep_effects::EffectsConfig::default()),

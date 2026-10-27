@@ -11,7 +11,9 @@
 //!   The variation files are the Ensembl VEP dumper's own, copied unchanged to
 //!   `variations/<chr>/`: `all_vars.gz` with its `.csi` or `.tbi`, or
 //!   `{start}-{end}_var.gz`, read from `variations/<chr>/`, or with a `{chr}_`
-//!   prefix from directly under `variations/`. The checksum manifest
+//!   prefix from directly under `variations/`. Regulatory JSON arrays are preserved
+//!   under `regulatory/<chr>/<start>-<end>.json`; metadata advertises them only
+//!   after that tree has been written. The checksum manifest
 //!   `CHECKSUMS.sha256` is written last, over every file then under the output
 //!   directory: the files this conversion wrote and any an earlier use of the
 //!   same `--output-dir` left there.
@@ -446,7 +448,12 @@ fn convert_cache(json_dir: &Path, output_dir: &str, _region_size: u64) -> Result
     let output_path = Path::new(output_dir);
     fs::create_dir_all(output_path).context("Failed to create output directory")?;
 
-    copy_info_json(json_dir, output_path)?;
+    // A failed conversion must not leave an earlier run's availability marker.
+    match fs::remove_file(output_path.join("info.json")) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("Failed to remove previous info.json"),
+    }
 
     let (transcript_regions, transcript_entries) = convert_data_files(
         &json_dir.join("transcripts"),
@@ -459,32 +466,62 @@ fn convert_cache(json_dir: &Path, output_dir: &str, _region_size: u64) -> Result
         &output_path.join("variations"),
     )?;
 
+    let regulatory_regions = copy_regulatory_files(
+        &json_dir.join("regulatory"),
+        &output_path.join("regulatory"),
+    )?;
+    copy_info_json(json_dir, output_path, regulatory_regions != 0)?;
+
     let listed = CacheManifest::write(output_path).context("Failed to write CHECKSUMS.sha256")?;
 
     info!(
         "Conversion complete: {} transcript regions ({} transcripts), \
-         {} variation files on {} chromosomes, {} files in the checksum manifest",
-        transcript_regions, transcript_entries, variation_files, variation_chromosomes, listed
+         {} variation files on {} chromosomes, {} regulatory regions, \
+         {} files in the checksum manifest",
+        transcript_regions,
+        transcript_entries,
+        variation_files,
+        variation_chromosomes,
+        regulatory_regions,
+        listed
     );
 
     Ok(())
 }
 
 /// Copy `info.json`, and `chr_synonyms.txt` when the source has one, once
-/// [`validate_info`] accepts the metadata.
-fn copy_info_json(json_dir: &Path, output_path: &Path) -> Result<()> {
+/// [`validate_info`] accepts the metadata. Regulatory availability describes the
+/// successfully written output, not the source's potentially stale marker.
+fn copy_info_json(json_dir: &Path, output_path: &Path, regulatory_written: bool) -> Result<()> {
     let src = json_dir.join("info.json");
     let dst = output_path.join("info.json");
 
     let content =
         fs::read_to_string(&src).with_context(|| format!("Failed to read {}", src.display()))?;
 
-    let value: serde_json::Value = serde_json::from_str(&content)
+    let mut value: serde_json::Value = serde_json::from_str(&content)
         .with_context(|| format!("Failed to parse info.json at {}", src.display()))?;
     validate_info(&value).with_context(|| format!("{} is not a cache's info", src.display()))?;
     let species = value["species"].as_str().unwrap_or_default();
     let assembly = value["assembly"].as_str().unwrap_or_default();
     info!("Cache info: species={}, assembly={}", species, assembly);
+
+    let regulatory_changed = if regulatory_written {
+        value.get("regulatory").and_then(|value| value.as_bool()) != Some(true)
+    } else {
+        value.get("regulatory").is_some()
+    };
+    let content = if regulatory_changed {
+        let metadata = value.as_object_mut().expect("validated metadata object");
+        if regulatory_written {
+            metadata.insert("regulatory".into(), serde_json::Value::Bool(true));
+        } else {
+            metadata.remove("regulatory");
+        }
+        serde_json::to_string_pretty(&value).context("Failed to encode info.json")?
+    } else {
+        content
+    };
 
     fs::write(&dst, &content).with_context(|| format!("Failed to write {}", dst.display()))?;
     info!("Copied info.json");
@@ -526,6 +563,63 @@ fn validate_info(value: &serde_json::Value) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Preserve the Storable converter's regulatory JSON tree byte for byte.
+/// A shard must be a JSON array before it counts toward cache availability.
+fn copy_regulatory_files(src_dir: &Path, dst_dir: &Path) -> Result<usize> {
+    if !src_dir.exists() {
+        return Ok(0);
+    }
+    let mut chromosomes: Vec<_> = fs::read_dir(src_dir)
+        .with_context(|| format!("Failed to read {}", src_dir.display()))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    chromosomes.sort_by_key(|entry| entry.file_name());
+    let mut written = 0;
+    for chromosome in chromosomes {
+        let chr_name = chromosome.file_name();
+        let Some(chr) = chr_name.to_str().filter(|chr| is_cache_path_component(chr)) else {
+            continue;
+        };
+        if !chromosome.path().is_dir() {
+            continue;
+        }
+        let mut shards: Vec<_> = fs::read_dir(chromosome.path())
+            .with_context(|| format!("Failed to read regulatory chromosome {chr}"))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        shards.sort_by_key(|entry| entry.file_name());
+        for shard in shards {
+            let path = shard.path();
+            if !path.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let Some((start, end)) = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .and_then(|stem| stem.split_once('-'))
+            else {
+                continue;
+            };
+            if start.parse::<u64>().is_err() || end.parse::<u64>().is_err() {
+                continue;
+            }
+            let content =
+                fs::read(&path).with_context(|| format!("Failed to read {}", path.display()))?;
+            let value: serde_json::Value = serde_json::from_slice(&content)
+                .with_context(|| format!("Failed to parse JSON in {}", path.display()))?;
+            if !value.is_array() {
+                bail!("{} is not a regulatory JSON array", path.display());
+            }
+            let out_chr = dst_dir.join(chr);
+            fs::create_dir_all(&out_chr)
+                .with_context(|| format!("Failed to create {}", out_chr.display()))?;
+            let out = out_chr.join(shard.file_name());
+            fs::write(&out, &content)
+                .with_context(|| format!("Failed to write {}", out.display()))?;
+            written += 1;
+        }
+    }
+    Ok(written)
 }
 
 /// Copy the variation files into the runtime layout `variations/<chr>/`.
@@ -974,6 +1068,12 @@ mod tests {
         let src = tmp.path().join("src");
         fs::create_dir_all(src.join("transcripts")).unwrap();
         fs::create_dir_all(src.join("variations")).unwrap();
+        fs::create_dir_all(src.join("regulatory/21")).unwrap();
+        fs::write(
+            src.join("regulatory/21/1-1000000.json"),
+            br#"[{"stable_id":"ENSR_FIXTURE","start":10,"end":20,"strand":0,"feature_type":"RegulatoryFeature","biotype":"enhancer"}]"#,
+        )
+        .unwrap();
         fs::write(
             src.join("info.json"),
             r#"{"species":"homo_sapiens","assembly":"GRCh38","cache_version":116}"#,
@@ -985,12 +1085,16 @@ mod tests {
         fs::write(src.join("variations/21_all_vars.gz.csi"), b"csi").unwrap();
         let out = tmp.path().join("out");
         convert_cache(&src, out.to_str().unwrap(), 1_000_000).unwrap();
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(out.join("info.json")).unwrap()).unwrap();
+        assert_eq!(metadata["regulatory"], true);
 
         let manifest = CacheManifest::load(&out).unwrap();
         assert!(manifest.is_present());
         let listed = [
             "chr_synonyms.txt",
             "info.json",
+            "regulatory/21/1-1000000.json",
             "transcripts/21/1-1000000.json",
             "variations/21/all_vars.gz",
             "variations/21/all_vars.gz.csi",
@@ -1040,7 +1144,7 @@ mod tests {
         fs::write(src.join("chr_synonyms.txt"), "21\tNC_000021.9\n").unwrap();
         let dst = tmp.path().join("dst");
         fs::create_dir_all(&dst).unwrap();
-        copy_info_json(&src, &dst).unwrap();
+        copy_info_json(&src, &dst, false).unwrap();
         assert_eq!(fs::read_to_string(dst.join("info.json")).unwrap(), good);
         assert_eq!(
             fs::read_to_string(dst.join("chr_synonyms.txt")).unwrap(),
@@ -1067,6 +1171,53 @@ mod tests {
                 "{text}: {error} should name {reason}"
             );
         }
+    }
+
+    #[test]
+    fn regulatory_shards_preserve_raw_matrices_and_empty_arrays() {
+        let tmp = Scratch::new();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(src.join("LRG_485")).unwrap();
+        let raw = br#"[{
+          "stable_id":"ENSM00000587149","start":45009809,"end":45009823,"strand":-1,
+          "feature_type":"MotifFeature","binding_matrix":{
+            "stable_id":"ENSPFM0363","name":"MAFF_fixture","transcription_factors":["MAFK"],
+            "frequencies":{"1":{"A":137,"C":73,"G":62,"T":250}}}}]"#;
+        fs::write(src.join("LRG_485/1-1000000.json"), raw).unwrap();
+        fs::write(src.join("LRG_485/1000001-2000000.json"), b"[]\n").unwrap();
+        fs::write(src.join("LRG_485/not-a-region.json"), b"{}").unwrap();
+        let dst = tmp.path().join("dst");
+        assert_eq!(copy_regulatory_files(&src, &dst).unwrap(), 2);
+        assert_eq!(fs::read(dst.join("LRG_485/1-1000000.json")).unwrap(), raw);
+        assert_eq!(
+            fs::read(dst.join("LRG_485/1000001-2000000.json")).unwrap(),
+            b"[]\n"
+        );
+        assert!(!dst.join("LRG_485/not-a-region.json").exists());
+    }
+
+    #[test]
+    fn regulatory_marker_requires_written_shards_and_failures_leave_no_info() {
+        let tmp = Scratch::new();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("info.json"),
+            r#"{"species":"homo_sapiens","assembly":"GRCh38","regulatory":true}"#,
+        )
+        .unwrap();
+        let dst = tmp.path().join("dst");
+        convert_cache(&src, dst.to_str().unwrap(), 1_000_000).unwrap();
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(dst.join("info.json")).unwrap()).unwrap();
+        assert!(metadata.get("regulatory").is_none());
+
+        fs::create_dir_all(src.join("regulatory/21")).unwrap();
+        fs::write(src.join("regulatory/21/1-1000000.json"), b"{}").unwrap();
+        fs::write(dst.join("info.json"), br#"{"regulatory":true}"#).unwrap();
+        let error = convert_cache(&src, dst.to_str().unwrap(), 1_000_000).unwrap_err();
+        assert!(error.to_string().contains("not a regulatory JSON array"));
+        assert!(!dst.join("info.json").exists());
     }
 
     /// A plugin data file whose second data line is one byte over the cap
