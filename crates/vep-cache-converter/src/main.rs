@@ -11,9 +11,11 @@
 //!   The variation files are the Ensembl VEP dumper's own, copied unchanged to
 //!   `variations/<chr>/`: `all_vars.gz` with its `.csi` or `.tbi`, or
 //!   `{start}-{end}_var.gz`, read from `variations/<chr>/`, or with a `{chr}_`
-//!   prefix from directly under `variations/`. Regulatory JSON arrays are preserved
-//!   under `regulatory/<chr>/<start>-<end>.json`; metadata advertises them only
-//!   after that tree has been written. The checksum manifest
+//!   prefix from directly under `variations/`. Regulatory shards,
+//!   `<start>-<end>.json` or `.json.gz` arrays of regulatory and motif features,
+//!   are copied unchanged to `regulatory/<chr>/` once each parses as the
+//!   annotator parses it; metadata advertises them only after that tree has
+//!   been written. The checksum manifest
 //!   `CHECKSUMS.sha256` is written last, over every file then under the output
 //!   directory: the files this conversion wrote and any an earlier use of the
 //!   same `--output-dir` left there.

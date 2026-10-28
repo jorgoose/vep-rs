@@ -302,4 +302,70 @@ mod tests {
             .init(&[hg19.to_string_lossy().to_string()])
             .expect("no --assembly must not block loading");
     }
+
+    /// AlphaMissense.pm declares `feature_types` of `['Transcript']`, so a
+    /// record's score lands on each of its transcript rows and on no
+    /// regulatory or motif row; nothing is written at record level, where it
+    /// would print on every row of the record.
+    #[test]
+    fn writes_on_transcript_rows_alone() {
+        use crate::test_fixtures::{write_tabix_fixture, IndexSpec};
+        use vep_core::consequence::FeatureType;
+
+        let dir = tempfile::tempdir().unwrap();
+        let rows = [
+            "#CHROM\tPOS\tREF\tALT\tgenome\tuniprot_id\ttranscript_id\tprotein_variant\tam_pathogenicity\tam_class",
+            "chr21\t9068417\tC\tA\thg38\tQ9NQ38\tENST1\tA1B\t0.9123\tlikely_pathogenic",
+        ];
+        let path = write_tabix_fixture(dir.path(), "am.tsv.gz", &rows, IndexSpec::standard());
+
+        let mut plugin = AlphaMissensePlugin::new();
+        plugin.init(&[path.to_string_lossy().to_string()]).unwrap();
+
+        let mut variants = vec![InputVariant::new(
+            "21".into(),
+            9068417,
+            9068417,
+            b"C".to_vec(),
+            b"A".to_vec(),
+        )];
+        for feature_type in [
+            FeatureType::Transcript,
+            FeatureType::RegulatoryFeature,
+            FeatureType::MotifFeature,
+            FeatureType::Transcript,
+        ] {
+            variants[0]
+                .transcript_consequences
+                .push(TranscriptConsequence {
+                    feature_type,
+                    ..TranscriptConsequence::default()
+                });
+        }
+
+        plugin.run_batch(&mut variants).unwrap();
+
+        let classes: Vec<Option<&str>> = variants[0]
+            .transcript_consequences
+            .iter()
+            .map(|tc| tc.plugin_data.get("am_class").map(String::as_str))
+            .collect();
+        assert_eq!(
+            classes,
+            [
+                Some("likely_pathogenic"),
+                None,
+                None,
+                Some("likely_pathogenic")
+            ]
+        );
+        assert_eq!(
+            variants[0].transcript_consequences[0]
+                .plugin_data
+                .get("am_pathogenicity")
+                .map(String::as_str),
+            Some("0.9123")
+        );
+        assert!(variants[0].plugin_data.is_empty());
+    }
 }

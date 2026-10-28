@@ -3008,32 +3008,53 @@ mod tests {
     /// The byte writer agrees with the string table on every column, with both
     /// list separators, with and without HGVS escaping, under the whole-variant
     /// ClinVar rule, with the own-span positions, in the display vocabulary, on
-    /// a bare row, an empty consequence and the default options; and between the
-    /// populated sequence row and the structural row every column but the
-    /// regulatory ones and the name nothing produces prints a value.
+    /// a bare row, an empty consequence and the default options, and on a motif
+    /// row with factors and a matrix position and one with neither; and between
+    /// the populated sequence row, the structural row and the motif rows every
+    /// column but the two motif scores and the name nothing produces prints a
+    /// value.
     #[test]
     fn write_field_value_matches_the_string_table_on_every_column() {
         let variant = populated_variant();
         let tc = populated_consequence();
         let structural = structural_variant();
         let options = all_options();
+        let motif = TranscriptConsequence {
+            transcript_id: Arc::from("ENSM00000001"),
+            consequences: std::iter::once(Consequence::TfBindingSiteVariant).collect(),
+            feature_type: FeatureType::MotifFeature,
+            strand: -1,
+            motif: Some(Box::new(vep_core::consequence::MotifFields {
+                name: Arc::from("ENSPFM0001"),
+                pos: Some(7),
+                factors: Arc::from([Arc::from("CTCF"), Arc::from("ZNF143")]),
+            })),
+            ..TranscriptConsequence::default()
+        };
+        let unbound = TranscriptConsequence {
+            motif: Some(Box::new(vep_core::consequence::MotifFields {
+                name: Arc::from("ENSPFM0002"),
+                pos: None,
+                factors: Arc::from([]),
+            })),
+            ..motif.clone()
+        };
         let mut populated: Vec<&str> = Vec::new();
         for sep in [",", "&"] {
             populated.extend(assert_writer_matches(&variant, Some(&tc), &options, sep));
             populated.extend(assert_writer_matches(&variant, None, &options, sep));
             populated.extend(assert_writer_matches(&structural, Some(&tc), &options, sep));
             populated.extend(assert_writer_matches(&structural, None, &options, sep));
+            populated.extend(assert_writer_matches(&variant, Some(&motif), &options, sep));
+            populated.extend(assert_writer_matches(
+                &variant,
+                Some(&unbound),
+                &options,
+                sep,
+            ));
         }
         for column in every_column() {
-            let never = matches!(
-                column,
-                "MOTIF_NAME"
-                    | "MOTIF_POS"
-                    | "HIGH_INF_POS"
-                    | "MOTIF_SCORE_CHANGE"
-                    | "TRANSCRIPTION_FACTORS"
-                    | "Unknown"
-            );
+            let never = matches!(column, "HIGH_INF_POS" | "MOTIF_SCORE_CHANGE" | "Unknown");
             assert_eq!(populated.contains(&column), !never, "{column}");
         }
         for options in [
@@ -3062,6 +3083,8 @@ mod tests {
         ] {
             assert_writer_matches(&variant, Some(&tc), &options, ",");
             assert_writer_matches(&structural, Some(&tc), &options, ",");
+            assert_writer_matches(&variant, Some(&motif), &options, ",");
+            assert_writer_matches(&variant, Some(&unbound), &options, ",");
         }
         let bare = InputVariant::new("21".into(), 100, 100, b"A".to_vec(), b"G".to_vec());
         let empty = TranscriptConsequence::default();
@@ -3070,6 +3093,52 @@ mod tests {
             assert_writer_matches(&bare, None, &options, ",");
             assert_writer_matches(&variant, Some(&empty), &options, ",");
         }
+        // The empty `TRANSCRIPTION_FACTORS` of a matrix that lists no factor is
+        // a value; a row without a matrix has no such key.
+        assert_eq!(
+            field_value("MOTIF_NAME", &variant, Some(&motif), &options, ","),
+            "ENSPFM0001"
+        );
+        assert_eq!(
+            field_value("MOTIF_POS", &variant, Some(&motif), &options, ","),
+            "7"
+        );
+        assert_eq!(
+            field_value(
+                "TRANSCRIPTION_FACTORS",
+                &variant,
+                Some(&motif),
+                &options,
+                "&"
+            ),
+            "CTCF&ZNF143"
+        );
+        assert_eq!(
+            field_value("MOTIF_POS", &variant, Some(&unbound), &options, ","),
+            ""
+        );
+        assert_eq!(
+            field_value(
+                "TRANSCRIPTION_FACTORS",
+                &variant,
+                Some(&unbound),
+                &options,
+                ","
+            ),
+            ""
+        );
+        assert!(empty_value_is_written(
+            "TRANSCRIPTION_FACTORS",
+            &variant,
+            Some(&unbound),
+            &options
+        ));
+        assert!(!empty_value_is_written(
+            "TRANSCRIPTION_FACTORS",
+            &variant,
+            Some(&tc),
+            &options
+        ));
         // An individual's copy without the `--individual_zyg` list prints its own
         // zygosity.
         let mut own_copy = variant.clone();
@@ -4131,6 +4200,64 @@ mod tests {
             extra_keys_with(&plan.flag_fields, &v, None, &options),
             extra_keys(&v, None, &options)
         );
+    }
+
+    /// The transcript fast path is on under `--regulatory` alone and with no
+    /// optional group, and off once any other group is on; a transcript row's
+    /// key list is the flag fields without the five motif fields, which are the
+    /// `regulatory` group's members after `BIOTYPE`.
+    #[test]
+    fn extra_fields_plan_keeps_the_transcript_fast_path_under_regulatory_alone() {
+        let regulatory = FieldOptions {
+            regulatory: true,
+            ..Default::default()
+        };
+        let plan = ExtraFieldsPlan::new(regulatory.clone());
+        assert!(plan.transcript_fast_path && plan.any_optional_group);
+        assert_eq!(
+            plan.flag_fields,
+            ["IMPACT", "DISTANCE", "STRAND", "FLAGS", "BIOTYPE"]
+                .into_iter()
+                .chain(MOTIF_FIELDS)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            plan.transcript_flag_fields,
+            ["IMPACT", "DISTANCE", "STRAND", "FLAGS", "BIOTYPE"]
+        );
+        assert!(ExtraFieldsPlan::new(FieldOptions::default()).transcript_fast_path);
+        let one_group = [
+            |o: &mut FieldOptions| o.individual = true,
+            |o: &mut FieldOptions| o.biotype = true,
+            |o: &mut FieldOptions| o.symbol = true,
+            |o: &mut FieldOptions| o.af = true,
+            |o: &mut FieldOptions| o.check_existing = true,
+            |o: &mut FieldOptions| o.overlaps = true,
+            |o: &mut FieldOptions| o.dont_skip = true,
+            |o: &mut FieldOptions| o.var_synonyms = true,
+        ];
+        for (i, set) in one_group.iter().enumerate() {
+            for regulatory in [false, true] {
+                let mut options = FieldOptions {
+                    regulatory,
+                    ..Default::default()
+                };
+                set(&mut options);
+                assert!(!options.only_regulatory_group_beyond_user(), "{i}");
+            }
+        }
+        let every = ExtraFieldsPlan::new(all_options());
+        assert!(!every.transcript_fast_path);
+        assert_eq!(
+            every.transcript_flag_fields,
+            every
+                .flag_fields
+                .iter()
+                .copied()
+                .filter(|field| !MOTIF_FIELDS.contains(field))
+                .collect::<Vec<_>>()
+        );
+        assert!(MOTIF_FIELDS.iter().all(|f| every.flag_fields.contains(f)));
     }
 
     /// `GENCODE_PRIMARY` is the literal `1` on a transcript carrying the

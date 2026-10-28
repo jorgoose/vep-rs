@@ -1453,8 +1453,10 @@ impl Runner {
 
     /// Which optional output fields the configuration switches on, shared by
     /// every output format; `run` replaces `hgvs` with the value
-    /// [`fasta_setup_checks`] settled once the FASTA is known, and `sift` and
-    /// `polyphen` with the values [`prediction_checks`] settled against the cache.
+    /// [`fasta_setup_checks`] settled once the FASTA is known, `sift` and
+    /// `polyphen` with the values [`prediction_checks`] settled against the
+    /// cache, and `regulatory` with the value a loaded plugin may switch on
+    /// ([`crate::annotator::regulatory_enabled`]).
     fn field_options(&self) -> FieldOptions {
         let c = &self.config;
         FieldOptions {

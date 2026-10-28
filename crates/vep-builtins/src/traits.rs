@@ -205,3 +205,78 @@ pub trait BuiltinPlugin: Send + Sync {
         Ok(IndexMap::new())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vep_core::consequence::FeatureType;
+
+    /// A per-consequence plugin whose `run` marks every row it is handed.
+    struct MarkerPlugin;
+
+    impl BuiltinPlugin for MarkerPlugin {
+        fn name(&self) -> &str {
+            "Marker"
+        }
+        fn header_info(&self) -> Vec<(String, String)> {
+            vec![]
+        }
+        fn init(&mut self, _params: &[String]) -> Result<(), PluginError> {
+            Ok(())
+        }
+        fn run(
+            &self,
+            _consequence: &TranscriptConsequence,
+            _variant: &InputVariant,
+        ) -> Result<IndexMap<String, String>, PluginError> {
+            let mut result = IndexMap::new();
+            result.insert("Marker".to_string(), "1".to_string());
+            Ok(result)
+        }
+    }
+
+    fn row(feature_type: FeatureType) -> TranscriptConsequence {
+        TranscriptConsequence {
+            feature_type,
+            ..TranscriptConsequence::default()
+        }
+    }
+
+    #[test]
+    fn annotates_row_accepts_transcript_rows_alone() {
+        assert!(annotates_row(&row(FeatureType::Transcript)));
+        assert!(!annotates_row(&row(FeatureType::RegulatoryFeature)));
+        assert!(!annotates_row(&row(FeatureType::MotifFeature)));
+    }
+
+    /// Ensembl VEP hands a row to a plugin only when the plugin's
+    /// `feature_types` names the row's feature class (OutputFactory.pm:2223,
+    /// BaseVepPlugin.pm `check_feature_type`), so the per-consequence `run`
+    /// path writes on the transcript row of a record and on neither of its
+    /// regulatory rows.
+    #[test]
+    fn default_run_batch_writes_on_transcript_rows_alone() {
+        let mut variants = vec![InputVariant::new(
+            "21".into(),
+            100,
+            100,
+            b"A".to_vec(),
+            b"G".to_vec(),
+        )];
+        variants[0].transcript_consequences.extend([
+            row(FeatureType::Transcript),
+            row(FeatureType::RegulatoryFeature),
+            row(FeatureType::MotifFeature),
+        ]);
+
+        MarkerPlugin.run_batch(&mut variants).unwrap();
+
+        let written: Vec<bool> = variants[0]
+            .transcript_consequences
+            .iter()
+            .map(|tc| tc.plugin_data.contains_key("Marker"))
+            .collect();
+        assert_eq!(written, [true, false, false]);
+        assert!(variants[0].plugin_data.is_empty());
+    }
+}
