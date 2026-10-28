@@ -9,7 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `--regulatory` (and `--everything`) annotates regulatory and motif features from a cache converted with its regulatory tree: `RegulatoryFeature` and `MotifFeature` rows with their terms, `BIOTYPE`, `STRAND`, `MOTIF_NAME`, `MOTIF_POS` and `TRANSCRIPTION_FACTORS`, and the intergenic companion row; `HIGH_INF_POS`, `MOTIF_SCORE_CHANGE` and cell-type activity are not written. (#78, #61)
+- Regulatory and motif feature annotation
+  - `--regulatory` (and `--everything`) writes `RegulatoryFeature` and `MotifFeature` rows from a cache converted with its regulatory tree, with the intergenic companion row for an allele overlapping no transcript. (#78, #61)
+  - The rows carry their terms, `BIOTYPE`, `STRAND`, `MOTIF_NAME`, `MOTIF_POS` and `TRANSCRIPTION_FACTORS`; `HIGH_INF_POS`, `MOTIF_SCORE_CHANGE` and cell-type activity are not written. (#78)
+  - `--pick`, `--per_gene`, `--summary`, `--most_severe`, `--no_intergenic` and `--coding_only` rank, pass through, fold in or drop regulatory and motif rows as Ensembl VEP does. (#78)
+  - `--overlaps` reports `OverlapBP` and `OverlapPC` on regulatory-feature and motif-feature rows of a structural variant as well as on transcript rows. (#78)
+  - `storable_to_json.pl` and `vep-cache-converter` write the cache's regulatory tree as `regulatory/<chr>/<start>-<end>.json` shards and set the `regulatory` marker of `info.json` when they do. (#78)
+  - `--regulatory_gff` and `--extended_promoters` are refused with a message naming the cache as the one source of regulatory features. (#78)
+  - `--regulatory` on a cache converted without its regulatory tree warns once and writes no `RegulatoryFeature` or `MotifFeature` row. (#78)
+- Plugins
+  - A dylib plugin may export `vep_plugin_feature_types` naming the feature types it annotates; it then runs on the rows of those types, and on transcript rows alone without it. (#78)
+  - Built-in plugins that write per row annotate transcript rows alone; CADD, gnomADc and GWAS keep their record-level values on every row. (#78)
+  - AlphaMissense writes `am_class` and `am_pathogenicity` on each transcript row of the variant and on no other row. (#78)
 
 ### Changed
 
