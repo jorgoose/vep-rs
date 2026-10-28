@@ -281,7 +281,8 @@ def compare(perl: Path, rust: Path, examples: int, tmp_dir: Path | None, keep_on
     report["inputs"] = {"reference": str(perl), "scored": str(rust)}
     report["key"] = ["Location", "Allele", "Feature", "Feature_type", "consequence_set"]
     report["comparison"] = "verbatim per field on tuples both sides emit under the same key"
-    report["keep_only"] = keep_only
+    if keep_only is not None:
+        report["keep_only"] = keep_only
     return report
 
 
