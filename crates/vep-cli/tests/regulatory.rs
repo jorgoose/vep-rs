@@ -145,6 +145,155 @@ fn regulatory_rows_and_extras_reach_every_text_format() {
     assert!(!String::from_utf8_lossy(&result.stdout).contains("motif_feature_consequences"));
 }
 
+/// Two records of the gnomAD v4.1 chromosome 21 dataset against the slice of
+/// the converted release 116 cache (`fixtures/regulatory/chr21-slice.json`):
+/// `rs868224642` (`21:46699255 G>C`) inside the enhancer `ENSR21_C6M55` and
+/// its four `NRF1` motifs on both strands, and `21:5090724 A>T` inside two
+/// motifs of different matrices and no regulatory feature. Every row is held
+/// whole, in the default, tab, VCF and JSON formats, to the row Ensembl VEP
+/// 116.2 writes for the same record on the same cache, with the two fields
+/// vep-rs does not write, `HIGH_INF_POS` and `MOTIF_SCORE_CHANGE`, taken out
+/// (`Y`, `-0.094`, `Y`, `-0.094`, `N`, `-0.070`, `N`, `-0.082` on the NRF1
+/// rows; `Y`, `-0.089` and `N`, `0.039` on the two others).
+#[test]
+fn regulatory_rows_are_byte_exact_in_every_format() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = common::regulatory_cache_of_real_features(dir.path());
+    fs::write(
+        dir.path().join("in.vcf"),
+        "##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n\
+         21\t5090724\t.\tA\tT\t.\t.\t.\n\
+         21\t46699255\trs868224642\tG\tC\t.\t.\t.\n",
+    )
+    .unwrap();
+    let rows = |format: &str| -> Vec<String> {
+        annotate(dir.path(), &cache, format, true)
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .map(str::to_owned)
+            .collect()
+    };
+    let nrf1 = |id: &str, strand: &str, pos: &str| {
+        format!(
+            "rs868224642\t21:46699255\tC\t-\t{id}\tMotifFeature\tTF_binding_site_variant\t-\t-\t-\t-\t-\t-\tIMPACT=MODIFIER;STRAND={strand};MOTIF_NAME=ENSPFM0427;MOTIF_POS={pos};TRANSCRIPTION_FACTORS=NRF1"
+        )
+    };
+    assert_eq!(
+        rows("default"),
+        [
+            "21_5090724_A/T\t21:5090724\tT\t-\tENSM00000574814\tMotifFeature\tTF_binding_site_variant\t-\t-\t-\t-\t-\t-\tIMPACT=MODIFIER;STRAND=1;MOTIF_NAME=ENSPFM0290;MOTIF_POS=7;TRANSCRIPTION_FACTORS=HNF4A,NR2F1,RXRA".to_string(),
+            "21_5090724_A/T\t21:5090724\tT\t-\tENSM00000574815\tMotifFeature\tTF_binding_site_variant\t-\t-\t-\t-\t-\t-\tIMPACT=MODIFIER;STRAND=-1;MOTIF_NAME=ENSPFM0484;MOTIF_POS=15;TRANSCRIPTION_FACTORS=RUNX3".to_string(),
+            "21_5090724_A/T\t21:5090724\tT\t-\t-\t-\tintergenic_variant\t-\t-\t-\t-\t-\t-\tIMPACT=MODIFIER".to_string(),
+            "rs868224642\t21:46699255\tC\t-\tENSR21_C6M55\tRegulatoryFeature\tregulatory_region_variant\t-\t-\t-\t-\t-\t-\tIMPACT=MODIFIER;BIOTYPE=enhancer".to_string(),
+            nrf1("ENSM00000588223", "-1", "5"),
+            nrf1("ENSM00000588224", "1", "8"),
+            nrf1("ENSM00000588225", "-1", "11"),
+            nrf1("ENSM00000588226", "1", "2"),
+            "rs868224642\t21:46699255\tC\t-\t-\t-\tintergenic_variant\t-\t-\t-\t-\t-\t-\tIMPACT=MODIFIER".to_string(),
+        ]
+    );
+    let tab_motif = |uploaded: &str,
+                     location: &str,
+                     allele: &str,
+                     id: &str,
+                     strand: &str,
+                     matrix: &str,
+                     pos: &str,
+                     factors: &str| {
+        format!(
+            "{uploaded}\t{location}\t{allele}\t-\t{id}\tMotifFeature\tTF_binding_site_variant\t-\t-\t-\t-\t-\t-\tMODIFIER\t-\t{strand}\t-\t-\t{matrix}\t{pos}\t-\t-\t{factors}"
+        )
+    };
+    assert_eq!(
+        rows("tab"),
+        [
+            tab_motif("21_5090724_A/T", "21:5090724", "T", "ENSM00000574814", "1", "ENSPFM0290", "7", "HNF4A,NR2F1,RXRA"),
+            tab_motif("21_5090724_A/T", "21:5090724", "T", "ENSM00000574815", "-1", "ENSPFM0484", "15", "RUNX3"),
+            "21_5090724_A/T\t21:5090724\tT\t-\t-\t-\tintergenic_variant\t-\t-\t-\t-\t-\t-\tMODIFIER\t-\t-\t-\t-\t-\t-\t-\t-\t-".to_string(),
+            "rs868224642\t21:46699255\tC\t-\tENSR21_C6M55\tRegulatoryFeature\tregulatory_region_variant\t-\t-\t-\t-\t-\t-\tMODIFIER\t-\t-\t-\tenhancer\t-\t-\t-\t-\t-".to_string(),
+            tab_motif("rs868224642", "21:46699255", "C", "ENSM00000588223", "-1", "ENSPFM0427", "5", "NRF1"),
+            tab_motif("rs868224642", "21:46699255", "C", "ENSM00000588224", "1", "ENSPFM0427", "8", "NRF1"),
+            tab_motif("rs868224642", "21:46699255", "C", "ENSM00000588225", "-1", "ENSPFM0427", "11", "NRF1"),
+            tab_motif("rs868224642", "21:46699255", "C", "ENSM00000588226", "1", "ENSPFM0427", "2", "NRF1"),
+            "rs868224642\t21:46699255\tC\t-\t-\t-\tintergenic_variant\t-\t-\t-\t-\t-\t-\tMODIFIER\t-\t-\t-\t-\t-\t-\t-\t-\t-".to_string(),
+        ]
+    );
+    let vcf: Vec<String> = rows("vcf")
+        .iter()
+        .map(|line| line.split('\t').nth(7).unwrap().to_string())
+        .collect();
+    let csq_motif = |allele: &str,
+                     id: &str,
+                     strand: &str,
+                     matrix: &str,
+                     pos: &str,
+                     factors: &str| {
+        format!("{allele}|TF_binding_site_variant|MODIFIER|||MotifFeature|{id}|||||||||||||{strand}||||{matrix}|{pos}|||{factors}")
+    };
+    assert_eq!(
+        vcf,
+        [
+            format!(
+                "CSQ={},{},T|intergenic_variant|MODIFIER|||||||||||||||||||||||||",
+                csq_motif("T", "ENSM00000574814", "1", "ENSPFM0290", "7", "HNF4A&NR2F1&RXRA"),
+                csq_motif("T", "ENSM00000574815", "-1", "ENSPFM0484", "15", "RUNX3")
+            ),
+            format!(
+                "CSQ=C|regulatory_region_variant|MODIFIER|||RegulatoryFeature|ENSR21_C6M55|enhancer||||||||||||||||||||,{},{},{},{},C|intergenic_variant|MODIFIER|||||||||||||||||||||||||",
+                csq_motif("C", "ENSM00000588223", "-1", "ENSPFM0427", "5", "NRF1"),
+                csq_motif("C", "ENSM00000588224", "1", "ENSPFM0427", "8", "NRF1"),
+                csq_motif("C", "ENSM00000588225", "-1", "ENSPFM0427", "11", "NRF1"),
+                csq_motif("C", "ENSM00000588226", "1", "ENSPFM0427", "2", "NRF1")
+            ),
+        ]
+    );
+    let json: Vec<Value> = rows("json")
+        .iter()
+        .map(|line| {
+            let mut record: Value = serde_json::from_str(line).unwrap();
+            // The input line and the version key are vep-rs's own, outside the comparison.
+            record.as_object_mut().unwrap().remove("input");
+            record.as_object_mut().unwrap().remove("vep_rs_version");
+            record
+        })
+        .collect();
+    let motif = |id: &str, matrix: &str, pos: u32, strand: i32, factors: &[&str], allele: &str| {
+        serde_json::json!({
+            "consequence_terms": ["TF_binding_site_variant"], "impact": "MODIFIER",
+            "motif_feature_id": id, "motif_name": matrix, "motif_pos": pos, "strand": strand,
+            "transcription_factors": factors, "variant_allele": allele
+        })
+    };
+    assert_eq!(
+        json,
+        [
+            serde_json::json!({
+                "allele_string": "A/T", "assembly_name": "GRCh38", "end": 5090724, "id": ".",
+                "intergenic_consequences": [{"consequence_terms": ["intergenic_variant"], "impact": "MODIFIER", "variant_allele": "T"}],
+                "most_severe_consequence": "TF_binding_site_variant",
+                "motif_feature_consequences": [
+                    motif("ENSM00000574814", "ENSPFM0290", 7, 1, &["HNF4A", "NR2F1", "RXRA"], "T"),
+                    motif("ENSM00000574815", "ENSPFM0484", 15, -1, &["RUNX3"], "T"),
+                ],
+                "seq_region_name": "21", "start": 5090724, "strand": 1
+            }),
+            serde_json::json!({
+                "allele_string": "G/C", "assembly_name": "GRCh38", "end": 46699255, "id": "rs868224642",
+                "intergenic_consequences": [{"consequence_terms": ["intergenic_variant"], "impact": "MODIFIER", "variant_allele": "C"}],
+                "most_severe_consequence": "TF_binding_site_variant",
+                "motif_feature_consequences": [
+                    motif("ENSM00000588223", "ENSPFM0427", 5, -1, &["NRF1"], "C"),
+                    motif("ENSM00000588224", "ENSPFM0427", 8, 1, &["NRF1"], "C"),
+                    motif("ENSM00000588225", "ENSPFM0427", 11, -1, &["NRF1"], "C"),
+                    motif("ENSM00000588226", "ENSPFM0427", 2, 1, &["NRF1"], "C"),
+                ],
+                "regulatory_feature_consequences": [{"biotype": "enhancer", "consequence_terms": ["regulatory_region_variant"], "impact": "MODIFIER", "regulatory_feature_id": "ENSR21_C6M55", "variant_allele": "C"}],
+                "seq_region_name": "21", "start": 46699255, "strand": 1
+            }),
+        ]
+    );
+}
+
 #[test]
 fn regulatory_and_motif_rows_use_dash_for_absent_gene() {
     let dir = tempfile::tempdir().unwrap();

@@ -955,16 +955,26 @@ fn base_args(run: &Run, out_dir: &Path) -> Vec<String> {
 /// on chromosome 22, which the command line's lazy loader reads only for a
 /// record of that chromosome.
 pub fn regulatory_cache(dir: &Path) -> PathBuf {
+    regulatory_cache_with(dir, include_bytes!("../fixtures/regulatory/1-1000000.json"))
+}
+
+/// [`regulatory_cache`] over the slice of the converted chromosome 21 cache
+/// (`fixtures/regulatory/chr21-slice.json`, described in the fixtures' README):
+/// seven features as the converter wrote them.
+pub fn regulatory_cache_of_real_features(dir: &Path) -> PathBuf {
+    regulatory_cache_with(
+        dir,
+        include_bytes!("../fixtures/regulatory/chr21-slice.json"),
+    )
+}
+
+fn regulatory_cache_with(dir: &Path, shard: &[u8]) -> PathBuf {
     let cache = dir.join("cache");
     fs::create_dir_all(cache.join("transcripts/21")).unwrap();
     fs::create_dir_all(cache.join("regulatory/21")).unwrap();
     fs::create_dir_all(cache.join("regulatory/22")).unwrap();
     fs::write(cache.join("transcripts/21/1-1000000.json"), "[]").unwrap();
-    fs::write(
-        cache.join("regulatory/21/1-1000000.json"),
-        include_bytes!("../fixtures/regulatory/1-1000000.json"),
-    )
-    .unwrap();
+    fs::write(cache.join("regulatory/21/1-50000000.json"), shard).unwrap();
     fs::write(cache.join("regulatory/22/1-1000000.json"), "[").unwrap();
     fs::write(
         cache.join("info.json"),
