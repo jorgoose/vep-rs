@@ -226,13 +226,16 @@ impl RegulatorySource {
                     variant.alt_allele().len() < variant.ref_allele.len()
                         || variant.alt_allele() == b"-"
                 };
-                let amplification = variant.is_structural
-                    && matches!(
+                let amplification = if variant.is_structural {
+                    matches!(
                         variant.variant_class,
                         VariantClass::Duplication
                             | VariantClass::TandemDuplication
                             | VariantClass::TandemRepeat
-                    );
+                    )
+                } else {
+                    repeats_reference(&variant.ref_allele, variant.alt_allele())
+                };
                 if deletion {
                     row.consequences
                         .push(if feature.feature_type == FeatureType::MotifFeature {
@@ -293,6 +296,21 @@ impl RegulatorySource {
             variant.most_severe_consequence = Some(term);
         }
     }
+}
+
+/// Ensembl VEP's `tandem_repeat` predicate for a sequence variant
+/// (`Utils/VariationEffect.pm:282-298`): the alternate allele is the reference
+/// allele repeated, so a variant covering a whole feature amplifies it. `-`
+/// reads as the empty allele, and an empty allele on either side is no repeat.
+fn repeats_reference(reference: &[u8], alternate: &[u8]) -> bool {
+    let reference = if reference == b"-" { b"" } else { reference };
+    let alternate = if alternate == b"-" { b"" } else { alternate };
+    !reference.is_empty()
+        && alternate.len() > reference.len()
+        && alternate.len() % reference.len() == 0
+        && alternate
+            .chunks(reference.len())
+            .all(|copy| copy == reference)
 }
 
 #[cfg(test)]
@@ -437,5 +455,65 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A sequence variant whose alternate allele repeats its reference allele
+    /// is Ensembl VEP's `tandem_repeat` (`Utils/VariationEffect.pm:282-298`),
+    /// a copy-number gain, so covering a feature with it is an amplification
+    /// (`feature_amplification`, `:330-335`) beside the overlap term; a longer
+    /// allele that is not a repeat is the overlap term alone.
+    #[test]
+    fn repeated_reference_allele_covering_a_feature_amplifies_it() {
+        let (_dir, source) = source();
+        source.prewarm("21").unwrap();
+        let reference = b"ACGTACGTACGTACGTACGTA";
+        let repeated = [&reference[..], &reference[..]].concat();
+        let mut v = variant(100, 120, reference, &repeated);
+        source.annotate(&mut v);
+        // The writer orders the rows; the annotator's own order is not part of
+        // the contract, so compare them sorted by id.
+        let mut terms: Vec<_> = v
+            .transcript_consequences
+            .iter()
+            .map(|r| (r.transcript_id.as_ref(), r.consequences.to_vec()))
+            .collect();
+        terms.sort();
+        assert_eq!(
+            terms,
+            [
+                (
+                    "ENSM_FORWARD",
+                    vec![
+                        Consequence::TfbsAmplification,
+                        Consequence::TfBindingSiteVariant
+                    ]
+                ),
+                (
+                    "ENSM_REVERSE",
+                    vec![
+                        Consequence::TfbsAmplification,
+                        Consequence::TfBindingSiteVariant
+                    ]
+                ),
+                (
+                    "ENSR_FIXTURE",
+                    vec![
+                        Consequence::RegulatoryRegionAmplification,
+                        Consequence::RegulatoryRegionVariant
+                    ]
+                ),
+            ]
+        );
+        let mut longer = variant(100, 120, reference, b"ACGTACGTACGTACGTACGTAC");
+        source.annotate(&mut longer);
+        assert!(longer
+            .transcript_consequences
+            .iter()
+            .all(|r| r.consequences.len() == 1));
+        assert!(repeats_reference(b"AC", b"ACACAC"));
+        assert!(!repeats_reference(b"AC", b"ACAC-"));
+        assert!(!repeats_reference(b"-", b"ACAC"));
+        assert!(!repeats_reference(b"AC", b"AC"));
+        assert!(!repeats_reference(b"AC", b"ACA"));
     }
 }
