@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::loader::LoadedPlugin;
-use crate::PluginError;
+use crate::{FeatureType, PluginError};
 use vep_core::sv_routing::split_plugin_arg;
 
 /// Registry of loaded plugins.
@@ -81,7 +81,7 @@ impl PluginRegistry {
             plugin.feature_types().iter().any(|t| {
                 matches!(
                     t,
-                    crate::FeatureType::RegulatoryFeature | crate::FeatureType::MotifFeature
+                    FeatureType::RegulatoryFeature | FeatureType::MotifFeature
                 )
             })
         })

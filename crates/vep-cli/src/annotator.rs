@@ -529,6 +529,21 @@ pub(crate) struct LoadedPlugins {
     pub(crate) dylib: PluginRegistry,
 }
 
+/// Whether the run annotates regulatory features: `--regulatory` (given or
+/// implied by `--everything`), or a loaded plugin that declares regulatory or
+/// motif features, which Ensembl VEP switches the option on for
+/// (`Runner.pm:998-1002`).
+pub(crate) fn regulatory_enabled(config: &Config, dylib: &PluginRegistry) -> bool {
+    if config.regulatory {
+        return true;
+    }
+    if dylib.wants_regulatory_features() {
+        info!("Fetching regulatory features for a plugin that declares them");
+        return true;
+    }
+    false
+}
+
 /// Load the `--plugin` arguments as `get_all_Plugins` does (Runner.pm:901-960):
 /// a plugins directory that does not exist is warned about when a plugin is named,
 /// an error under `safe` (`:911-918`); each argument is `Name,param,param`
@@ -545,21 +560,6 @@ pub(crate) struct LoadedPlugins {
 /// tabix-TSV GERP reader, and CADD / dbscSNV use it to refuse a data file whose own
 /// declared assembly contradicts the run. Passing `None` leaves every one of those
 /// guards inert, so a wrong-assembly file annotates nothing and still exits 0.
-/// Whether the run annotates regulatory features: `--regulatory` (given or
-/// implied by `--everything`), or a loaded plugin that declares regulatory or
-/// motif features, which Ensembl VEP switches the option on for
-/// (`Runner.pm:998-1002`).
-pub(crate) fn regulatory_enabled(config: &Config, dylib: &PluginRegistry) -> bool {
-    if config.regulatory {
-        return true;
-    }
-    if dylib.wants_regulatory_features() {
-        info!("Fetching regulatory features for a plugin that declares them");
-        return true;
-    }
-    false
-}
-
 pub(crate) fn load_plugins(
     plugin_args: &[String],
     dir_plugins: &str,

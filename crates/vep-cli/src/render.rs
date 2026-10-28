@@ -745,11 +745,6 @@ mod tests {
         }
     }
 
-    /// The default-format bytes of a multi-allelic record with shared and
-    /// distinct transcripts, an intergenic allele and co-located ids are those of
-    /// the owned-string renderer, under the unconditional group alone, under
-    /// every optional group, and under a group set whose rows carry no plugin
-    /// key; a column copied from the allele's first row prints on every row.
     /// A record inside a regulatory feature and no transcript writes its
     /// `RegulatoryFeature` row with `-` in the Gene cell and then its intergenic
     /// companion row with `-` in the Gene, Feature and Feature_type cells and
@@ -805,6 +800,11 @@ mod tests {
         assert_eq!(rows[0][13], "IMPACT=MODIFIER;BIOTYPE=enhancer");
     }
 
+    /// The default-format bytes of a multi-allelic record with shared and
+    /// distinct transcripts, an intergenic allele and co-located ids are those of
+    /// the owned-string renderer, under the unconditional group alone, under
+    /// every optional group, and under a group set whose rows carry no plugin
+    /// key; a column copied from the allele's first row prints on every row.
     #[test]
     fn default_record_bytes_match_the_string_renderer() {
         let record = record();

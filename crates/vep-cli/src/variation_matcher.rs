@@ -1449,7 +1449,6 @@ mod tests {
     /// path, where its BIOTYPE prints.
     #[test]
     fn transcript_rows_keep_the_fast_path_under_the_regulatory_group_alone() {
-        use vep_core::consequence::FeatureType;
         let variant = InputVariant::new("21".into(), 100, 100, b"A".to_vec(), b"G".to_vec());
         let transcript = TranscriptConsequence {
             impact: Impact::MODIFIER,

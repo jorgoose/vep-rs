@@ -1180,6 +1180,7 @@ mod tests {
 
     #[test]
     fn regulatory_shards_preserve_raw_matrices_and_empty_arrays() {
+        use std::io::Write;
         let tmp = Scratch::new();
         let src = tmp.path().join("src");
         fs::create_dir_all(src.join("LRG_485")).unwrap();
@@ -1193,7 +1194,7 @@ mod tests {
         fs::write(src.join("LRG_485/not-a-region.json"), b"{}").unwrap();
         // A gzip-compressed shard is copied as it is, once its inflated content parses.
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-        std::io::Write::write_all(&mut encoder, raw).unwrap();
+        encoder.write_all(raw).unwrap();
         let compressed = encoder.finish().unwrap();
         fs::write(src.join("LRG_485/2000001-3000000.json.gz"), &compressed).unwrap();
         let dst = tmp.path().join("dst");
@@ -1225,7 +1226,7 @@ mod tests {
     #[test]
     fn regulatory_shards_are_parsed_as_the_annotator_parses_them() {
         for (shard, phrase) in [
-            (&br#"{}"#[..], "expected a sequence"),
+            (&b"{}"[..], "expected a sequence"),
             (
                 br#"[{"stable_id":"T1","start":1,"end":2,"strand":1,"feature_type":"Transcript"}]"#,
                 "unknown variant `Transcript`",

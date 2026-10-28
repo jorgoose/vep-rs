@@ -712,7 +712,7 @@ impl<'env> Prewarmer<'env> {
 
 /// Warms one chromosome's transcript index and, under `--regulatory`, its
 /// regulatory features, the two loads a chromosome crossing needs.
-fn prewarm_chromosome(
+pub(crate) fn prewarm_chromosome(
     transcripts: &LazyTranscriptIndexes,
     regulatory: Option<&crate::regulatory::RegulatorySource>,
     chr: &str,

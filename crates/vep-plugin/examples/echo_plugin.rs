@@ -4,13 +4,13 @@
 //! Example C-ABI plugin: echoes the consequence's feature id, and the first
 //! `--plugin` parameter when one was given, back as Extra-column fields.
 //!
-//! Built as a `cdylib`, so the eight `vep_plugin_*` symbols below are exactly what
-//! `LoadedPlugin::load` looks up, with the signatures in `vep_plugin::abi::ffi`,
-//! plus the optional `vep_plugin_feature_types`: a parameter
-//! `feature_types=Transcript;RegulatoryFeature` (semicolon-separated, since the
-//! `--plugin` list splits on commas) names the rows the plugin runs on, and
-//! without one the plugin declares `Transcript`, the host's default.
-//! Every string handed to the host is a `CString::into_raw`, which
+//! Built as a `cdylib`, so the `vep_plugin_*` symbols below are exactly what
+//! `LoadedPlugin::load` looks up, with the signatures in `vep_plugin::abi::ffi`.
+//! The optional `vep_plugin_feature_types` names the rows the plugin runs on: a
+//! parameter `feature_types=Transcript;RegulatoryFeature` (semicolon-separated,
+//! since the `--plugin` list splits on commas) sets the list, and without one
+//! the plugin declares `Transcript`, the host's default.
+//! The result `vep_plugin_run` hands to the host is a `CString::into_raw`, which
 //! `vep_plugin_free` reclaims with `CString::from_raw`; the name, version and
 //! feature-type pointers stay valid because their `CString`s live inside the
 //! boxed instance. The consequence JSON is read with a string scan for the one
@@ -88,10 +88,10 @@ pub unsafe extern "C" fn vep_plugin_init(
             return 1;
         };
         if let Some(types) = param.strip_prefix("feature_types=") {
-            match CString::new(types.replace(';', ",")) {
-                Ok(types) => plugin.feature_types = types,
-                Err(_) => return 1,
-            }
+            let Ok(c_types) = CString::new(types.replace(';', ",")) else {
+                return 1;
+            };
+            plugin.feature_types = c_types;
         } else if plugin.param.is_none() {
             plugin.param = Some(param.to_owned());
         }

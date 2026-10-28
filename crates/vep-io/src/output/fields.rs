@@ -391,9 +391,10 @@ impl FieldOptions {
     }
 
     /// True when no group beyond `user` and `regulatory` is on: a transcript row
-    /// then carries IMPACT, DISTANCE, STRAND and FLAGS alone, since the six
-    /// regulatory fields are empty on it (BIOTYPE prints on a transcript row under
-    /// its own `biotype` group), and only a regulatory or motif row carries more.
+    /// then carries IMPACT, DISTANCE, STRAND and FLAGS alone, since the
+    /// `regulatory` group's fields are empty on it (BIOTYPE prints on a transcript
+    /// row under its own `biotype` group), and only a regulatory or motif row
+    /// carries more.
     pub fn only_regulatory_group_beyond_user(&self) -> bool {
         FLAG_FIELD_GROUPS
             .iter()
@@ -421,7 +422,7 @@ pub struct ExtraFieldsPlan {
     pub options: FieldOptions,
     /// [`flag_fields`] of `options`.
     pub flag_fields: Vec<&'static str>,
-    /// [`flag_fields`] without the five motif fields, which a motif row alone
+    /// [`flag_fields`] without [`MOTIF_FIELDS`], which a motif row alone
     /// carries: the keys a transcript or intergenic row can print.
     pub transcript_flag_fields: Vec<&'static str>,
     /// [`FieldOptions::any_optional_group`] of `options`.
@@ -1621,7 +1622,7 @@ fn write_row_field_value(
             }
         }
         "TRANSCRIPTION_FACTORS" => {
-            if let Some(motif) = tc.and_then(|row| row.motif.as_deref()) {
+            if let Some(motif) = tc.and_then(|x| x.motif.as_deref()) {
                 push_joined(out, motif.factors.iter().map(AsRef::as_ref), list_sep);
             }
         }
@@ -2914,13 +2915,7 @@ mod tests {
                 .unwrap_or_default(),
             "TRANSCRIPTION_FACTORS" => tc
                 .and_then(|x| x.motif.as_deref())
-                .map(|m| {
-                    m.factors
-                        .iter()
-                        .map(AsRef::as_ref)
-                        .collect::<Vec<_>>()
-                        .join(list_sep)
-                })
+                .map(|m| m.factors.join(list_sep))
                 .unwrap_or_default(),
             "MAX_AF" => frequency::max_af(variant, &options.frequency_groups())
                 .map(|(max, _)| max)

@@ -39,7 +39,8 @@ Masks, floors and field pairs (comparison mode):
   rows in every format for a candidate cache without regulatory data, recomputes the
   ``most_severe_consequence`` of each JSON record that lost a row from the rows that remain,
   and in ``--warnings`` mode requires the candidate's notice about missing regulatory data
-  (or the notice of releases 0.1.0 to 0.5.0) and leaves it out of the comparison. The class ``order_only`` is built in too: the set-valued columns
+  (or the notice of releases 0.1.0 to 0.5.0) and leaves it out of the comparison. The class
+  ``order_only`` is built in too: the set-valued columns
   ``DOMAINS``, ``FREQS`` and ``ZYG`` (and the ``Extra`` text carrying them) agree when their
   items agree as a multiset in any order, since Ensembl VEP prints the protein features in
   the order of the cache's array and the frequencies and the per-sample zygosities in hash
@@ -1393,11 +1394,11 @@ def filter_consequence_rows(
             lost_rows.add(record)
     kept: list[Entry] = []
     for e in entries:
-        record = e.key.split("|", 1)[0]
         if not e.key.endswith("|record"):
             if keep(e):
                 kept.append(e)
             continue
+        record = e.key.split("|", 1)[0]
         if not keep_bare_records and record not in terms_by_record:
             continue
         if record in lost_rows and "most_severe_consequence" in e.fields:

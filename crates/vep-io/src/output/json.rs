@@ -278,7 +278,7 @@ impl JsonOutputFormatter {
             let value = fields::field_value(name, variant, tc, &self.options, ",");
             if name == "TRANSCRIPTION_FACTORS"
                 && value.is_empty()
-                && tc.is_some_and(|row| row.motif.is_some())
+                && fields::empty_value_is_written(name, variant, tc, &self.options)
             {
                 obj.insert(json_key(name), Value::Array(Vec::new()));
                 continue;

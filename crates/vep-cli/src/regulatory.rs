@@ -378,11 +378,14 @@ impl RegulatorySource {
             .flat_map(|r| &r.consequences)
             .copied()
             .min_by_key(|c| c.rank());
-        variant.most_severe_consequence = match (variant.most_severe_consequence, worst_added) {
-            (Some(current), Some(added)) if added.rank() < current.rank() => Some(added),
-            (None, added) => added,
-            (current, _) => current,
-        };
+        if let Some(worst_added) = worst_added {
+            let outranks_current = variant
+                .most_severe_consequence
+                .is_none_or(|current| worst_added.rank() < current.rank());
+            if outranks_current {
+                variant.most_severe_consequence = Some(worst_added);
+            }
+        }
     }
 }
 
@@ -405,6 +408,21 @@ fn repeats_reference(reference: &[u8], alternate: &[u8]) -> bool {
 mod tests {
     use super::*;
 
+    /// A cache at `dir` whose metadata declares regulatory data.
+    fn resolved_cache(dir: &Path) -> ResolvedCache {
+        ResolvedCache {
+            dir: dir.to_string_lossy().into_owned(),
+            info: vep_core::cache_info::CacheInfo {
+                regulatory: true,
+                ..Default::default()
+            },
+            manifest: Arc::new(CacheManifest::load(dir).unwrap()),
+            assembly: Some("GRCh38".into()),
+            fasta: None,
+            synonyms: Arc::new(Default::default()),
+        }
+    }
+
     fn source() -> (tempfile::TempDir, Arc<RegulatorySource>) {
         let dir = tempfile::tempdir().unwrap();
         let chr = dir.path().join("regulatory/21");
@@ -413,18 +431,9 @@ mod tests {
         std::fs::write(chr.join("1-1000000.json"), fixture).unwrap();
         // Overlapping shards repeat features; the loader must emit each feature once.
         std::fs::write(chr.join("1000001-2000000.json"), fixture).unwrap();
-        let cache = ResolvedCache {
-            dir: dir.path().to_string_lossy().into_owned(),
-            info: vep_core::cache_info::CacheInfo {
-                regulatory: true,
-                ..Default::default()
-            },
-            manifest: Arc::new(CacheManifest::load(dir.path()).unwrap()),
-            assembly: Some("GRCh38".into()),
-            fasta: None,
-            synonyms: Arc::new(Default::default()),
-        };
-        let source = RegulatorySource::open(&cache, true).unwrap().unwrap();
+        let source = RegulatorySource::open(&resolved_cache(dir.path()), true)
+            .unwrap()
+            .unwrap();
         (dir, source)
     }
 
@@ -524,18 +533,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(chr.join("1-1000000.json.gz"), encoder.finish().unwrap()).unwrap();
-        let cache = |dir: &std::path::Path| ResolvedCache {
-            dir: dir.to_string_lossy().into_owned(),
-            info: vep_core::cache_info::CacheInfo {
-                regulatory: true,
-                ..Default::default()
-            },
-            manifest: Arc::new(CacheManifest::load(dir).unwrap()),
-            assembly: Some("GRCh38".into()),
-            fasta: None,
-            synonyms: Arc::new(Default::default()),
-        };
-        let source = RegulatorySource::open(&cache(dir.path()), true)
+        let source = RegulatorySource::open(&resolved_cache(dir.path()), true)
             .unwrap()
             .unwrap();
         source.prewarm("21").unwrap();
@@ -550,7 +548,7 @@ mod tests {
         let other = dir.path().join("regulatory/22");
         std::fs::create_dir_all(&other).unwrap();
         std::fs::write(other.join("1-1000000.json.bak"), b"[]").unwrap();
-        let error = match RegulatorySource::open(&cache(dir.path()), true) {
+        let error = match RegulatorySource::open(&resolved_cache(dir.path()), true) {
             Err(error) => error.to_string(),
             Ok(_) => panic!("a directory without shards opened"),
         };

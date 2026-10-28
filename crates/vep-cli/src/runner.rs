@@ -2834,13 +2834,7 @@ impl AnnotationResources {
 
     /// Materialize chromosome-scoped caches before either streaming or batch workers run.
     pub(crate) fn prewarm_chromosome(&self, chr: &str) -> anyhow::Result<()> {
-        self.transcripts.prewarm(chr)?;
-        if let Some(source) = &self.regulatory_source {
-            source
-                .prewarm(chr)
-                .map_err(|error| CliError::new("cache", format!("{error:#}")))?;
-        }
-        Ok(())
+        pipeline::prewarm_chromosome(&self.transcripts, self.regulatory_source.as_deref(), chr)
     }
 
     pub(crate) fn synonyms(&self) -> &ChromosomeSynonyms {
