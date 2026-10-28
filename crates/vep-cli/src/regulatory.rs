@@ -3,12 +3,13 @@
 
 //! Cache-backed regulatory overlaps (Ensembl VEP 116.2).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::Context;
 use rayon::prelude::*;
+use rustc_hash::FxHashMap;
 use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use vep_core::cache_manifest::CacheManifest;
@@ -131,7 +132,7 @@ struct Index {
 
 /// Regulatory JSON shards, enumerated eagerly and parsed once per queried chromosome.
 pub struct RegulatorySource {
-    chromosomes: HashMap<String, Chromosome>,
+    chromosomes: FxHashMap<String, Chromosome>,
     manifest: Arc<CacheManifest>,
 }
 
@@ -148,7 +149,7 @@ impl RegulatorySource {
             crate::warnings::global().warn("--regulatory has no effect: no regulatory data is available in the cache, so no TFBS_* or regulatory_region_* consequence is emitted");
             return Ok(None);
         }
-        let mut chromosomes = HashMap::new();
+        let mut chromosomes = FxHashMap::default();
         for entry in std::fs::read_dir(&root)? {
             let entry = entry?;
             if !entry.file_type()?.is_dir()
@@ -349,31 +350,39 @@ impl RegulatorySource {
                     "TRANSCRIPTION_FACTORS".into(),
                     matrix.transcription_factors.join(","),
                 );
-                let relative = i128::from(start) - i128::from(feature.start) + 1;
+                let relative = start as i64 - feature.start as i64 + 1;
                 let position = if feature.strand < 0 {
-                    i128::from(matrix.length) - relative + 1
+                    matrix.length as i64 - relative + 1
                 } else {
                     relative
                 };
-                if position >= 1 && position <= i128::from(feature.end - feature.start + 1) {
+                if position >= 1 && position <= (feature.end - feature.start + 1) as i64 {
                     row.plugin_data
                         .insert("MOTIF_POS".into(), position.to_string());
                 }
             }
             variant.transcript_consequences.push(row);
         }
-        if initial_rows == 0 && !variant.transcript_consequences.is_empty() {
+        let added = &variant.transcript_consequences[initial_rows..];
+        if added.is_empty() {
+            return;
+        }
+        if initial_rows == 0 {
             variant.intergenic_overlap = true;
         }
-        if let Some(term) = variant
-            .transcript_consequences
+        // The transcript path left the record's verdict at the least rank of its
+        // rows; the added rows fold into it, so a record that gained no row, the
+        // common case, is not rescanned.
+        let worst_added = added
             .iter()
             .flat_map(|r| &r.consequences)
             .copied()
-            .min_by_key(|c| c.rank())
-        {
-            variant.most_severe_consequence = Some(term);
-        }
+            .min_by_key(|c| c.rank());
+        variant.most_severe_consequence = match (variant.most_severe_consequence, worst_added) {
+            (Some(current), Some(added)) if added.rank() < current.rank() => Some(added),
+            (None, added) => added,
+            (current, _) => current,
+        };
     }
 }
 
