@@ -591,7 +591,8 @@ fn copy_regulatory_files(src_dir: &Path, dst_dir: &Path) -> Result<usize> {
     chromosomes.sort_by_key(|entry| entry.file_name());
     let mut written = 0;
     for chromosome in chromosomes {
-        let chr_name = chromosome.file_name().to_string_lossy().into_owned();
+        let file_name = chromosome.file_name();
+        let chr_name = file_name.to_string_lossy();
         if !chromosome.path().is_dir() {
             warn!(
                 "Skipping file with unexpected name: regulatory/{}",
@@ -599,14 +600,19 @@ fn copy_regulatory_files(src_dir: &Path, dst_dir: &Path) -> Result<usize> {
             );
             continue;
         }
-        if !is_cache_path_component(&chr_name) {
+        // A record names its chromosome as text, so a directory whose name is
+        // not UTF-8 names no chromosome; its lossy spelling would name one no
+        // record reaches.
+        let Some(chr) = file_name
+            .to_str()
+            .filter(|name| is_cache_path_component(name))
+        else {
             warn!(
                 "Skipping directory with unexpected name: regulatory/{}",
                 chr_name
             );
             continue;
-        }
-        let chr = chr_name.as_str();
+        };
         let mut shards: Vec<_> = fs::read_dir(chromosome.path())
             .with_context(|| format!("Failed to read regulatory chromosome {chr}"))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -660,9 +666,22 @@ fn copy_variation_files(src_dir: &Path, dst_dir: &Path) -> Result<(usize, usize)
     let mut planned: Vec<(String, String, PathBuf)> = Vec::new();
     for entry in &entries {
         let path = entry.path();
-        let name = entry.file_name().to_string_lossy().into_owned();
+        let entry_name = entry.file_name();
+        // The chromosome is read from the entry's name, a directory's or a flat
+        // file's prefix, and a record names its chromosome as text, so a name
+        // that is not UTF-8 names none; its lossy spelling would name one no
+        // record reaches.
+        let Some(name) = entry_name.to_str() else {
+            let lossy = entry_name.to_string_lossy();
+            if path.is_dir() {
+                warn!("Skipping directory with unexpected name: {}", lossy);
+            } else {
+                warn!("Skipping file with unexpected name: {}", lossy);
+            }
+            continue;
+        };
         if path.is_dir() {
-            if !is_cache_path_component(&name) {
+            if !is_cache_path_component(name) {
                 warn!("Skipping directory with unexpected name: {}", name);
                 continue;
             }
@@ -673,7 +692,7 @@ fn copy_variation_files(src_dir: &Path, dst_dir: &Path) -> Result<(usize, usize)
             for file in files {
                 let file_name = file.file_name().to_string_lossy().into_owned();
                 if variation_file_kind(&file_name).is_some() {
-                    planned.push((name.clone(), file_name, file.path()));
+                    planned.push((name.to_string(), file_name, file.path()));
                 } else if file_name.ends_with(".json") {
                     return Err(json_shard_error(&file.path()));
                 } else {
@@ -682,7 +701,7 @@ fn copy_variation_files(src_dir: &Path, dst_dir: &Path) -> Result<(usize, usize)
             }
         } else if name.ends_with(".json") {
             return Err(json_shard_error(&path));
-        } else if let Some((chr, file_name)) = split_flat_variation_name(&name) {
+        } else if let Some((chr, file_name)) = split_flat_variation_name(name) {
             planned.push((chr, file_name, path));
         } else {
             warn!("Skipping file with unexpected name: {}", name);
@@ -973,6 +992,57 @@ mod tests {
         assert_eq!(copy_variation_files(&src, &out).unwrap(), (1, 2));
         assert_eq!(entries(&out), ["21"]);
         assert_eq!(entries(&out.join("21")), ["all_vars.gz", "all_vars.gz.csi"]);
+    }
+
+    /// A chromosome directory, or a flat variation file, whose name is not
+    /// UTF-8 is skipped with the warning every unexpected name gets, in the
+    /// regulatory tree and the variations tree alike: a record names its
+    /// chromosome as text, so the lossy spelling of such a name would name a
+    /// chromosome no record reaches. The entries beside it are copied. A Linux
+    /// file system stores the name's bytes as they are; other platforms refuse
+    /// such a name.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_chromosome_whose_name_is_not_utf8_is_skipped() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let tmp = Scratch::new();
+        let names = [OsStr::new("21"), OsStr::from_bytes(b"21\xff")];
+        let regulatory = tmp.path().join("regulatory");
+        for chr in names {
+            let dir = regulatory.join(chr);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("1-1000000.json"), b"[]").unwrap();
+        }
+        let out = tmp.path().join("out");
+        assert_eq!(
+            copy_regulatory_files(&regulatory, &out.join("regulatory")).unwrap(),
+            1
+        );
+        assert_eq!(entries(&out.join("regulatory")), ["21"]);
+
+        let variations = tmp.path().join("variations");
+        for chr in names {
+            let dir = variations.join(chr);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("all_vars.gz"), b"gz").unwrap();
+            fs::write(dir.join("all_vars.gz.csi"), b"csi").unwrap();
+        }
+        fs::write(
+            variations.join(OsStr::from_bytes(b"22\xff_all_vars.gz")),
+            b"gz",
+        )
+        .unwrap();
+        fs::write(
+            variations.join(OsStr::from_bytes(b"22\xff_all_vars.gz.csi")),
+            b"csi",
+        )
+        .unwrap();
+        assert_eq!(
+            copy_variation_files(&variations, &out.join("variations")).unwrap(),
+            (1, 2)
+        );
+        assert_eq!(entries(&out.join("variations")), ["21"]);
     }
 
     #[test]
