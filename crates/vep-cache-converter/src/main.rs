@@ -591,26 +591,35 @@ fn copy_regulatory_files(src_dir: &Path, dst_dir: &Path) -> Result<usize> {
     chromosomes.sort_by_key(|entry| entry.file_name());
     let mut written = 0;
     for chromosome in chromosomes {
-        let chr_name = chromosome.file_name();
-        let Some(chr) = chr_name.to_str().filter(|chr| is_cache_path_component(chr)) else {
-            continue;
-        };
+        let chr_name = chromosome.file_name().to_string_lossy().into_owned();
         if !chromosome.path().is_dir() {
+            warn!(
+                "Skipping file with unexpected name: regulatory/{}",
+                chr_name
+            );
             continue;
         }
+        if !is_cache_path_component(&chr_name) {
+            warn!(
+                "Skipping directory with unexpected name: regulatory/{}",
+                chr_name
+            );
+            continue;
+        }
+        let chr = chr_name.as_str();
         let mut shards: Vec<_> = fs::read_dir(chromosome.path())
             .with_context(|| format!("Failed to read regulatory chromosome {chr}"))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         shards.sort_by_key(|entry| entry.file_name());
         for shard in shards {
             let path = shard.path();
-            let is_shard = path.is_file()
-                && shard
-                    .file_name()
-                    .to_str()
-                    .and_then(regulatory_shard_range)
-                    .is_some();
+            let shard_name = shard.file_name().to_string_lossy().into_owned();
+            let is_shard = path.is_file() && regulatory_shard_range(&shard_name).is_some();
             if !is_shard {
+                warn!(
+                    "Skipping file with unexpected name: regulatory/{}/{}",
+                    chr, shard_name
+                );
                 continue;
             }
             vep_cli::regulatory::count_shard_features(&path)
