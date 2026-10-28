@@ -2013,6 +2013,7 @@ impl Runner {
             no_headers: self.config.no_headers,
             vcf_formatter: vcf_formatter.as_ref(),
             transcripts: &annotation_resources.transcripts,
+            regulatory: annotation_resources.regulatory_source.as_deref(),
             synonyms: &self.cache.synonyms,
             prewarm_order: &prewarm_order,
             checks: &checks,
