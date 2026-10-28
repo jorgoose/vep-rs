@@ -1179,7 +1179,10 @@ mod tests {
     /// `-/G` insertion's frameshift row on rank and precedes the first allele's
     /// equal row (`multi_dup_plus_ins`, ALLELE_NUM 2). A prefix sorting after the
     /// id (`G/A_`) leaves the first allele's row in front, and each feature's
-    /// reference row of `--process_ref_homs` stays ahead of its alternate.
+    /// reference row of `--process_ref_homs` stays ahead of its alternate. The
+    /// intergenic rows follow in allele order whatever the prefixes: the rejoin
+    /// appends a later allele's intergenic alleles to the record's one intergenic
+    /// variation (`:2323-2338`) instead of rekeying them.
     #[test]
     fn minimal_split_alleles_sort_by_the_rejoin_key() {
         let same = || {
@@ -1235,6 +1238,31 @@ mod tests {
             .map(|r| (r.allele(), record[r.allele()].reference_allele_row))
             .collect();
         assert_eq!(rows, [(2, true), (3, false), (0, true), (1, false)]);
+
+        let regulatory = || {
+            feature(
+                "ENSR1",
+                FeatureType::RegulatoryFeature,
+                Consequence::RegulatoryRegionVariant,
+            )
+        };
+        let mut second = allele(b"T", 1, vec![regulatory()]);
+        second.rejoin_key_prefix = Some("C/T_".into());
+        second.intergenic_overlap = true;
+        let mut third = allele(b"-", 2, vec![regulatory()]);
+        third.rejoin_key_prefix = Some("A/-_".into());
+        third.intergenic_overlap = true;
+        let record = vec![allele(b"G", 0, vec![]), second, third];
+        assert_eq!(
+            record_rows(&record),
+            [
+                Row::Transcript { allele: 2, tc: 0 },
+                Row::Transcript { allele: 1, tc: 0 },
+                Row::Intergenic { allele: 0 },
+                Row::Intergenic { allele: 1 },
+                Row::Intergenic { allele: 2 }
+            ]
+        );
     }
 
     /// `--most_severe` collapses the record to one row carrying the lowest-rank

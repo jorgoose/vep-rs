@@ -997,16 +997,21 @@ pub fn row_ga4gh_vrs<'a>(
 /// or `--most_severe` row (the allele carrying [`InputVariant::summary_terms`]).
 pub type Row<'a> = (&'a InputVariant, Option<&'a TranscriptConsequence>);
 
-/// The rows one input record produces, in VEP's order: transcript-major (by
-/// transcript id) and allele-minor (the reference row of `--process_ref_homs`
-/// first, then ALT order) across every allele split from the record, then one
-/// intergenic row per allele that overlapped no transcript, including alleles
-/// with regulatory or motif rows, or the one `--summary` or `--most_severe` row
-/// the record's first allele carries.
-/// The alleles of a `--minimal` split sort by the keys Ensembl VEP's rejoin
-/// stores their transcript variations under ([`InputVariant::rejoin_key_prefix`]
-/// before the transcript id), so an allele whose key prefix sorts before the
-/// letters of a transcript id prints every one of its rows first.
+/// The rows one input record produces, in VEP's order
+/// (`VariationFeature.pm:855-864`): the transcript rows, then the regulatory
+/// rows, then the motif rows, each kind feature-major (by stable id) and
+/// allele-minor (the reference row of `--process_ref_homs` first, then ALT
+/// order) across every allele split from the record; then one intergenic row
+/// per allele that overlapped no transcript, including alleles with regulatory
+/// or motif rows, the reference row first and then ALT order; or the one
+/// `--summary` or `--most_severe` row the record's first allele carries.
+/// The feature rows of a `--minimal` split allele sort by the keys Ensembl
+/// VEP's rejoin stores its variations under ([`InputVariant::rejoin_key_prefix`]
+/// before the stable id, OutputFactory.pm:2316), so an allele whose key prefix
+/// sorts before the letters of a stable id prints every one of its feature rows
+/// first; the rejoin appends a later allele's intergenic alleles to the record's
+/// one intergenic variation (:2323-2338), so the intergenic rows keep ALT order
+/// whatever the prefixes.
 ///
 /// An allele whose chromosome had no transcripts at all (no `most_severe_consequence`
 /// and no summary row) produces no row, as VEP writes nothing for it.
@@ -1034,35 +1039,34 @@ pub fn record_rows_into<'a>(record: &[&'a InputVariant], rows: &mut Vec<Row<'a>>
             .then(a.0.allele_index.cmp(&b.0.allele_index))
     });
     let intergenic_start = rows.len();
+    // An allele that overlaps no transcript writes its intergenic row, beside its
+    // regulatory and motif rows or alone, or the record's `--summary` or
+    // `--most_severe` row, which stands even with no term (OutputFactory.pm:454-458).
     for variant in record {
-        if variant.intergenic_overlap {
-            rows.push((variant, None));
-        }
-    }
-    rows[intergenic_start..].sort_by(|a, b| {
-        a.0.rejoin_key_prefix
-            .as_deref()
-            .unwrap_or("")
-            .cmp(b.0.rejoin_key_prefix.as_deref().unwrap_or(""))
-            .then(b.0.reference_allele_row.cmp(&a.0.reference_allele_row))
-            .then(a.0.allele_index.cmp(&b.0.allele_index))
-    });
-    // An allele with no feature row writes its intergenic row, or the record's
-    // `--summary` or `--most_severe` row, which stands even with no term
-    // (OutputFactory.pm:454-458).
-    for variant in record {
-        if !variant.intergenic_overlap
-            && variant.transcript_consequences.is_empty()
-            && (variant.most_severe_consequence.is_some() || variant.summary_terms.is_some())
+        if variant.intergenic_overlap
+            || (variant.transcript_consequences.is_empty()
+                && (variant.most_severe_consequence.is_some() || variant.summary_terms.is_some()))
         {
             rows.push((variant, None));
         }
     }
+    // The record's one intergenic variation lists its reference allele, then its
+    // alternate alleles in ALT order (BaseVariationFeatureOverlap.pm:363-373);
+    // the rejoin of a `--minimal` split appends a later allele's alleles to it
+    // instead of rekeying them (OutputFactory.pm:2323-2338), so no rejoin key
+    // enters this order.
+    rows[intergenic_start..].sort_by(|a, b| {
+        b.0.reference_allele_row
+            .cmp(&a.0.reference_allele_row)
+            .then(a.0.allele_index.cmp(&b.0.allele_index))
+    });
 }
 
-/// The order of two feature rows' sort keys ([`rejoin_key`]): by the loader's
-/// ranks when both rows carry one that orders as the key does
-/// ([`orderable_rank`]), else by the keys themselves.
+/// The order of two feature rows: by feature type first (Transcript, then
+/// RegulatoryFeature, then MotifFeature, as `VariationFeature.pm:855-864` lists
+/// the kinds), then by their sort keys ([`rejoin_key`]): the loader's ranks when
+/// both rows carry one that orders as the key does ([`orderable_rank`]), else
+/// the keys themselves.
 fn transcript_order(a: &Row<'_>, b: &Row<'_>) -> std::cmp::Ordering {
     let type_order = (a.1.expect("feature row").feature_type as u8)
         .cmp(&(b.1.expect("feature row").feature_type as u8));
@@ -4107,6 +4111,61 @@ mod tests {
                 ("ENST2".to_string(), 0),
                 ("ENST2".to_string(), 1),
                 (String::new(), 2),
+            ]
+        );
+    }
+
+    /// The intergenic rows of a record keep the reference row first and then ALT
+    /// order whatever the rejoin prefixes of a `--minimal` split, an allele that
+    /// overlaps nothing beside alleles whose regulatory rows come with an
+    /// intergenic row: the rejoin rekeys the feature rows alone
+    /// (OutputFactory.pm:2311-2317) and appends a later allele's intergenic
+    /// alleles to the record's one intergenic variation (:2323-2338), so a prefix
+    /// that sorts an allele's regulatory row first leaves its intergenic row in
+    /// place.
+    #[test]
+    fn intergenic_rows_keep_allele_order_under_minimal_rejoin_prefixes() {
+        let regulatory = || TranscriptConsequence {
+            transcript_id: Arc::from("ENSR1"),
+            feature_type: FeatureType::RegulatoryFeature,
+            consequences: smallvec::smallvec![Consequence::RegulatoryRegionVariant],
+            ..Default::default()
+        };
+        let mut a = InputVariant::new("21".into(), 100, 100, b"A".to_vec(), b"G".to_vec());
+        a.most_severe_consequence = Some(Consequence::IntergenicVariant);
+        let mut b = InputVariant::new("21".into(), 100, 100, b"A".to_vec(), b"T".to_vec());
+        b.allele_index = 1;
+        b.rejoin_key_prefix = Some(Arc::from("C/T_"));
+        b.transcript_consequences = vec![regulatory()];
+        b.intergenic_overlap = true;
+        b.most_severe_consequence = Some(Consequence::RegulatoryRegionVariant);
+        let mut c = InputVariant::new("21".into(), 100, 100, b"A".to_vec(), b"-".to_vec());
+        c.allele_index = 2;
+        c.rejoin_key_prefix = Some(Arc::from("A/-_"));
+        c.transcript_consequences = vec![regulatory()];
+        c.intergenic_overlap = true;
+        c.most_severe_consequence = Some(Consequence::RegulatoryRegionVariant);
+        let mut reference = a.reference_allele_row();
+        reference.most_severe_consequence = Some(Consequence::IntergenicVariant);
+        let order: Vec<(&str, usize, bool)> = record_rows(&[&reference, &a, &b, &c])
+            .iter()
+            .map(|(v, tc)| {
+                (
+                    tc.map_or("", |tc| &*tc.transcript_id),
+                    v.allele_index,
+                    v.reference_allele_row,
+                )
+            })
+            .collect();
+        assert_eq!(
+            order,
+            [
+                ("ENSR1", 2, false),
+                ("ENSR1", 1, false),
+                ("", 0, true),
+                ("", 0, false),
+                ("", 1, false),
+                ("", 2, false),
             ]
         );
     }
