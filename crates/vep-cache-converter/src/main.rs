@@ -1049,6 +1049,86 @@ mod tests {
         assert_eq!(entries(&out.join("variations")), ["21"]);
     }
 
+    /// A transcripts entry without the `.json` extension is skipped with the
+    /// warning every unexpected name gets, naming the entry; the region file
+    /// beside it is converted. A directory of region files alone raises no
+    /// warning.
+    #[test]
+    fn a_transcripts_entry_without_the_json_extension_is_skipped_with_a_warning() {
+        let tmp = Scratch::new();
+        let src = tmp.path().join("transcripts");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("21_1-1000000.json"), b"[]").unwrap();
+        fs::write(src.join("notes.txt"), b"notes").unwrap();
+        let out = tmp.path().join("out");
+        let (converted, warnings) =
+            warnings_during(|| convert_data_files(&src, &out, "transcripts"));
+        assert_eq!(converted.unwrap(), (1, 0));
+        assert_eq!(entries(&out), ["21"]);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("Skipping file with unexpected name: notes.txt"),
+            "{warnings:?}"
+        );
+
+        fs::remove_file(src.join("notes.txt")).unwrap();
+        fs::write(src.join("LRG_485_1-1000000.json"), b"[]").unwrap();
+        let (converted, warnings) =
+            warnings_during(|| convert_data_files(&src, &tmp.path().join("flat"), "transcripts"));
+        assert_eq!(converted.unwrap(), (2, 0));
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    /// A transcripts entry whose stem is not UTF-8 is skipped with the warning
+    /// every unexpected name gets, its name spelled lossily; the region file
+    /// beside it is converted. A Linux file system stores the name's bytes as
+    /// they are; other platforms refuse such a name.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_transcripts_entry_whose_stem_is_not_utf8_is_skipped_with_a_warning() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let tmp = Scratch::new();
+        let src = tmp.path().join("transcripts");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("21_1-1000000.json"), b"[]").unwrap();
+        fs::write(src.join(OsStr::from_bytes(b"21\xff_1-1000000.json")), b"[]").unwrap();
+        let out = tmp.path().join("out");
+        let (converted, warnings) =
+            warnings_during(|| convert_data_files(&src, &out, "transcripts"));
+        assert_eq!(converted.unwrap(), (1, 0));
+        assert_eq!(entries(&out), ["21"]);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("Skipping file with unexpected name: 21\u{fffd}_1-1000000.json"),
+            "{warnings:?}"
+        );
+    }
+
+    /// A regulatory chromosome directory whose name starts with a dot is
+    /// skipped with the warning every unexpected name gets: the annotator
+    /// passes over such a directory, so copying it would write a chromosome
+    /// never read. The directory beside it is copied.
+    #[test]
+    fn a_dot_named_regulatory_directory_is_skipped_with_a_warning() {
+        let tmp = Scratch::new();
+        let regulatory = tmp.path().join("regulatory");
+        for chr in [".hidden", "21"] {
+            let dir = regulatory.join(chr);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("1-1000000.json"), b"[]").unwrap();
+        }
+        let out = tmp.path().join("out");
+        let (written, warnings) = warnings_during(|| copy_regulatory_files(&regulatory, &out));
+        assert_eq!(written.unwrap(), 1);
+        assert_eq!(entries(&out), ["21"]);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("Skipping directory with unexpected name: regulatory/.hidden"),
+            "{warnings:?}"
+        );
+    }
+
     #[test]
     fn flat_variation_names_split_into_chromosome_and_file() {
         assert_eq!(
@@ -1112,6 +1192,39 @@ mod tests {
             .collect();
         names.sort();
         names
+    }
+
+    /// Runs `work` under a subscriber that keeps its warnings, returning the
+    /// result with the warning lines in the order they were emitted.
+    fn warnings_during<T>(work: impl FnOnce() -> T) -> (T, Vec<String>) {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Kept(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Kept {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let kept = Kept::default();
+        let writer = kept.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let result = tracing::subscriber::with_default(subscriber, work);
+        let text = String::from_utf8(kept.0.lock().unwrap().clone()).unwrap();
+        (result, text.lines().map(str::to_owned).collect())
     }
 
     #[test]
