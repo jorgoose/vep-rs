@@ -243,11 +243,6 @@ fn record_rows(record: &[InputVariant]) -> Vec<Row> {
         }
     }
     let feature = |&(allele, tc): &(usize, usize)| &record[allele].transcript_consequences[tc];
-    let kind_rank = |row: &(usize, usize)| match feature(row).feature_type {
-        FeatureType::Transcript => 0,
-        FeatureType::RegulatoryFeature => 1,
-        FeatureType::MotifFeature => 2,
-    };
     let feature_key = |row: &(usize, usize)| {
         record[row.0]
             .rejoin_key_prefix
@@ -257,8 +252,9 @@ fn record_rows(record: &[InputVariant]) -> Vec<Row> {
             .chain(feature(row).transcript_id.bytes())
     };
     feature_rows.sort_by(|a, b| {
-        kind_rank(a)
-            .cmp(&kind_rank(b))
+        feature(a)
+            .feature_type
+            .cmp(&feature(b).feature_type)
             .then_with(|| feature_key(a).cmp(feature_key(b)))
             .then_with(|| {
                 record[b.0]

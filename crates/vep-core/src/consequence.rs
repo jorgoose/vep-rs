@@ -717,8 +717,14 @@ pub struct MotifFields {
 /// Type of genomic feature that a consequence is annotated against.
 ///
 /// Most consequences are against `Transcript` features; `RegulatoryFeature`
-/// and `MotifFeature` are used for regulatory consequence annotation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+/// and `MotifFeature` are used for regulatory consequence annotation. The
+/// variants are declared in the order Ensembl VEP lists a variant's feature
+/// overlaps (`VariationFeature.pm:855-864`: the transcript rows, then the
+/// regulatory rows, then the motif rows), which `Ord` follows: the writers and
+/// the picks order a record's rows by it.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub enum FeatureType {
     Transcript,
     RegulatoryFeature,
@@ -1125,5 +1131,25 @@ mod tests {
         assert_eq!(csqs[0], Consequence::StopGained);
         assert_eq!(csqs[1], Consequence::MissenseVariant);
         assert_eq!(csqs[2], Consequence::IntergenicVariant);
+    }
+
+    /// The feature kinds order as Ensembl VEP lists a variant's overlaps
+    /// (`VariationFeature.pm:855-864`): transcript, regulatory, motif.
+    #[test]
+    fn feature_types_order_as_the_overlap_list() {
+        let mut kinds = [
+            FeatureType::MotifFeature,
+            FeatureType::Transcript,
+            FeatureType::RegulatoryFeature,
+        ];
+        kinds.sort();
+        assert_eq!(
+            kinds,
+            [
+                FeatureType::Transcript,
+                FeatureType::RegulatoryFeature,
+                FeatureType::MotifFeature
+            ]
+        );
     }
 }

@@ -1062,14 +1062,15 @@ pub fn record_rows_into<'a>(record: &[&'a InputVariant], rows: &mut Vec<Row<'a>>
     });
 }
 
-/// The order of two feature rows: by feature type first (Transcript, then
-/// RegulatoryFeature, then MotifFeature, as `VariationFeature.pm:855-864` lists
-/// the kinds), then by their sort keys ([`rejoin_key`]): the loader's ranks when
-/// both rows carry one that orders as the key does ([`orderable_rank`]), else
-/// the keys themselves.
+/// The order of two feature rows: by feature type first ([`FeatureType`]'s
+/// order, the one `VariationFeature.pm:855-864` lists the kinds in), then by
+/// their sort keys ([`rejoin_key`]): the loader's ranks when both rows carry one
+/// that orders as the key does ([`orderable_rank`]), else the keys themselves.
 fn transcript_order(a: &Row<'_>, b: &Row<'_>) -> std::cmp::Ordering {
-    let type_order = (a.1.expect("feature row").feature_type as u8)
-        .cmp(&(b.1.expect("feature row").feature_type as u8));
+    let type_order =
+        a.1.expect("feature row")
+            .feature_type
+            .cmp(&b.1.expect("feature row").feature_type);
     if !type_order.is_eq() {
         return type_order;
     }
