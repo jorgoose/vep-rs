@@ -145,7 +145,7 @@ impl RegulatorySource {
         }
         let root = std::path::Path::new(&cache.dir).join("regulatory");
         if !cache.info.regulatory || !root.is_dir() {
-            crate::warnings::global().warn("--regulatory has no effect: no regulatory data is available in the cache, so no TFBS_* or regulatory_region_* consequence is emitted");
+            crate::warnings::global().warn("--regulatory: this cache holds no regulatory data; no RegulatoryFeature or MotifFeature row is written");
             return Ok(None);
         }
         let mut chromosomes = FxHashMap::default();

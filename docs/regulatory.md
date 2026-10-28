@@ -8,7 +8,7 @@ The features come from an Ensembl VEP cache converted with `scripts/data/storabl
 
 A cache converted without the regulatory tree holds no regulatory features, and a cache built by `vep-cache-builder` holds none: convert the Ensembl VEP cache again. Every motif feature carries its binding matrix; the converter and the loader refuse a motif without one as a corrupt shard. The shards of a chromosome are read the first time a record of that chromosome is annotated, so a run without `--regulatory` never opens them.
 
-On a cache with no regulatory data, `--regulatory` writes one warnings-file line: `--regulatory has no effect: no regulatory data is available in the cache, so no TFBS_* or regulatory_region_* consequence is emitted`. The regulatory columns of the tab and VCF headers are declared and print empty. Ensembl VEP skips the source without a word (`CacheDir.pm` lines 168 to 176).
+On a cache with no regulatory data, `--regulatory` writes one warnings-file line: `--regulatory: this cache holds no regulatory data; no RegulatoryFeature or MotifFeature row is written`. The regulatory columns of the tab and VCF headers are declared and print empty. Ensembl VEP skips the source without a word (`CacheDir.pm` lines 168 to 176).
 
 ## The rows
 

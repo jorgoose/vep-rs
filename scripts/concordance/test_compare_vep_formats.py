@@ -612,8 +612,8 @@ def test_regulatory_mask_accepts_cache_unavailable_warning(tmp_path):
     actual = tmp_path / "actual_warnings.txt"
     expected.write_text("", encoding="utf-8")
     actual.write_text(
-        "WARNING: --regulatory has no effect: no regulatory data is available in the cache, "
-        "so no TFBS_* or regulatory_region_* consequence is emitted\n", encoding="utf-8",
+        "WARNING: --regulatory: this cache holds no regulatory data; no RegulatoryFeature or MotifFeature row is written\n",
+        encoding="utf-8",
     )
     assert cvf.compare_warnings(expected, actual, None, None)["verdict"] == "red"
     report = cvf.compare_warnings(expected, actual, None, None, {"regulatory_feature_rows"})

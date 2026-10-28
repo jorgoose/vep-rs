@@ -142,7 +142,7 @@ fn regulatory_rows_and_extras_reach_every_text_format() {
         String::from_utf8_lossy(&result.stderr)
     );
     assert!(String::from_utf8_lossy(&result.stderr)
-        .contains("no regulatory data is available in the cache"));
+        .contains("this cache holds no regulatory data"));
     assert!(!String::from_utf8_lossy(&result.stdout).contains("motif_feature_consequences"));
 }
 

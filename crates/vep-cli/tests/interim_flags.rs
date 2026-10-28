@@ -201,10 +201,10 @@ fn custom_is_accepted_and_changes_no_output() {
     }
 }
 
-/// A cache without regulatory data warns and retains empty motif columns.
+/// A cache without regulatory data warns and writes empty motif columns.
 #[test]
 fn missing_regulatory_data_warns_and_writes_empty_motif_columns() {
-    const NOTICE: &str = "--regulatory has no effect: no regulatory data is available in the cache";
+    const NOTICE: &str = "--regulatory: this cache holds no regulatory data; no RegulatoryFeature or MotifFeature row is written";
     const EVERYTHING_NOTICE: &str = NOTICE;
     let dir = tempfile::tempdir().unwrap();
     write_input(dir.path());

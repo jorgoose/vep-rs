@@ -138,7 +138,7 @@ REGULATORY_FEATURE_ROWS = "regulatory_feature_rows"
 REGULATORY_KINDS = {"regulatory_feature", "motif_feature"}
 # The old and cache-aware warnings-file phrases for an unavailable --regulatory annotation.
 REGULATORY_NOTICE = "regulatory-feature annotation is not implemented"
-MISSING_REGULATORY_NOTICE = "no regulatory data is available in the cache"
+MISSING_REGULATORY_NOTICE = "this cache holds no regulatory data"
 EXAMPLES_PER_GROUP = 4
 
 # OutputFactory/JSON.pm:98-112 at release/116.2.

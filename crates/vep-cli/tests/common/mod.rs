@@ -248,7 +248,7 @@ const REGULATORY_JSON_ARRAYS: [&str; 2] = [
     "motif_feature_consequences",
 ];
 /// The missing-regulatory-cache notice expected for legacy regulatory-masked corpora.
-const REGULATORY_NOTICE: &str = "no regulatory data is available in the cache";
+const REGULATORY_NOTICE: &str = "this cache holds no regulatory data";
 
 /// Applies a run's mask classes to the reference entries of one format.
 /// Under [`REGULATORY_FEATURE_ROWS`] the default and tab rows and the VCF CSQ
