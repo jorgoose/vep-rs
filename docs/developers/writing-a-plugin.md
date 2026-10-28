@@ -359,7 +359,8 @@ Plugins execute after consequence assignment:
    runs in parallel across plugins, then each plugin's `annotate()` (or
    `run_batch()`, for a plugin without `prefetch`) runs sequentially on the full
    batch
-5. Dynamic (dylib) plugins run on every transcript consequence
+5. Dynamic (dylib) plugins run on every row whose feature type they declare
+   (transcript rows alone without `vep_plugin_feature_types`)
 6. Output written
 
 Variant-level plugins (CADD, gnomADc, GWAS) write to `variant.plugin_data`.
