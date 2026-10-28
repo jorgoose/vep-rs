@@ -7,8 +7,9 @@
 //! `am_class` (likely_pathogenic/likely_benign/ambiguous) and `am_pathogenicity` (0.0-1.0).
 //! Uses allele matching to ensure the correct alt allele is matched.
 //!
-//! This is a variant-level plugin that writes directly to `variant.plugin_data`
-//! via [`crate::BuiltinPlugin::run_batch`], similar to CADD.
+//! The scores are per variant, and Ensembl VEP's plugin declares `Transcript`
+//! features, so they are written on each transcript row of the variant
+//! ([`crate::BuiltinPlugin::run_batch`]) and on no other row.
 
 use indexmap::IndexMap;
 use tracing::debug;
@@ -158,6 +159,7 @@ impl BuiltinPlugin for AlphaMissensePlugin {
         for variant in variants.iter_mut() {
             let records = batch_result.lookup(&variant.chr, variant.start, variant.end);
 
+            let mut values: Vec<(String, String)> = Vec::new();
             for record in records {
                 if !allele_match::matches_allele(record, variant, REF_COL, ALT_COL) {
                     continue;
@@ -165,21 +167,28 @@ impl BuiltinPlugin for AlphaMissensePlugin {
 
                 if let Some(pathogenicity) = record.columns.get(PATHOGENICITY_COL) {
                     if !pathogenicity.is_empty() && pathogenicity != "." {
-                        variant
-                            .plugin_data
-                            .insert("am_pathogenicity".to_string(), pathogenicity.clone());
+                        values.push(("am_pathogenicity".to_string(), pathogenicity.clone()));
                     }
                 }
 
                 if let Some(class) = record.columns.get(CLASS_COL) {
                     if !class.is_empty() && class != "." {
-                        variant
-                            .plugin_data
-                            .insert("am_class".to_string(), class.clone());
+                        values.push(("am_class".to_string(), class.clone()));
                     }
                 }
 
                 break;
+            }
+            if values.is_empty() {
+                continue;
+            }
+            for tc in &mut variant.transcript_consequences {
+                if !crate::traits::annotates_row(tc) {
+                    continue;
+                }
+                for (key, value) in &values {
+                    tc.plugin_data.insert(key.clone(), value.clone());
+                }
             }
         }
 

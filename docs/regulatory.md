@@ -24,4 +24,4 @@ A `RegulatoryFeature` row carries `BIOTYPE` (the feature's type, such as `promot
 
 A structural variant's regulatory and motif rows carry none of `BIOTYPE`, `STRAND` and the motif fields, and carry `OverlapBP` and `OverlapPC` as a transcript row does ([VEP default and tab](output/vep-and-tab.md)).
 
-`CELL_TYPE` is not written, and `--cell_type` is refused as an unknown argument. `--regulatory_gff` and `--extended_promoters` are refused with an error: regulatory features are read from the cache alone.
+A plugin annotates the rows of the feature types it declares, transcript rows unless it says otherwise ([Writing a plugin](developers/writing-a-plugin.md)); a plugin that declares regulatory or motif features switches `--regulatory` on. `CELL_TYPE` is not written, and `--cell_type` is refused as an unknown argument. `--regulatory_gff` and `--extended_promoters` are refused with an error: regulatory features are read from the cache alone.

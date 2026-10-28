@@ -50,7 +50,9 @@ pub fn load_unresolved(
     crate::annotator::plugin_warning(message, safe)
 }
 
-/// Runs every loaded dylib plugin on every transcript consequence in `batch`.
+/// Runs every loaded dylib plugin on the consequences in `batch` whose feature
+/// type it declares (`OutputFactory.pm:2223` `check_feature_type`; a plugin
+/// declares `Transcript` unless its `vep_plugin_feature_types` says otherwise).
 ///
 /// The variant is serialised once and that text is handed to every plugin for
 /// every consequence of the variant; only the consequence is serialised per call.
@@ -63,13 +65,21 @@ pub fn run(registry: &PluginRegistry, batch: &mut [InputVariant]) -> anyhow::Res
             format!("serialising variant {} for plugins", variant.allele_string)
         })?;
         for tc in variant.transcript_consequences.iter_mut() {
+            let plugins: Vec<_> = registry
+                .plugins()
+                .iter()
+                .filter(|plugin| plugin.annotates(tc.feature_type))
+                .collect();
+            if plugins.is_empty() {
+                continue;
+            }
             let consequence_json = serde_json::to_string(&*tc).with_context(|| {
                 format!(
                     "serialising consequence on {} for plugins",
                     tc.transcript_id
                 )
             })?;
-            for plugin in registry.plugins() {
+            for plugin in plugins {
                 let result = plugin
                     .run(&consequence_json, &variant_json)
                     .with_context(|| format!("plugin '{}' run failed", plugin.name()))?;

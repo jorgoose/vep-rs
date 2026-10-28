@@ -198,6 +198,9 @@ impl BuiltinPlugin for DbscSnvPlugin {
             }
 
             for tc in &mut variant.transcript_consequences {
+                if !crate::traits::annotates_row(tc) {
+                    continue;
+                }
                 for (k, v) in &variant_result {
                     tc.plugin_data.insert(k.clone(), v.clone());
                 }

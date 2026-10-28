@@ -7,25 +7,7 @@ use std::path::Path;
 mod common;
 
 fn cache(dir: &Path) -> std::path::PathBuf {
-    let cache = dir.join("cache");
-    fs::create_dir_all(cache.join("transcripts/21")).unwrap();
-    fs::create_dir_all(cache.join("regulatory/21")).unwrap();
-    fs::create_dir_all(cache.join("regulatory/22")).unwrap();
-    fs::write(cache.join("transcripts/21/1-1000000.json"), "[]").unwrap();
-    fs::write(
-        cache.join("regulatory/21/1-1000000.json"),
-        include_bytes!("fixtures/regulatory/1-1000000.json"),
-    )
-    .unwrap();
-    // A chromosome the run never queries is not parsed by the command line's
-    // lazy loader, so the corrupt shard is reached only through chromosome 22.
-    fs::write(cache.join("regulatory/22/1-1000000.json"), "[").unwrap();
-    fs::write(
-        cache.join("info.json"),
-        r#"{"assembly":"GRCh38","regulatory":true}"#,
-    )
-    .unwrap();
-    cache
+    common::regulatory_cache(dir)
 }
 
 fn annotate(dir: &Path, cache: &Path, format: &str, regulatory: bool) -> String {

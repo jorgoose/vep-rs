@@ -48,7 +48,7 @@ which is Ensembl VEP's default. Under `--safe` it is an error, as Ensembl VEP's
 is.
 
 A file that exists but does not open as a shared library, lacks one of the eight
-symbols or reports an ABI version other than 1 is dropped with a warning. The warnings
+required symbols or reports an ABI version other than 1 is dropped with a warning. The warnings
 file records it as `Failed to compile plugin Name: <reason>` and the run continues
 without it, as Ensembl VEP's does when a plugin module fails to compile. Under
 `--safe` it is an error, as Ensembl VEP's is.
@@ -63,7 +63,7 @@ either is an error, as Ensembl VEP's is.
 ### The C ABI (version 1)
 
 A plugin exports these eight symbols with these signatures
-(`crates/vep-plugin/src/abi.rs`).
+(`crates/vep-plugin/src/abi.rs`), and may export a ninth, `vep_plugin_feature_types`.
 
 #### `vep_plugin_abi_version`
 
@@ -132,13 +132,31 @@ extern "C" fn(*mut c_char)
 
 Frees a string returned by `vep_plugin_run`.
 
+#### `vep_plugin_feature_types` (optional)
+
+```rust
+extern "C" fn(*const c_void) -> *const c_char
+```
+
+Returns the feature types the plugin annotates as a NUL-terminated,
+comma-separated list of the words Ensembl VEP's `feature_types` takes:
+`Transcript`, `RegulatoryFeature`, `MotifFeature`, `Feature` (the three
+together) and `Intergenic`. The host reads it once after `vep_plugin_init`, so
+the list may depend on the parameters, and the pointer must stay valid for the
+instance's lifetime; any other word fails the load. A plugin without the symbol
+annotates `Transcript` rows alone, Ensembl VEP's default. A plugin that names
+`RegulatoryFeature` or `MotifFeature` switches regulatory annotation on for the
+run, as Ensembl VEP does for such a plugin.
+
 ### What `run` receives
 
 After the built-in plugins have run on a batch, the host calls `vep_plugin_run`
-once per entry in each variant's `transcript_consequences` (transcript,
-regulatory-feature and motif-feature consequences alike), for every loaded dylib
-in `--plugin` order. A variant with no such entries, such as an intergenic one,
-is never passed to a plugin.
+once per entry in each variant's `transcript_consequences` whose `feature_type`
+the plugin declares, for every loaded dylib in `--plugin` order. A plugin
+declares `Transcript` unless `vep_plugin_feature_types` says otherwise, as
+Ensembl VEP runs a plugin on the feature classes its `feature_types` names. An intergenic row has
+no entry, so `Intergenic` in the list gives a plugin no row; Ensembl VEP runs a
+plugin that declares it on intergenic rows.
 
 The two JSON documents are the serde serialization of `TranscriptConsequence`
 (`crates/vep-core/src/consequence.rs`) and `InputVariant`

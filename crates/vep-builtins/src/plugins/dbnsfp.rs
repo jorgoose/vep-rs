@@ -220,6 +220,9 @@ impl BuiltinPlugin for DbNsfpPlugin {
             }
 
             for tc_idx in 0..variant.transcript_consequences.len() {
+                if !crate::traits::annotates_row(&variant.transcript_consequences[tc_idx]) {
+                    continue;
+                }
                 let transcript_id = variant.transcript_consequences[tc_idx]
                     .transcript_id
                     .clone();

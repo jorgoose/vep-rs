@@ -949,6 +949,31 @@ fn base_args(run: &Run, out_dir: &Path) -> Vec<String> {
     args
 }
 
+/// A cache under `dir` with no transcript on chromosome 21, the regulatory
+/// fixture shard (`fixtures/regulatory/1-1000000.json`: an enhancer at 100-120
+/// and two motifs inside it) on chromosome 21, and a corrupt regulatory shard
+/// on chromosome 22, which the command line's lazy loader reads only for a
+/// record of that chromosome.
+pub fn regulatory_cache(dir: &Path) -> PathBuf {
+    let cache = dir.join("cache");
+    fs::create_dir_all(cache.join("transcripts/21")).unwrap();
+    fs::create_dir_all(cache.join("regulatory/21")).unwrap();
+    fs::create_dir_all(cache.join("regulatory/22")).unwrap();
+    fs::write(cache.join("transcripts/21/1-1000000.json"), "[]").unwrap();
+    fs::write(
+        cache.join("regulatory/21/1-1000000.json"),
+        include_bytes!("../fixtures/regulatory/1-1000000.json"),
+    )
+    .unwrap();
+    fs::write(cache.join("regulatory/22/1-1000000.json"), "[").unwrap();
+    fs::write(
+        cache.join("info.json"),
+        r#"{"assembly":"GRCh38","regulatory":true}"#,
+    )
+    .unwrap();
+    cache
+}
+
 /// The binary with no `VEP_*` variable and no `vep.ini` of the machine's own
 /// reaching it: every `VEP_*` variable is removed and `HOME` is an empty
 /// directory under `out_dir`, so a run reads only the flags the test gives.

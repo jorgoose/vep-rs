@@ -356,6 +356,9 @@ impl BuiltinPlugin for SpliceAiPlugin {
             }
 
             for tc_idx in 0..variant.transcript_consequences.len() {
+                if !crate::traits::annotates_row(&variant.transcript_consequences[tc_idx]) {
+                    continue;
+                }
                 let gene_symbol = variant.transcript_consequences[tc_idx]
                     .gene_symbol
                     .as_deref();

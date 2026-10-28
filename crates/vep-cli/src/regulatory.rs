@@ -17,7 +17,6 @@ use vep_core::consequence::{Consequence, FeatureType, TranscriptConsequence};
 use vep_core::variant::{InputVariant, VariantClass};
 
 use crate::cache_resolve::ResolvedCache;
-use crate::config::Config;
 
 #[derive(Deserialize)]
 struct Feature {
@@ -137,11 +136,11 @@ pub struct RegulatorySource {
 }
 
 impl RegulatorySource {
-    pub(crate) fn open(
-        config: &Config,
-        cache: &ResolvedCache,
-    ) -> anyhow::Result<Option<Arc<Self>>> {
-        if !config.regulatory {
+    /// Opens the cache's regulatory tree when `enabled`: `--regulatory`, which
+    /// `--everything` implies, or a loaded plugin that declares regulatory or
+    /// motif features (`Runner.pm:998-1002`).
+    pub(crate) fn open(cache: &ResolvedCache, enabled: bool) -> anyhow::Result<Option<Arc<Self>>> {
+        if !enabled {
             return Ok(None);
         }
         let root = std::path::Path::new(&cache.dir).join("regulatory");
@@ -424,8 +423,7 @@ mod tests {
             fasta: None,
             synonyms: Arc::new(Default::default()),
         };
-        let config = Config::from_argv(["vep", "--regulatory"]).unwrap();
-        let source = RegulatorySource::open(&config, &cache).unwrap().unwrap();
+        let source = RegulatorySource::open(&cache, true).unwrap().unwrap();
         (dir, source)
     }
 
@@ -532,8 +530,7 @@ mod tests {
             fasta: None,
             synonyms: Arc::new(Default::default()),
         };
-        let config = Config::from_argv(["vep", "--regulatory"]).unwrap();
-        let source = RegulatorySource::open(&config, &cache(dir.path()))
+        let source = RegulatorySource::open(&cache(dir.path()), true)
             .unwrap()
             .unwrap();
         source.prewarm("21").unwrap();
@@ -548,7 +545,7 @@ mod tests {
         let other = dir.path().join("regulatory/22");
         std::fs::create_dir_all(&other).unwrap();
         std::fs::write(other.join("1-1000000.json.bak"), b"[]").unwrap();
-        let error = match RegulatorySource::open(&config, &cache(dir.path())) {
+        let error = match RegulatorySource::open(&cache(dir.path()), true) {
             Err(error) => error.to_string(),
             Ok(_) => panic!("a directory without shards opened"),
         };

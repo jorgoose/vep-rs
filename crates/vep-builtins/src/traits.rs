@@ -32,6 +32,15 @@ pub enum PluginError {
     Io(#[from] std::io::Error),
 }
 
+/// Whether a consequence row is one the built-in plugins annotate: every
+/// built-in's Ensembl VEP module declares `feature_types` of `['Transcript']`,
+/// except CADD, gnomADc and GWAS, which declare `['Feature', 'Intergenic']`
+/// and write record-level values that print on every row, so a plugin that
+/// writes per row writes on transcript rows alone.
+pub fn annotates_row(consequence: &TranscriptConsequence) -> bool {
+    consequence.feature_type == vep_core::consequence::FeatureType::Transcript
+}
+
 /// Type-erased container for data returned by [`BuiltinPlugin::prefetch`].
 ///
 /// Each plugin stores its own concrete type (e.g., `BatchQueryResult`) inside
@@ -170,6 +179,9 @@ pub trait BuiltinPlugin: Send + Sync {
     fn run_batch(&self, variants: &mut [InputVariant]) -> Result<(), PluginError> {
         for variant in variants.iter_mut() {
             for tc_idx in 0..variant.transcript_consequences.len() {
+                if !annotates_row(&variant.transcript_consequences[tc_idx]) {
+                    continue;
+                }
                 let result = self.run(&variant.transcript_consequences[tc_idx], variant)?;
                 for (k, v) in result {
                     variant.transcript_consequences[tc_idx]

@@ -301,6 +301,7 @@ impl Annotator {
         )?;
         let builtin_plugins = Arc::new(builtin);
         let dylib_plugins = Arc::new(dylib);
+        let regulatory = regulatory_enabled(config, &dylib_plugins);
         let transcripts = load_transcript_indexes(
             &cache.dir,
             &effects_config,
@@ -313,7 +314,7 @@ impl Annotator {
             AnnotationResources {
                 transcripts,
                 variation_source,
-                regulatory_source: crate::regulatory::RegulatorySource::open(config, &cache)?,
+                regulatory_source: crate::regulatory::RegulatorySource::open(&cache, regulatory)?,
                 sv_source,
                 colocation: ColocationRules::from_config(config),
                 effects_config,
@@ -544,6 +545,21 @@ pub(crate) struct LoadedPlugins {
 /// tabix-TSV GERP reader, and CADD / dbscSNV use it to refuse a data file whose own
 /// declared assembly contradicts the run. Passing `None` leaves every one of those
 /// guards inert, so a wrong-assembly file annotates nothing and still exits 0.
+/// Whether the run annotates regulatory features: `--regulatory` (given or
+/// implied by `--everything`), or a loaded plugin that declares regulatory or
+/// motif features, which Ensembl VEP switches the option on for
+/// (`Runner.pm:998-1002`).
+pub(crate) fn regulatory_enabled(config: &Config, dylib: &PluginRegistry) -> bool {
+    if config.regulatory {
+        return true;
+    }
+    if dylib.wants_regulatory_features() {
+        info!("Fetching regulatory features for a plugin that declares them");
+        return true;
+    }
+    false
+}
+
 pub(crate) fn load_plugins(
     plugin_args: &[String],
     dir_plugins: &str,

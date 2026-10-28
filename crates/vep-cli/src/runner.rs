@@ -1707,6 +1707,7 @@ impl Runner {
         let LoadedPlugins { builtin, dylib } = self.load_plugins(plugin_fasta)?;
         let builtin_plugins = Arc::new(builtin);
         let dylib_plugins = Arc::new(dylib);
+        let regulatory = crate::annotator::regulatory_enabled(&self.config, &dylib_plugins);
         if builtin_plugins.plugin_count() > 0 {
             info!(
                 "Loaded {} built-in plugin(s)",
@@ -1831,6 +1832,7 @@ impl Runner {
         let plugin_headers = builtin_plugins.all_header_info();
         let plugin_fields = vep_io::output::fields::plugin_field_names(&plugin_headers);
         let mut options = self.field_options();
+        options.regulatory = regulatory;
         options.hgvs = checks.hgvs;
         options.sift = predictions.sift.is_some();
         options.polyphen = predictions.polyphen.is_some();
@@ -1935,10 +1937,7 @@ impl Runner {
         let annotation_resources = AnnotationResources {
             transcripts,
             variation_source,
-            regulatory_source: crate::regulatory::RegulatorySource::open(
-                &self.config,
-                &self.cache,
-            )?,
+            regulatory_source: crate::regulatory::RegulatorySource::open(&self.cache, regulatory)?,
             sv_source,
             colocation: ColocationRules::from_config(&self.config),
             effects_config,
