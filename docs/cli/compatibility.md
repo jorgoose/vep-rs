@@ -20,9 +20,7 @@ vep-rs reads a local cache and never contacts a database. Each database flag is 
 
 ## Consequence terms never assigned
 
-All six regulatory and motif consequence terms are supported under `--regulatory` or `--everything` with a converted GRCh38 regulatory cache; see [partial regulatory support](../divergences/regulatory-rows.md).
-
-The root term `sequence_variant` has no predicate, and Ensembl VEP's consequence engine never assigns it either. The other 40 of Ensembl VEP's 41 Sequence Ontology terms are assigned.
+One term is never assigned: the root `sequence_variant` has no predicate, and Ensembl VEP's consequence engine never assigns it either. The other 40 of Ensembl VEP's 41 Sequence Ontology terms are assigned; the six regulatory and motif terms need `--regulatory` (or `--everything`) and a cache converted with its regulatory features ([Regulatory and motif features](../regulatory.md)).
 
 ## Input formats
 

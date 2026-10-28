@@ -751,14 +751,11 @@ fn render_compatibility(group: &Group, command: &Command, sections: &[FlagSectio
 
     out.push_str("## Consequence terms never assigned\n\n");
     out.push_str(
-        "All six regulatory and motif consequence terms are supported under `--regulatory` or \
-         `--everything` with a converted GRCh38 regulatory cache; see \
-         [partial regulatory support](../divergences/regulatory-rows.md).\n\n",
-    );
-    out.push_str(
-        "The root term `sequence_variant` has no predicate, and Ensembl VEP's consequence engine \
-         never assigns it either. The other 40 of Ensembl VEP's 41 Sequence Ontology terms are \
-         assigned.\n\n",
+        "One term is never assigned: the root `sequence_variant` has no predicate, and Ensembl \
+         VEP's consequence engine never assigns it either. The other 40 of Ensembl VEP's 41 \
+         Sequence Ontology terms are assigned; the six regulatory and motif terms need \
+         `--regulatory` (or `--everything`) and a cache converted with its regulatory features \
+         ([Regulatory and motif features](../regulatory.md)).\n\n",
     );
 
     out.push_str("## Input formats\n\n");

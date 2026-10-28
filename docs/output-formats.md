@@ -47,9 +47,9 @@ The corpus manifest records the (Location, Allele, Feature) keys whose terms dif
 
 The tested flag set is the one the golden corpora run: `--offline --json_cache <dir> --species homo_sapiens --assembly <assembly> --buffer_size 5000 --no_stats --quiet` plus one format flag and the corpus manifest's own flags. A corpus whose cache sits in Ensembl VEP's `cache_root/homo_sapiens/<release>_<assembly>` layout takes `--offline --cache --dir_cache <root> --cache_version <release>` in place of `--json_cache <dir>`.
 
-Outside the tested flag set there are known differences. `--regulatory` supports converted GRCh38 regulatory caches with [partial motif support](divergences/regulatory-rows.md). `--output_format vcf` switches on the same fields as `--vcf`, where VEP ties them to the flag alone.
+Outside the tested flag set there are known differences. `--regulatory` writes the regulatory and motif rows of a converted cache ([Regulatory and motif features](regulatory.md)) with `HIGH_INF_POS` and `MOTIF_SCORE_CHANGE` empty ([the divergence page](divergences/regulatory-rows.md)). `--output_format vcf` switches on the same fields as `--vcf`, where VEP ties them to the flag alone.
 
-`--vcf` also switches on `--symbol`, `--biotype` and `--numbers`, as in VEP, and `--json` switches on `--no_escape`, as VEP's `rest` option set does. `--output_format json` switches it on here as well, where VEP leaves that output escaped ([Unescaped JSON under `--output_format json`](divergences/json-escaping.md)). `--everything` switches on exactly Ensembl VEP's set ([CLI reference](cli-reference.md#option-sets-configpm351-593)), including cache-backed `--regulatory`; omitted motif fields remain empty.
+`--vcf` also switches on `--symbol`, `--biotype` and `--numbers`, as in VEP, and `--json` switches on `--no_escape`, as VEP's `rest` option set does. `--output_format json` switches it on here as well, where VEP leaves that output escaped ([Unescaped JSON under `--output_format json`](divergences/json-escaping.md)). `--everything` switches on exactly Ensembl VEP's set ([CLI reference](cli-reference.md#option-sets-configpm351-593)), `--regulatory` among them, and the two unscored motif fields, `HIGH_INF_POS` and `MOTIF_SCORE_CHANGE`, are empty.
 
 ### Where each rule lives
 

@@ -8,8 +8,6 @@ The cache is a directory holding `info.json` and `transcripts/`: the release dir
 --json_cache $HOME/.vep/homo_sapiens/116_GRCh38
 ```
 
-For `--regulatory` (also enabled by `--everything`), convert an Ensembl GRCh38 cache containing regulatory `_reg.gz` files. Reconvert older transcript-only JSON caches: native transcript builds do not supply regulatory features. Conversion writes `regulatory/<chr>/*.json` and declares `regulatory: true` in `info.json`; runtime loads those files lazily only with regulatory annotation enabled. See [supported regulatory and motif fields and omissions](divergences/regulatory-rows.md).
-
 ## Build a cache
 
 `vep-cache-builder` builds a cache natively, with no Perl dependency. It downloads the release's Ensembl GFF3 and protein FASTA, or reads local copies passed with `--gff3` and `--fasta`, and writes the cache directory. For GRCh37 the download fetches the release-87 gene set, the one Ensembl publishes for GRCh37 from release 88 onward.

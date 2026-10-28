@@ -79,6 +79,7 @@ has drained.
 | `src/output_compress.rs`    | `OutputCompression`: `--compress_output` gzip or bgzip encoding of the output in process, in place of the `gzip -c` or `bgzip -c` pipe Ensembl VEP opens; `CompressedOutput::finish` writes the stream's trailer once every line is written |
 | `src/annotator.rs`          | The embedding entry point: `Annotator` over `AnnotationResources` and a scoped pool, the `RawRow` simple-allele input, the per-row `AnnotationError`, and the shared loaders for FASTA, plugins and transcripts            |
 | `src/json_cache.rs`         | Deserializes the JSON cache: enumerates `transcripts/<chr>/<start>-<end>.json` shards and loads one chromosome's transcripts                                                                                                 |
+| `src/regulatory.rs`         | `RegulatorySource`: the cache's regulatory and motif features under `regulatory/<chr>/`, one chromosome's shards parsed on first use into a start-sorted index, and `annotate`, which adds a record's `RegulatoryFeature` and `MotifFeature` rows with their terms and motif fields |
 | `src/variation_source.rs`   | `VariationSource`: the cache's variation files under `variations/<chr>/`, opened on first use and read through their index for the records a variant's window reaches, with a per-batch prefetch                           |
 | `src/variation_name_index.rs` | `resolve_names`: the `--format id` pass over the cache's variation files, every name of the list held in memory and every file read once, each name mapped to its variation features                                   |
 | `src/transcript_lookup.rs`  | `TranscriptLookup`: the stable-id, translation-id and gene-name index over the run's transcript cache behind HGVS `c.`, `n.` and `p.` input, built on the first lookup from the reference sequences' shards and extended to the alternate loci, patches and LRG regions only when a stable id is found on none of them |
@@ -120,8 +121,8 @@ the full list, with every flag's parity note, is
 
 Three declared flags are refused with an error rather than ignored, because the feature they
 belong to is not implemented: `--regulatory_gff`, `--extended_promoters` and
-`--custom_suppress_filter`. `--regulatory` is accepted and warns that no regulatory consequence
-is emitted.
+`--custom_suppress_filter`. `--regulatory` annotates the regulatory and motif features of a cache
+converted with them, and warns once when the cache holds none.
 
 ```bash
 vep -i input.vcf -o output.txt --json_cache /path/to/json_cache --offline --everything
