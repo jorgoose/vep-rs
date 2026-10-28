@@ -21,8 +21,9 @@ use vep_io::OutputFormatter;
 
 /// Renders one input record: the alleles split from one line, written together
 /// so every format emits a record the way VEP does (one VCF line or JSON
-/// object per record; default and tab rows transcript-major then allele-minor,
-/// intergenic rows last).
+/// object per record; default and tab rows in `fields::record_rows`'s order:
+/// transcript, regulatory and motif rows, each kind feature-major then
+/// allele-minor, intergenic rows last).
 pub(crate) fn render_record<'a>(
     out: &mut Vec<u8>,
     record: &[&'a InputVariant],
