@@ -36,8 +36,8 @@ These flags choose which annotation fields appear in the output. `--everything` 
 | `--numbers` | bool | false | Add exon/intron numbers |
 | `--domains` | bool | false | Add the DOMAINS column: on a coding row, the protein features whose residues the variant overlaps, each as label:identifier (Pfam:PF00080, Gene3D:1.10.510.10; a native cache carries the features only when built with `--core-dumps`) |
 | `--regulatory` | bool | false | Annotate overlaps with cached regulatory and motif features; warns when the cache has no regulatory data |
-| `--regulatory_gff` | String | none | Refused with an error: `--regulatory_gff` is not supported: it would annotate regulatory features and motifs from a GFF3 file in place of the cache, and regulatory annotation is not supported |
-| `--extended_promoters` | bool | false | Refused with an error: `--extended_promoters` is not supported: it would widen the promoters read with `--regulatory_gff` to their extended bounds, and regulatory annotation is not supported |
+| `--regulatory_gff` | String | none | Refused with an error: `--regulatory_gff` is not supported: it would annotate regulatory features and motifs from a GFF3 file in place of the cache; regulatory features are read from the cache alone |
+| `--extended_promoters` | bool | false | Refused with an error: `--extended_promoters` is not supported: it would widen the promoters read with `--regulatory_gff` to their extended bounds; regulatory features are read from the cache alone |
 | `--variant_class` | bool | false | Add variant class from SO |
 | `--overlaps` | bool | false | Add the OverlapBP and OverlapPC columns to the tab, VCF and Parquet outputs: the bases of a structural variant inside the transcript and the percentage of the transcript they cover (also reported for cached regulatory and motif features) |
 | `--check_existing` | bool | false | Check for co-located known variants |

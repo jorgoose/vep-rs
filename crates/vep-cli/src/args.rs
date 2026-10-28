@@ -1883,27 +1883,27 @@ mod tests {
         );
     }
 
-    /// `--regulatory_gff` is refused: regulatory annotation is not supported.
+    /// `--regulatory_gff` is refused: regulatory features are read from the cache alone.
     #[test]
     fn regulatory_gff_is_refused() {
         let err = Config::from_argv(["vep", "--regulatory_gff", "reg.gff3.gz"]).unwrap_err();
         assert_eq!(
             err.to_string(),
             "ERROR: [cli] --regulatory_gff is not supported: it would annotate regulatory features \
-             and motifs from a GFF3 file in place of the cache, and regulatory annotation \
-             is not supported"
+             and motifs from a GFF3 file in place of the cache; regulatory features are read \
+             from the cache alone"
         );
     }
 
-    /// `--extended_promoters` is refused: regulatory annotation is not supported.
+    /// `--extended_promoters` is refused: regulatory features are read from the cache alone.
     #[test]
     fn extended_promoters_is_refused() {
         let err = Config::from_argv(["vep", "--extended_promoters"]).unwrap_err();
         assert_eq!(
             err.to_string(),
             "ERROR: [cli] --extended_promoters is not supported: it would widen the promoters read \
-             with --regulatory_gff to their extended bounds, and regulatory annotation is \
-             not supported"
+             with --regulatory_gff to their extended bounds; regulatory features are read from \
+             the cache alone"
         );
     }
 

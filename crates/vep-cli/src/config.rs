@@ -248,13 +248,13 @@ pub const ERROR_TABLE: &[ErrorTableEntry] = &[
     },
     refused(
         "regulatory_gff",
-        "--regulatory_gff is not supported: it would annotate regulatory features and motifs from a GFF3 file in place of the cache, and regulatory annotation is not supported",
+        "--regulatory_gff is not supported: it would annotate regulatory features and motifs from a GFF3 file in place of the cache; regulatory features are read from the cache alone",
         "Config.pm:210; the option set at :434-439 switches on --regulatory",
         "none",
     ),
     refused(
         "extended_promoters",
-        "--extended_promoters is not supported: it would widen the promoters read with --regulatory_gff to their extended bounds, and regulatory annotation is not supported",
+        "--extended_promoters is not supported: it would widen the promoters read with --regulatory_gff to their extended bounds; regulatory features are read from the cache alone",
         "Config.pm:211",
         "none",
     ),
