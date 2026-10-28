@@ -719,11 +719,19 @@ pub(crate) fn prewarm_chromosome(
 ) -> anyhow::Result<()> {
     transcripts.prewarm(chr)?;
     if let Some(source) = regulatory {
-        source
-            .prewarm(chr)
-            .map_err(|error| crate::config::CliError::new("cache", format!("{error:#}")))?;
+        source.prewarm(chr).map_err(regulatory_load_error)?;
     }
     Ok(())
+}
+
+/// A regulatory load's failure as the run prints it, under the `cache`
+/// component; a refusal the loader already made under the error contract (a
+/// checksum mismatch) keeps its own line.
+fn regulatory_load_error(error: anyhow::Error) -> anyhow::Error {
+    if error.is::<crate::config::CliError>() {
+        return error;
+    }
+    crate::config::CliError::new("cache", format!("{error:#}")).into()
 }
 
 /// Output configuration shared by the render tasks.
@@ -3527,6 +3535,55 @@ mod tests {
         assert_eq!(
             crate::config::CliError::from_run(&other),
             "ERROR: [run] outer: inner"
+        );
+    }
+
+    /// A regulatory shard whose bytes differ from the cache manifest's entry
+    /// ends the run with the manifest's own refusal, one `cache` line, as a
+    /// transcript shard's mismatch does; a regulatory load's other failures
+    /// print under the `cache` component with their cause chain.
+    #[test]
+    fn a_regulatory_shard_mismatch_prints_the_manifest_refusal_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let shard = dir.path().join("regulatory/21/1-1000000.json");
+        std::fs::create_dir_all(shard.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(dir.path().join("transcripts/21")).unwrap();
+        std::fs::write(dir.path().join("transcripts/21/0-1000.json"), "[]").unwrap();
+        std::fs::write(
+            &shard,
+            include_bytes!("../tests/fixtures/regulatory/1-1000000.json"),
+        )
+        .unwrap();
+        vep_core::cache_manifest::CacheManifest::write(dir.path()).unwrap();
+        std::fs::write(&shard, "[]").unwrap();
+        let cache = crate::cache_resolve::ResolvedCache {
+            dir: dir.path().to_string_lossy().into_owned(),
+            manifest: Arc::new(vep_core::cache_manifest::CacheManifest::load(dir.path()).unwrap()),
+            info: vep_core::cache_info::CacheInfo {
+                regulatory: true,
+                ..Default::default()
+            },
+            assembly: Some("GRCh38".into()),
+            fasta: None,
+            synonyms: Arc::new(Default::default()),
+        };
+        let regulatory = crate::regulatory::RegulatorySource::open(&cache, true)
+            .unwrap()
+            .unwrap();
+        let transcripts = LazyTranscriptIndexes::new(dir.path().to_str().unwrap(), 0, 0).unwrap();
+        let error = prewarm_chromosome(&transcripts, Some(&regulatory), "21").unwrap_err();
+        assert_eq!(
+            crate::config::CliError::from_run(&error),
+            format!(
+                "ERROR: [cache] checksum mismatch for regulatory/21/1-1000000.json in {}",
+                dir.path().display()
+            )
+        );
+
+        let other = regulatory_load_error(anyhow::anyhow!("inner").context("outer"));
+        assert_eq!(
+            crate::config::CliError::from_run(&other),
+            "ERROR: [cache] outer: inner"
         );
     }
 
