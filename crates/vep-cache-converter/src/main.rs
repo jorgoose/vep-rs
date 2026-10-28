@@ -602,10 +602,11 @@ fn copy_regulatory_files(src_dir: &Path, dst_dir: &Path) -> Result<usize> {
         }
         // A record names its chromosome as text, so a directory whose name is
         // not UTF-8 names no chromosome; its lossy spelling would name one no
-        // record reaches.
+        // record reaches. The loader passes over a directory whose name starts
+        // with a dot, so copying one would write a chromosome never read.
         let Some(chr) = file_name
             .to_str()
-            .filter(|name| is_cache_path_component(name))
+            .filter(|name| is_cache_path_component(name) && !name.starts_with('.'))
         else {
             warn!(
                 "Skipping directory with unexpected name: regulatory/{}",
@@ -815,12 +816,22 @@ fn convert_data_files(src_dir: &Path, dst_dir: &Path, label: &str) -> Result<(us
         let path = entry.path();
         let ext = path.extension().and_then(|e| e.to_str());
         if ext != Some("json") {
+            warn!(
+                "Skipping file with unexpected name: {}",
+                entry.file_name().to_string_lossy()
+            );
             continue;
         }
 
         let filestem = match path.file_stem().and_then(|s| s.to_str()) {
             Some(s) => s.to_string(),
-            None => continue,
+            None => {
+                warn!(
+                    "Skipping file with unexpected name: {}",
+                    entry.file_name().to_string_lossy()
+                );
+                continue;
+            }
         };
 
         let (chr, start, end) = match parse_region_filename(&filestem) {
