@@ -37,6 +37,7 @@
   - [Flat-file plugins](plugins/flat-file.md)
   - [SpliceAI](plugins/spliceai.md)
   - [Preparing data files](plugins/data-files.md)
+- [Regulatory and motif features](regulatory.md)
 
 # Concordance with Ensembl VEP
 
