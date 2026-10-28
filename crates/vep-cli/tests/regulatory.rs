@@ -294,6 +294,108 @@ fn regulatory_rows_are_byte_exact_in_every_format() {
     );
 }
 
+/// The Parquet output holds the regulatory, motif and intergenic rows the
+/// `--tab` output holds, in both shapes, read back through the adapter and
+/// compared as a multiset (Parquet is sorted by variant key). A motif row's
+/// factor list comes back as the tab cell; a factorless motif's empty factor
+/// cell, a written value the tab format leaves empty rather than `-`, is NULL
+/// in Parquet like every absent value and comes back as `-`. Runs only where
+/// the DuckDB CLI the adapter needs is installed.
+#[test]
+fn regulatory_rows_round_trip_through_parquet() {
+    let duckdb = std::process::Command::new("duckdb")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !duckdb {
+        eprintln!("skipping: duckdb CLI not installed");
+        return;
+    }
+    let adapter =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/adapters/parquet_to_vep_tab.py");
+    let dir = tempfile::tempdir().unwrap();
+    let cache = cache(dir.path());
+    fs::write(
+        dir.path().join("in.vcf"),
+        "##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n\
+         21\t106\tforward\tC\tG\t.\t.\t.\n\
+         21\t116\treverse\tA\tG\t.\t.\t.\n",
+    )
+    .unwrap();
+    let tab = annotate(dir.path(), &cache, "tab", true);
+    let mut tab_rows: Vec<String> = tab
+        .lines()
+        .filter(|l| !l.starts_with("##"))
+        .map(|l| {
+            if l.ends_with('\t') {
+                format!("{l}-")
+            } else {
+                l.to_string()
+            }
+        })
+        .collect();
+    tab_rows.sort_unstable();
+    assert!(
+        tab_rows.iter().any(|row| row.contains("\tTF_A,TF_B")),
+        "the forward motif row carries its factors:\n{tab}"
+    );
+    assert!(
+        tab.lines()
+            .any(|row| row.contains("ENSM_REVERSE") && row.ends_with('\t')),
+        "the factorless motif row ends in the empty factor cell:\n{tab}"
+    );
+    for shape in ["flat", "nested"] {
+        let parquet_dir = dir.path().join(format!("out-{shape}.parquet"));
+        let mut command = common::isolated_vep(dir.path());
+        command
+            .args([
+                "--json_cache",
+                cache.to_str().unwrap(),
+                "--assembly",
+                "GRCh38",
+                "--no_stats",
+                "--no_fasta",
+                "--force_overwrite",
+                "--format",
+                "vcf",
+                "--regulatory",
+                "--output_format",
+                "parquet",
+                "--parquet_shape",
+                shape,
+            ])
+            .arg("--input_file")
+            .arg(dir.path().join("in.vcf"))
+            .arg("--output_file")
+            .arg(&parquet_dir);
+        let result = command.output().unwrap();
+        assert!(
+            result.status.success(),
+            "parquet ({shape}): {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let back = std::process::Command::new("python3")
+            .arg(&adapter)
+            .arg(&parquet_dir)
+            .output()
+            .unwrap();
+        assert!(
+            back.status.success(),
+            "adapter ({shape}): {}",
+            String::from_utf8_lossy(&back.stderr)
+        );
+        let round_trip = String::from_utf8(back.stdout).unwrap();
+        let mut parquet_rows: Vec<String> = round_trip
+            .lines()
+            .filter(|l| !l.starts_with("##"))
+            .map(str::to_string)
+            .collect();
+        parquet_rows.sort_unstable();
+        assert_eq!(parquet_rows, tab_rows, "parquet ({shape}) round trip");
+    }
+}
+
 /// Every structural class and the sequence-variant edges over the hand-built
 /// fixture (enhancer 100-120, motifs 105-108 and 115-118), as Ensembl VEP
 /// 116.2 writes them: `<DEL>` and `<CN0>` covering a feature are its ablation
