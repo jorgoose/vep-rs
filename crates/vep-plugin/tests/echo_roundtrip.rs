@@ -185,4 +185,11 @@ fn feature_types_are_read_after_init_and_default_to_transcript() {
         .load_from_args(&[format!("{path},feature_types=MotifFeature")], None)
         .unwrap();
     assert!(registry.wants_regulatory_features());
+    // `Feature` covers the regulatory classes but names neither word, so it
+    // leaves regulatory annotation off, as Ensembl VEP's word check does.
+    let mut registry = PluginRegistry::new();
+    registry
+        .load_from_args(&[format!("{path},feature_types=Feature")], None)
+        .unwrap();
+    assert!(!registry.wants_regulatory_features());
 }

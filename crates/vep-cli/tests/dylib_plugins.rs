@@ -290,9 +290,13 @@ fn plugins_run_on_the_rows_their_feature_types_declare() {
         run("echo_plugin,feature_types=MotifFeature", false),
         rows("-", "ENSM_FORWARD")
     );
-    // Without a plugin that declares them and without the flag, no regulatory row.
-    assert_eq!(
-        run("echo_plugin", false),
-        vec![("-".to_string(), "-".to_string(), "-".to_string())]
-    );
+    // Without a plugin that names them and without the flag, no regulatory row:
+    // `Feature` covers the classes but names neither word (Runner.pm:998).
+    for plugin in ["echo_plugin", "echo_plugin,feature_types=Feature"] {
+        assert_eq!(
+            run(plugin, false),
+            vec![("-".to_string(), "-".to_string(), "-".to_string())],
+            "{plugin}"
+        );
+    }
 }

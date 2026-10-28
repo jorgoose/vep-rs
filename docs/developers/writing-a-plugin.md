@@ -214,6 +214,7 @@ other absent optional value is `null`.
 | `feature_start`, `feature_end`                     | Genomic span of the feature, 1-based inclusive; both `0` when unknown                        |                                                    |
 | `plugin_data`                                      | The fields the built-in plugins have already written to this consequence; present only when non-empty | `{"REVEL_score": "0.931"}`                |
 | `loftee_ctx`                                       | The exon/intron model; present only when LoFTEE is enabled                                   |                                                    |
+| `motif`                                            | A motif row's `name` (the binding matrix's stable id), `pos` (the variant's position in the matrix, absent outside it) and `factors`; present on a sequence variant's `MotifFeature` row alone | `{"name": "ENSPFM0290", "pos": 7, "factors": ["HNF4A"]}` |
 
 `cdna_total`, `cds_total` and `protein_total` are the lengths `--total_length`
 appends to the three positions. Each is present only when its rule holds,
@@ -361,10 +362,10 @@ Plugins execute after consequence assignment:
 5. Dynamic (dylib) plugins run on every transcript consequence
 6. Output written
 
-Variant-level plugins (CADD, gnomADc, AlphaMissense, GWAS) write to
-`variant.plugin_data`. Transcript-level plugins write to
-`consequence.plugin_data`: REVEL, SpliceAI, dbNSFP and dbscSNV do so in their
-batch `annotate()` after a tabix `prefetch()`, and LoFtool, pLI and LoFTEE
+Variant-level plugins (CADD, gnomADc, GWAS) write to `variant.plugin_data`.
+Transcript-level plugins write to `consequence.plugin_data`: REVEL, SpliceAI,
+dbNSFP, dbscSNV and AlphaMissense do so in their batch `annotate()` after a
+tabix `prefetch()`, and LoFtool, pLI and LoFTEE
 through the per-consequence `run()` method. LoFTEE is the only
 consequence-_filtering_ plugin: it inspects the transcript exon/intron model
 (carried on the consequence via `LofteeContext`, populated only when LoFTEE is

@@ -209,8 +209,8 @@ mod tests {
     /// other: every field of `TranscriptConsequence` except `id_rank` and
     /// `record_span_in_cds`, with `cdna_total`, `cds_total`, `protein_total`,
     /// `plugin_data`, `loftee_ctx`, `cds_length`, `source_cache`,
-    /// `own_span_positions`, `used_ref` and `shifted_allele` present only when
-    /// populated.
+    /// `own_span_positions`, `used_ref`, `shifted_allele` and `motif` present
+    /// only when populated.
     #[test]
     fn consequence_json_carries_every_documented_key_and_nothing_else() {
         const ALWAYS: [&str; 46] = [
@@ -296,6 +296,11 @@ mod tests {
         }));
         tc.used_ref = Some(std::sync::Arc::from("A"));
         tc.shifted_allele = Some(std::sync::Arc::from("GAA"));
+        tc.motif = Some(Box::new(vep_core::consequence::MotifFields {
+            name: std::sync::Arc::from("ENSPFM0290"),
+            pos: Some(7),
+            factors: std::sync::Arc::from([std::sync::Arc::from("HNF4A")]),
+        }));
         expected.extend(
             [
                 "plugin_data",
@@ -308,6 +313,7 @@ mod tests {
                 "own_span_positions",
                 "used_ref",
                 "shifted_allele",
+                "motif",
             ]
             .map(str::to_string),
         );

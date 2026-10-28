@@ -30,6 +30,7 @@ pub struct LoadedPlugin {
     free_fn: ffi::PluginFreeFn,
     feature_types_fn: Option<ffi::PluginFeatureTypesFn>,
     feature_types: Vec<FeatureType>,
+    declares_regulatory: bool,
 }
 
 impl std::fmt::Debug for LoadedPlugin {
@@ -113,6 +114,7 @@ impl LoadedPlugin {
                 free_fn,
                 feature_types_fn,
                 feature_types: vec![FeatureType::Transcript],
+                declares_regulatory: false,
             })
         }
     }
@@ -124,9 +126,27 @@ impl LoadedPlugin {
             return Ok(());
         };
         let text = unsafe { read_c_string(feature_types_fn(self.instance), "feature types")? };
-        self.feature_types = FeatureType::parse_list(&text)
-            .map_err(|e| PluginError::Load(format!("plugin '{}': {e}", self.name)))?;
+        self.feature_types = FeatureType::parse_list(&text).map_err(|e| match e {
+            PluginError::Load(reason) => {
+                PluginError::Load(format!("plugin '{}': {reason}", self.name))
+            }
+            other => other,
+        })?;
+        // Ensembl VEP reads the declared words, not the classes they cover
+        // (Runner.pm:998 greps them for motif or regulatory), so `Feature`
+        // alone switches nothing on.
+        self.declares_regulatory = text
+            .split(',')
+            .map(str::trim)
+            .any(|word| matches!(word, "RegulatoryFeature" | "MotifFeature"));
         Ok(())
+    }
+
+    /// Whether the plugin's declared list names `RegulatoryFeature` or
+    /// `MotifFeature` by word, which switches regulatory annotation on for the
+    /// run (`Runner.pm:998-1002`); `Feature`, which covers both, does not.
+    pub fn declares_regulatory_features(&self) -> bool {
+        self.declares_regulatory
     }
 
     /// The feature types the plugin annotates ([`Self::read_feature_types`]).

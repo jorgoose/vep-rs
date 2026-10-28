@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::loader::LoadedPlugin;
-use crate::{FeatureType, PluginError};
+use crate::PluginError;
 use vep_core::sv_routing::split_plugin_arg;
 
 /// Registry of loaded plugins.
@@ -77,14 +77,9 @@ impl PluginRegistry {
     /// Whether a loaded plugin declares regulatory or motif features, which
     /// switches regulatory annotation on for the run (`Runner.pm:998-1002`).
     pub fn wants_regulatory_features(&self) -> bool {
-        self.plugins.iter().any(|plugin| {
-            plugin.feature_types().iter().any(|t| {
-                matches!(
-                    t,
-                    FeatureType::RegulatoryFeature | FeatureType::MotifFeature
-                )
-            })
-        })
+        self.plugins
+            .iter()
+            .any(LoadedPlugin::declares_regulatory_features)
     }
 
     /// Run all loaded plugins on the given consequence/variant pair (both as JSON).
