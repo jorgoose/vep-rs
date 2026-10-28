@@ -146,8 +146,10 @@ fn writes_a_row(
         .any(|tc| affects_cds(start, end, tc, own_span))
 }
 
-/// Sets the allele's `most_severe_consequence` from the transcript rows it has
-/// left: the most severe of their terms, or `None` for an allele with no row,
+/// Sets the allele's `most_severe_consequence` from the rows it has left: the
+/// most severe of their terms, `intergenic_variant` among them for the
+/// intergenic row of an allele that overlaps no transcript
+/// ([`InputVariant::intergenic_overlap`]), or `None` for an allele with no row,
 /// which no writer then prints.
 pub(crate) fn settle_verdict(variant: &mut InputVariant) {
     variant.most_severe_consequence = Consequence::most_severe(
