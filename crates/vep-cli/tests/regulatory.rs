@@ -120,7 +120,9 @@ fn regulatory_rows_and_extras_reach_every_text_format() {
     fs::write(cache.join("info.json"), r#"{"assembly":"GRCh38"}"#).unwrap();
     fs::write(cache.join("regulatory/21/1-1000000.json"), "[").unwrap();
     let mut command = common::isolated_vep(dir.path());
+    // An output of STDOUT writes its warnings file beside the working directory.
     let result = command
+        .current_dir(dir.path())
         .args([
             "--json_cache",
             cache.to_str().unwrap(),
