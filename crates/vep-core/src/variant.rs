@@ -179,7 +179,9 @@ pub struct InputVariant {
     pub variant_class: VariantClass,
     /// Consequence annotations computed during annotation phase.
     pub transcript_consequences: Vec<TranscriptConsequence>,
-    /// Perl's intergenic row is decided by transcripts alone
+    /// The allele overlaps no transcript and its rows are regulatory and motif
+    /// rows alone, so it carries an `intergenic_variant` row beside them: Perl's
+    /// intergenic row is decided by transcripts alone
     /// (VariationFeature.pm:826-839; StructuralVariationFeature.pm:674-690).
     #[serde(default)]
     pub intergenic_overlap: bool,
