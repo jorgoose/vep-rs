@@ -1373,57 +1373,54 @@ def is_regulatory_row(e: Entry) -> bool:
     return feature_kind(last_segment) in REGULATORY_KINDS
 
 
-def without_regulatory_rows(expected: list[Entry]) -> list[Entry]:
-    """The reference entries without their regulatory rows (``regulatory_feature_rows``). A
-    JSON record that lost a row has its ``most_severe_consequence`` recomputed from the
-    consequence entries that remain, as the candidate computes it from the rows it writes,
-    so a record the reference annotates against a regulatory feature and no transcript
-    compares as its intergenic row; every other record keeps the reference's value. Mutates
-    the kept record entries; raises ``ComparatorError`` on a term ``CONSEQUENCE_RANK`` lacks."""
-    kept = [e for e in expected if not is_regulatory_row(e)]
-    lost_rows = {e.key.split("|", 1)[0] for e in expected if is_regulatory_row(e)}
+def filter_consequence_rows(
+    entries: list[Entry], keep: Callable[[Entry], bool], keep_bare_records: bool
+) -> list[Entry]:
+    """The entries whose consequence rows ``keep`` accepts, in their order, with the VCF/JSON
+    record entries: every one when ``keep_bare_records``, else those of a record that kept a
+    row. A record that lost a row has its ``most_severe_consequence`` recomputed from the
+    rows it kept, as the candidate computes it from the rows it writes. Mutates the kept
+    record entries; raises ``ComparatorError`` on a term ``CONSEQUENCE_RANK`` lacks."""
     terms_by_record: dict[str, set[str]] = defaultdict(set)
-    for e in kept:
-        if not e.key.endswith("|record"):
-            terms_by_record[e.key.split("|", 1)[0]].update(t for t in re.split(r"[&,]", e.consequence) if t)
-    for e in kept:
-        record = e.key.split("|", 1)[0]
-        if not e.key.endswith("|record") or record not in lost_rows or "most_severe_consequence" not in e.fields:
+    lost_rows: set[str] = set()
+    for e in entries:
+        if e.key.endswith("|record"):
             continue
-        terms = terms_by_record.get(record, set())
-        unranked = sorted(terms.difference(CONSEQUENCE_RANK))
-        if unranked:
-            raise ComparatorError(f"{e.key}: no rank for the consequence terms {unranked}")
-        e.fields = {**e.fields, "most_severe_consequence": most_severe(terms)}
-    return kept
-
-
-def only_regulatory_rows(entries: list[Entry]) -> list[Entry]:
-    """Keep regulatory consequences and their VCF/JSON records on either side. As with
-    ``without_regulatory_rows``, recompute JSON severity only on records that lost a row,
-    mutating the retained record entries and rejecting unknown retained consequence terms."""
-    regulatory = [e for e in entries if is_regulatory_row(e)]
-    terms_by_record: dict[str, set[str]] = defaultdict(set)
-    for e in regulatory:
-        terms_by_record[e.key.split("|", 1)[0]].update(t for t in re.split(r"[&,]", e.consequence) if t)
-    lost_rows = {
-        e.key.split("|", 1)[0] for e in entries
-        if not e.key.endswith("|record") and not is_regulatory_row(e)
-    }
+        record = e.key.split("|", 1)[0]
+        if keep(e):
+            terms_by_record[record].update(t for t in re.split(r"[&,]", e.consequence) if t)
+        else:
+            lost_rows.add(record)
     kept: list[Entry] = []
     for e in entries:
         record = e.key.split("|", 1)[0]
-        if is_regulatory_row(e):
-            kept.append(e)
-        elif e.key.endswith("|record") and record in terms_by_record:
-            if record in lost_rows and "most_severe_consequence" in e.fields:
-                terms = terms_by_record[record]
-                unranked = sorted(terms.difference(CONSEQUENCE_RANK))
-                if unranked:
-                    raise ComparatorError(f"{e.key}: no rank for the consequence terms {unranked}")
-                e.fields = {**e.fields, "most_severe_consequence": most_severe(terms)}
-            kept.append(e)
+        if not e.key.endswith("|record"):
+            if keep(e):
+                kept.append(e)
+            continue
+        if not keep_bare_records and record not in terms_by_record:
+            continue
+        if record in lost_rows and "most_severe_consequence" in e.fields:
+            terms = terms_by_record.get(record, set())
+            unranked = sorted(terms.difference(CONSEQUENCE_RANK))
+            if unranked:
+                raise ComparatorError(f"{e.key}: no rank for the consequence terms {unranked}")
+            e.fields = {**e.fields, "most_severe_consequence": most_severe(terms)}
+        kept.append(e)
     return kept
+
+
+def without_regulatory_rows(expected: list[Entry]) -> list[Entry]:
+    """The reference entries without their regulatory rows (``regulatory_feature_rows``): a
+    record the reference annotates against a regulatory feature and no transcript compares
+    as its intergenic row, every record entry stays (``filter_consequence_rows``)."""
+    return filter_consequence_rows(expected, lambda e: not is_regulatory_row(e), True)
+
+
+def only_regulatory_rows(entries: list[Entry]) -> list[Entry]:
+    """The regulatory rows of either side and the record entries of the records that have
+    one (``--keep-only regulatory_feature_rows``; ``filter_consequence_rows``)."""
+    return filter_consequence_rows(entries, is_regulatory_row, False)
 
 
 def compare_files(
