@@ -676,6 +676,21 @@ mod tests {
         }
     }
 
+    /// A regulatory or motif row of `feature_type` carrying the one term
+    /// `consequence`.
+    fn feature(
+        id: &str,
+        feature_type: FeatureType,
+        consequence: Consequence,
+    ) -> TranscriptConsequence {
+        TranscriptConsequence {
+            transcript_id: id.into(),
+            feature_type,
+            consequences: smallvec![consequence],
+            ..Default::default()
+        }
+    }
+
     fn allele(alt: &[u8], index: usize, tcs: Vec<TranscriptConsequence>) -> InputVariant {
         let mut v = InputVariant::new("21".into(), 100, 100, b"A".to_vec(), alt.to_vec());
         v.allele_index = index;
@@ -861,12 +876,6 @@ mod tests {
     /// only the two G1 transcripts are reduced to one.
     #[test]
     fn per_gene_passes_regulatory_and_intergenic_rows_through() {
-        let feature = |id: &str, feature_type, consequence| TranscriptConsequence {
-            transcript_id: id.into(),
-            feature_type,
-            consequences: smallvec![consequence],
-            ..Default::default()
-        };
         let build = |with_transcripts: bool| {
             let mut rows = vec![
                 feature(
@@ -1204,13 +1213,11 @@ mod tests {
     fn regulatory_and_intergenic_rows_participate_in_summaries() {
         for most_severe in [true, false] {
             for with_transcript in [false, true] {
-                let regulatory = TranscriptConsequence {
-                    transcript_id: "ENSR1".into(),
-                    feature_type: FeatureType::RegulatoryFeature,
-                    consequences: smallvec![Consequence::RegulatoryRegionVariant],
-                    ..Default::default()
-                };
-                let mut rows = vec![regulatory];
+                let mut rows = vec![feature(
+                    "ENSR1",
+                    FeatureType::RegulatoryFeature,
+                    Consequence::RegulatoryRegionVariant,
+                )];
                 if with_transcript {
                     rows.push(tc("ENST1", "G1", smallvec![Consequence::MissenseVariant]));
                 }
