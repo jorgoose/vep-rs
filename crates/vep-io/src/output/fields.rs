@@ -1293,24 +1293,14 @@ fn write_row_field_value(
         "Consequence" => match tc {
             Some(x) => write_terms(out, &x.consequences, options.terms),
             None => {
-                let consequence = if variant.intergenic_overlap {
-                    Consequence::IntergenicVariant
-                } else {
-                    variant
-                        .most_severe_consequence
-                        .unwrap_or(Consequence::IntergenicVariant)
-                };
+                let consequence = intergenic_row_consequence(variant);
                 out.extend_from_slice(options.terms.term(consequence).as_bytes());
             }
         },
         "IMPACT" => {
             let impact = match tc {
                 Some(x) => x.impact,
-                None if variant.intergenic_overlap => Consequence::IntergenicVariant.impact(),
-                None => variant
-                    .most_severe_consequence
-                    .unwrap_or(Consequence::IntergenicVariant)
-                    .impact(),
+                None => intergenic_row_consequence(variant).impact(),
             };
             out.extend_from_slice(impact.as_str().as_bytes());
         }
@@ -1657,6 +1647,20 @@ fn write_row_field_value(
     }
 }
 
+/// The consequence an allele's intergenic row prints: `intergenic_variant` for an
+/// allele that overlaps no transcript ([`InputVariant::intergenic_overlap`]), else
+/// the verdict of an allele with no feature row, `intergenic_variant` when it
+/// carries none.
+fn intergenic_row_consequence(variant: &InputVariant) -> Consequence {
+    if variant.intergenic_overlap {
+        Consequence::IntergenicVariant
+    } else {
+        variant
+            .most_severe_consequence
+            .unwrap_or(Consequence::IntergenicVariant)
+    }
+}
+
 /// The allele's own span's positions, which the three position columns print
 /// in place of their own under [`FieldOptions::positions_of_own_span`]. `None`
 /// when the option is off or the row carries none, so the columns print their own.
@@ -1899,9 +1903,11 @@ fn sv_overlap(variant: &InputVariant, tc: Option<&TranscriptConsequence>) -> Opt
 /// empty list, which is a value (`OutputFactory.pm:1017`), and under
 /// `--clinvar_somatic_classification` it sets `CLINVAR_SOMATIC_CLASSIFICATION`
 /// to every defined `clinical_impact` of the row's variants in turn (:1093),
-/// the empty cell of a region file included; the default and tab writers print
-/// every key set (`VEP_output.pm:117`, `Tab.pm:128`). Every other empty value
-/// stands for an absent key. A `--summary` or `--most_severe` row is the
+/// the empty cell of a region file included, and on a motif row it sets
+/// `TRANSCRIPTION_FACTORS` to the binding matrix's factor list, empty when the
+/// matrix names none (:1920-1925); the default and tab writers print every key
+/// set (`VEP_output.pm:117`, `Tab.pm:128`). Every other empty value stands for
+/// an absent key. A `--summary` or `--most_severe` row is the
 /// record's hash alone (`summary_only`, OutputFactory.pm:426-458) and carries
 /// the variant-level fields and nothing else, as [`write_field_value`] writes
 /// it, so only a variant-level field's empty value is written on it; `tc` is

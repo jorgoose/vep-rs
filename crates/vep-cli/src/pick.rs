@@ -205,7 +205,9 @@ pub fn apply_to_record(record: &mut [InputVariant], config: &FilterConfig) {
 }
 
 /// One row of a record as Ensembl VEP's `VariationFeatureOverlapAllele` list
-/// holds it: an allele against a transcript, or an allele's intergenic row.
+/// holds it: an allele against a feature, a transcript, a regulatory feature or
+/// a motif feature alike (`Transcript`, after the consequence list that holds
+/// all three kinds), or an allele's intergenic row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Row {
     Transcript { allele: usize, tc: usize },
@@ -874,8 +876,8 @@ mod tests {
     }
 
     /// Rows not against a transcript pass through the per-gene picks untouched
-    /// (`:838-844`): both regulatory rows and the intergenic row survive, and
-    /// only the two G1 transcripts are reduced to one.
+    /// (`:838-844`): the regulatory row, the motif row and the intergenic row
+    /// survive, and only the two G1 transcripts are reduced to one.
     #[test]
     fn per_gene_passes_regulatory_and_intergenic_rows_through() {
         let build = |with_transcripts: bool| {
@@ -1303,6 +1305,11 @@ mod tests {
         );
     }
 
+    /// The summary modes read every row left on the record (`summary_only`,
+    /// `OutputFactory.pm:426-458`), regulatory and intergenic rows included:
+    /// `--summary` lists a regulatory row's term after a transcript's missense
+    /// term and, on an allele overlapping no transcript, before the allele's
+    /// `intergenic_variant`; `--most_severe` keeps the first term of each list.
     #[test]
     fn regulatory_and_intergenic_rows_participate_in_summaries() {
         for most_severe in [true, false] {
