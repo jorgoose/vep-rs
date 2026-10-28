@@ -151,6 +151,18 @@ impl RegulatorySource {
             let shard: Vec<Feature> = serde_json::from_slice(&bytes)
                 .with_context(|| format!("parsing {}", path.display()))?;
             for feature in shard {
+                // Every motif feature carries its binding matrix (the funcgen
+                // schema requires one and the GFF route blesses a stub), so a
+                // motif without one is a corrupt shard, not a feature to skip.
+                if feature.feature_type == FeatureType::MotifFeature
+                    && feature.binding_matrix.is_none()
+                {
+                    anyhow::bail!(
+                        "parsing {}: motif feature {} has no binding matrix",
+                        path.display(),
+                        feature.stable_id
+                    );
+                }
                 if seen.insert((feature.feature_type, Arc::clone(&feature.stable_id))) {
                     features.push(feature);
                 }
@@ -194,10 +206,6 @@ impl RegulatorySource {
             }
             let feature = &index.features[i];
             if feature.end < start {
-                continue;
-            }
-            if feature.feature_type == FeatureType::MotifFeature && feature.binding_matrix.is_none()
-            {
                 continue;
             }
             let mut row = TranscriptConsequence {
@@ -386,7 +394,7 @@ mod tests {
     }
 
     #[test]
-    fn insertion_boundaries_reverse_positions_and_missing_matrices() {
+    fn insertion_boundaries_and_reverse_positions() {
         let (_dir, source) = source();
         source.prewarm("21").unwrap();
         for (start, end, expected) in [(105, 104, false), (106, 105, true), (109, 108, false)] {
@@ -415,9 +423,24 @@ mod tests {
             .find(|r| r.transcript_id.as_ref() == "ENSM_REVERSE")
             .unwrap();
         assert!(!row.plugin_data.contains_key("MOTIF_POS"));
-        let mut missing = variant(135, 135, b"A", b"G");
-        source.annotate(&mut missing);
-        assert!(missing.transcript_consequences.is_empty());
+    }
+
+    /// A motif feature without a binding matrix cannot come from a converted
+    /// cache (the converter refuses it), so a shard carrying one is reported
+    /// as corrupt by name instead of being skipped feature by feature.
+    #[test]
+    fn motif_without_a_binding_matrix_is_a_corrupt_shard() {
+        let (_dir, source) = source();
+        std::fs::write(
+            &source.chromosomes["21"].shards[1],
+            br#"[{"stable_id":"ENSM_NO_MATRIX","start":130,"end":140,"strand":1,"feature_type":"MotifFeature"}]"#,
+        )
+        .unwrap();
+        let error = source.prewarm("21").unwrap_err().to_string();
+        assert!(
+            error.contains("motif feature ENSM_NO_MATRIX has no binding matrix"),
+            "{error}"
+        );
     }
 
     #[test]

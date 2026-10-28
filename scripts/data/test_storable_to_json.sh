@@ -128,6 +128,12 @@ if ($regulatory ne 'none') {
             ],
         }};
     }
+    if ($regulatory eq 'nomatrix') {
+        $data = { '21' => { MotifFeature => [
+            bless({ stable_id => 'ENSM_NO_MATRIX', start => 45009900, end => 45009905, strand => 1 },
+                'Bio::EnsEMBL::Funcgen::MotifFeature'),
+        ] } };
+    }
     my $reg_shard = "$cache_dir/21/45000001-46000000_reg";
     if ($regulatory eq 'corrupt') {
         open my $bad, '>', $reg_shard or die $!;
@@ -280,6 +286,23 @@ if run_perl make_cache.pl corrupt-regulatory "${common}"$'regulatory\t1\n' 0 cor
     fi
 else
     bad "corrupt regulatory fixture built"
+fi
+
+# 7. A motif feature without a binding matrix is corrupt (the funcgen schema requires
+# the matrix and the GFF route blesses a stub), so the conversion fails and names it.
+if run_perl make_cache.pl no-matrix "${common}" 0 nomatrix; then
+    mkdir -p "$WORK/no-matrix.out"
+    if run_perl storable_to_json.pl no-matrix no-matrix.out > "$WORK/no-matrix.log" 2>&1; then
+        bad "motif without a binding matrix rejected"
+    elif ! grep -q 'MotifFeature ENSM_NO_MATRIX lacks binding_matrix' "$WORK/no-matrix.log"; then
+        bad "motif without a binding matrix named ($(tail -1 "$WORK/no-matrix.log"))"
+    elif [[ -e "$WORK/no-matrix.out/info.json" ]]; then
+        bad "failed conversion leaves no metadata"
+    else
+        ok "motif without a binding matrix rejected by name"
+    fi
+else
+    bad "matrix-less motif fixture built"
 fi
 
 echo "$PASS ok, $FAIL failed"

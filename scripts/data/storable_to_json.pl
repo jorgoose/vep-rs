@@ -385,28 +385,29 @@ sub extract_regulatory_feature {
         $biotype = $biotype->{so_name} if (reftype($biotype) // '') eq 'HASH';
         $out{biotype} = "$biotype" if defined $biotype && !ref $biotype;
     } elsif ($type eq 'MotifFeature') {
+        # Every motif feature carries a binding matrix: the funcgen schema requires
+        # one and the GFF route blesses a stub, so a motif without one is corrupt.
         my $matrix = $feature->{binding_matrix};
-        if (defined $matrix) {
-            die "invalid binding matrix\n" unless (reftype($matrix) // '') eq 'HASH';
-            die "binding matrix lacks stable_id\n" unless defined $matrix->{stable_id};
-            my %binding_matrix = (stable_id => "$matrix->{stable_id}");
-            $binding_matrix{name} = "$matrix->{name}" if defined $matrix->{name};
-            my $complexes = $matrix->{associated_transcription_factor_complexes} // [];
-            die "invalid transcription factor complexes\n" unless (reftype($complexes) // '') eq 'ARRAY';
-            $binding_matrix{transcription_factors} = [
-                map { "$_->{display_name}" }
-                grep { (reftype($_) // '') eq 'HASH' && defined $_->{display_name} }
-                @$complexes
-            ];
-            # Keep raw position keys and counts; these are not normalized
-            # probabilities. GFF-derived matrices can legitimately lack elements.
-            if (defined $matrix->{elements}) {
-                my $kind = reftype($matrix->{elements}) // '';
-                die "invalid binding matrix elements\n" unless $kind eq 'HASH' || $kind eq 'ARRAY';
-                $binding_matrix{frequencies} = $matrix->{elements};
-            }
-            $out{binding_matrix} = \%binding_matrix;
+        die "MotifFeature $out{stable_id} lacks binding_matrix\n" unless defined $matrix;
+        die "invalid binding matrix\n" unless (reftype($matrix) // '') eq 'HASH';
+        die "binding matrix lacks stable_id\n" unless defined $matrix->{stable_id};
+        my %binding_matrix = (stable_id => "$matrix->{stable_id}");
+        $binding_matrix{name} = "$matrix->{name}" if defined $matrix->{name};
+        my $complexes = $matrix->{associated_transcription_factor_complexes} // [];
+        die "invalid transcription factor complexes\n" unless (reftype($complexes) // '') eq 'ARRAY';
+        $binding_matrix{transcription_factors} = [
+            map { "$_->{display_name}" }
+            grep { (reftype($_) // '') eq 'HASH' && defined $_->{display_name} }
+            @$complexes
+        ];
+        # Keep raw position keys and counts; these are not normalized
+        # probabilities. GFF-derived matrices can legitimately lack elements.
+        if (defined $matrix->{elements}) {
+            my $kind = reftype($matrix->{elements}) // '';
+            die "invalid binding matrix elements\n" unless $kind eq 'HASH' || $kind eq 'ARRAY';
+            $binding_matrix{frequencies} = $matrix->{elements};
         }
+        $out{binding_matrix} = \%binding_matrix;
     } else {
         die "unknown regulatory feature type $type\n";
     }
