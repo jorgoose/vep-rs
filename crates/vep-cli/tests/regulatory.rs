@@ -736,6 +736,113 @@ fn pick_family_flags_through_the_cli_keep_regulatory_rows() {
     );
 }
 
+/// A regulatory shard the run reads must be a JSON array of regulatory and
+/// motif features: a truncated shard, a feature type other than the two (a
+/// transcript among them), an element without the feature fields and a motif
+/// without its binding matrix each fail the run with exit 1 and the shard's
+/// path in the error, writing no data row; an empty array is a chromosome
+/// with no features, so its records write their intergenic rows; a
+/// gzip-compressed shard loads as a plain one does.
+#[test]
+fn malformed_regulatory_shards_fail_the_run_by_name() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("in.vcf"),
+        "##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n21\t106\tr\tC\tG\t.\t.\t.\n",
+    )
+    .unwrap();
+    let run = |shard: &[u8], name: &str| -> (std::process::ExitStatus, String, Vec<String>) {
+        let cache = dir.path().join("cache");
+        let _ = fs::remove_dir_all(&cache);
+        fs::create_dir_all(cache.join("transcripts/21")).unwrap();
+        fs::create_dir_all(cache.join("regulatory/21")).unwrap();
+        fs::write(cache.join("transcripts/21/1-1000000.json"), "[]").unwrap();
+        fs::write(cache.join("regulatory/21").join(name), shard).unwrap();
+        fs::write(
+            cache.join("info.json"),
+            r#"{"assembly":"GRCh38","regulatory":true}"#,
+        )
+        .unwrap();
+        let out = dir.path().join("out.txt");
+        let _ = fs::remove_file(&out);
+        let result = common::isolated_vep(dir.path())
+            .args(["--json_cache", cache.to_str().unwrap()])
+            .args([
+                "--assembly",
+                "GRCh38",
+                "--no_fasta",
+                "--no_stats",
+                "--force_overwrite",
+            ])
+            .arg("--regulatory")
+            .arg("--input_file")
+            .arg(dir.path().join("in.vcf"))
+            .arg("--output_file")
+            .arg(&out)
+            .output()
+            .unwrap();
+        let rows = fs::read_to_string(&out)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .map(str::to_owned)
+            .collect();
+        (
+            result.status,
+            String::from_utf8_lossy(&result.stderr).into_owned(),
+            rows,
+        )
+    };
+    for (shard, phrase) in [
+        (&b"["[..], "EOF while parsing"),
+        (
+            br#"[{"stable_id":"X","start":100,"end":120,"strand":0,"feature_type":"Enhancer"}]"#,
+            "unknown variant `Enhancer`, expected `RegulatoryFeature` or `MotifFeature`",
+        ),
+        (
+            br#"[{"stable_id":"T1","start":100,"end":120,"strand":1,"feature_type":"Transcript"}]"#,
+            "unknown variant `Transcript`",
+        ),
+        (br#"[{"foo":1}]"#, "missing field `stable_id`"),
+        (
+            br#"[{"stable_id":"ENSM_X","start":100,"end":120,"strand":1,"feature_type":"MotifFeature"}]"#,
+            "motif feature ENSM_X has no binding matrix",
+        ),
+    ] {
+        let (status, stderr, rows) = run(shard, "1-1000000.json");
+        assert_eq!(status.code(), Some(1), "{stderr}");
+        assert!(
+            stderr.contains("ERROR: [cache] parsing")
+                && stderr.contains("regulatory/21/1-1000000.json")
+                && stderr.contains(phrase),
+            "{stderr}"
+        );
+        assert!(rows.is_empty(), "{rows:?}");
+    }
+    let (status, stderr, rows) = run(b"[]", "1-1000000.json");
+    assert!(status.success(), "{stderr}");
+    assert_eq!(rows.len(), 1);
+    assert!(
+        rows[0].contains("\t-\t-\t-\tintergenic_variant\t"),
+        "{}",
+        rows[0]
+    );
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    std::io::Write::write_all(
+        &mut encoder,
+        include_bytes!("fixtures/regulatory/1-1000000.json"),
+    )
+    .unwrap();
+    let (status, stderr, rows) = run(&encoder.finish().unwrap(), "1-1000000.json.gz");
+    assert!(status.success(), "{stderr}");
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    assert!(
+        rows[0].contains("\tENSR_FIXTURE\tRegulatoryFeature\t"),
+        "{}",
+        rows[0]
+    );
+}
+
 #[test]
 fn regulatory_and_motif_rows_use_dash_for_absent_gene() {
     let dir = tempfile::tempdir().unwrap();
