@@ -294,6 +294,220 @@ fn regulatory_rows_are_byte_exact_in_every_format() {
     );
 }
 
+/// Every structural class and the sequence-variant edges over the hand-built
+/// fixture (enhancer 100-120, motifs 105-108 and 115-118), as Ensembl VEP
+/// 116.2 writes them: `<DEL>` and `<CN0>` covering a feature are its ablation
+/// (`deletion`, `copy_number_loss`: Utils/VariationEffect.pm:192-216), `<DUP>`,
+/// `<CN2>`, `<DUP:TANDEM>` and `<CNV:TR>` its amplification (`copy_number_gain`,
+/// :246-256), `<CNV>` and `<INV>` the overlap term alone (a VCF `<CNV>` has no
+/// supporting variants), each with `OverlapBP` and `OverlapPC`
+/// (OutputFactory.pm:2087-2095) and none of `BIOTYPE`, `STRAND` and the motif
+/// fields (:2069-2102 writes no such key); `--overlaps` adds the two as columns
+/// to the tab and VCF outputs, `-` and empty on the intergenic row. A sequence
+/// deletion covering the features is their ablation with the motif fields and
+/// no `MOTIF_POS` (its start lies before the matrix); a multi-allelic SNV writes
+/// each allele's rows; an insertion overlaps a feature only with both flanks
+/// inside it (InputBuffer.pm:324): 100-101 and 104-105 overlap the enhancer and
+/// not the motif at 105-108, 99-100 and 120-121 overlap nothing.
+#[test]
+fn sv_and_indel_classes_over_a_regulatory_feature() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = cache(dir.path());
+    let header = "##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n";
+    let symbolic = [
+        "<DEL>",
+        "<DUP>",
+        "<CNV>",
+        "<INV>",
+        "<CN0>",
+        "<CN2>",
+        "<CNV:TR>",
+        "<DUP:TANDEM>",
+    ];
+    let mut input = header.to_string();
+    for alt in symbolic {
+        input.push_str(&format!("21\t94\t{alt}\tN\t{alt}\t.\t.\tEND=125\n"));
+    }
+    input.push_str("21\t104\tpartial\tN\t<DEL>\t.\t.\tEND=112\n");
+    input.push_str("21\t99\tcover_del\tAAAAAAAAAAAAAAAAAAAAAA\tA\t.\t.\t.\n");
+    input.push_str("21\t106\tmulti\tC\tG,T\t.\t.\t.\n");
+    for (id, pos) in [
+        ("ins_in", 100),
+        ("ins_before", 99),
+        ("ins_after", 120),
+        ("ins_motif", 104),
+    ] {
+        input.push_str(&format!("21\t{pos}\t{id}\tA\tAT\t.\t.\t.\n"));
+    }
+    fs::write(dir.path().join("in.vcf"), input).unwrap();
+
+    // (id, class term, regulatory terms, motif terms, motif impact)
+    let classes = [
+        (
+            "<DEL>",
+            "deletion",
+            "regulatory_region_ablation,regulatory_region_variant",
+            "TFBS_ablation,TF_binding_site_variant",
+            "MODERATE",
+        ),
+        (
+            "<DUP>",
+            "duplication",
+            "regulatory_region_amplification,regulatory_region_variant",
+            "TFBS_amplification,TF_binding_site_variant",
+            "MODIFIER",
+        ),
+        (
+            "<CNV>",
+            "copy_number_variation",
+            "regulatory_region_variant",
+            "TF_binding_site_variant",
+            "MODIFIER",
+        ),
+        (
+            "<INV>",
+            "inversion",
+            "regulatory_region_variant",
+            "TF_binding_site_variant",
+            "MODIFIER",
+        ),
+        (
+            "<CN0>",
+            "deletion",
+            "regulatory_region_ablation,regulatory_region_variant",
+            "TFBS_ablation,TF_binding_site_variant",
+            "MODERATE",
+        ),
+        (
+            "<CN2>",
+            "duplication",
+            "regulatory_region_amplification,regulatory_region_variant",
+            "TFBS_amplification,TF_binding_site_variant",
+            "MODIFIER",
+        ),
+        (
+            "<CNV:TR>",
+            "tandem_repeat",
+            "regulatory_region_amplification,regulatory_region_variant",
+            "TFBS_amplification,TF_binding_site_variant",
+            "MODIFIER",
+        ),
+        (
+            "<DUP:TANDEM>",
+            "tandem_duplication",
+            "regulatory_region_amplification,regulatory_region_variant",
+            "TFBS_amplification,TF_binding_site_variant",
+            "MODIFIER",
+        ),
+    ];
+    let mut expected = Vec::new();
+    for (id, class, regulatory, motif, motif_impact) in classes {
+        let row = |feature: &str, kind: &str, terms: &str, extra: &str| {
+            format!("{id}\t21:95-125\t{class}\t-\t{feature}\t{kind}\t{terms}\t-\t-\t-\t-\t-\t-\t{extra}")
+        };
+        expected.push(row(
+            "ENSR_FIXTURE",
+            "RegulatoryFeature",
+            regulatory,
+            "IMPACT=MODIFIER;OverlapBP=21;OverlapPC=100.00",
+        ));
+        for feature in ["ENSM_FORWARD", "ENSM_REVERSE"] {
+            expected.push(row(
+                feature,
+                "MotifFeature",
+                motif,
+                &format!("IMPACT={motif_impact};OverlapBP=4;OverlapPC=100.00"),
+            ));
+        }
+        expected.push(row("-", "-", "intergenic_variant", "IMPACT=MODIFIER"));
+    }
+    expected.extend([
+        "partial\t21:105-112\tdeletion\t-\tENSR_FIXTURE\tRegulatoryFeature\tregulatory_region_variant\t-\t-\t-\t-\t-\t-\tIMPACT=MODIFIER;OverlapBP=8;OverlapPC=38.10".to_string(),
+        "partial\t21:105-112\tdeletion\t-\tENSM_FORWARD\tMotifFeature\tTFBS_ablation,TF_binding_site_variant\t-\t-\t-\t-\t-\t-\tIMPACT=MODERATE;OverlapBP=4;OverlapPC=100.00".to_string(),
+        "partial\t21:105-112\tdeletion\t-\t-\t-\tintergenic_variant\t-\t-\t-\t-\t-\t-\tIMPACT=MODIFIER".to_string(),
+        "cover_del\t21:100-120\t-\t-\tENSR_FIXTURE\tRegulatoryFeature\tregulatory_region_ablation,regulatory_region_variant\t-\t-\t-\t-\t-\t-\tIMPACT=MODIFIER;BIOTYPE=enhancer".to_string(),
+        "cover_del\t21:100-120\t-\t-\tENSM_FORWARD\tMotifFeature\tTFBS_ablation,TF_binding_site_variant\t-\t-\t-\t-\t-\t-\tIMPACT=MODERATE;STRAND=1;MOTIF_NAME=ENSPFM_FORWARD;TRANSCRIPTION_FACTORS=TF_A,TF_B".to_string(),
+        "cover_del\t21:100-120\t-\t-\tENSM_REVERSE\tMotifFeature\tTFBS_ablation,TF_binding_site_variant\t-\t-\t-\t-\t-\t-\tIMPACT=MODERATE;STRAND=-1;MOTIF_NAME=ENSPFM_REVERSE;TRANSCRIPTION_FACTORS=".to_string(),
+        "cover_del\t21:100-120\t-\t-\t-\t-\tintergenic_variant\t-\t-\t-\t-\t-\t-\tIMPACT=MODIFIER".to_string(),
+        "multi\t21:106\tG\t-\tENSR_FIXTURE\tRegulatoryFeature\tregulatory_region_variant\t-\t-\t-\t-\t-\t-\tIMPACT=MODIFIER;BIOTYPE=enhancer".to_string(),
+        "multi\t21:106\tT\t-\tENSR_FIXTURE\tRegulatoryFeature\tregulatory_region_variant\t-\t-\t-\t-\t-\t-\tIMPACT=MODIFIER;BIOTYPE=enhancer".to_string(),
+        "multi\t21:106\tG\t-\tENSM_FORWARD\tMotifFeature\tTF_binding_site_variant\t-\t-\t-\t-\t-\t-\tIMPACT=MODIFIER;STRAND=1;MOTIF_NAME=ENSPFM_FORWARD;MOTIF_POS=2;TRANSCRIPTION_FACTORS=TF_A,TF_B".to_string(),
+        "multi\t21:106\tT\t-\tENSM_FORWARD\tMotifFeature\tTF_binding_site_variant\t-\t-\t-\t-\t-\t-\tIMPACT=MODIFIER;STRAND=1;MOTIF_NAME=ENSPFM_FORWARD;MOTIF_POS=2;TRANSCRIPTION_FACTORS=TF_A,TF_B".to_string(),
+        "multi\t21:106\tG\t-\t-\t-\tintergenic_variant\t-\t-\t-\t-\t-\t-\tIMPACT=MODIFIER".to_string(),
+        "multi\t21:106\tT\t-\t-\t-\tintergenic_variant\t-\t-\t-\t-\t-\t-\tIMPACT=MODIFIER".to_string(),
+        "ins_in\t21:100-101\tT\t-\tENSR_FIXTURE\tRegulatoryFeature\tregulatory_region_variant\t-\t-\t-\t-\t-\t-\tIMPACT=MODIFIER;BIOTYPE=enhancer".to_string(),
+        "ins_in\t21:100-101\tT\t-\t-\t-\tintergenic_variant\t-\t-\t-\t-\t-\t-\tIMPACT=MODIFIER".to_string(),
+        "ins_before\t21:99-100\tT\t-\t-\t-\tintergenic_variant\t-\t-\t-\t-\t-\t-\tIMPACT=MODIFIER".to_string(),
+        "ins_after\t21:120-121\tT\t-\t-\t-\tintergenic_variant\t-\t-\t-\t-\t-\t-\tIMPACT=MODIFIER".to_string(),
+        "ins_motif\t21:104-105\tT\t-\tENSR_FIXTURE\tRegulatoryFeature\tregulatory_region_variant\t-\t-\t-\t-\t-\t-\tIMPACT=MODIFIER;BIOTYPE=enhancer".to_string(),
+        "ins_motif\t21:104-105\tT\t-\t-\t-\tintergenic_variant\t-\t-\t-\t-\t-\t-\tIMPACT=MODIFIER".to_string(),
+    ]);
+    let rows: Vec<String> = annotate(dir.path(), &cache, "default", true)
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(rows, expected);
+
+    // --overlaps: the two values become columns of the tab and VCF outputs, after
+    // FLAGS and before BIOTYPE, `-` and empty on the intergenic row.
+    let tab = annotate_with_args(dir.path(), &cache, "tab", true, &["--overlaps"]);
+    let header = tab
+        .lines()
+        .find(|l| l.starts_with("#Uploaded_variation"))
+        .unwrap();
+    assert_eq!(
+        header,
+        "#Uploaded_variation\tLocation\tAllele\tGene\tFeature\tFeature_type\tConsequence\tcDNA_position\tCDS_position\tProtein_position\tAmino_acids\tCodons\tExisting_variation\tIMPACT\tDISTANCE\tSTRAND\tFLAGS\tOverlapBP\tOverlapPC\tBIOTYPE\tMOTIF_NAME\tMOTIF_POS\tHIGH_INF_POS\tMOTIF_SCORE_CHANGE\tTRANSCRIPTION_FACTORS"
+    );
+    let partial: Vec<&str> = tab.lines().filter(|l| l.starts_with("partial\t")).collect();
+    assert_eq!(
+        partial,
+        [
+            "partial\t21:105-112\tdeletion\t-\tENSR_FIXTURE\tRegulatoryFeature\tregulatory_region_variant\t-\t-\t-\t-\t-\t-\tMODIFIER\t-\t-\t-\t8\t38.10\t-\t-\t-\t-\t-\t-",
+            "partial\t21:105-112\tdeletion\t-\tENSM_FORWARD\tMotifFeature\tTFBS_ablation,TF_binding_site_variant\t-\t-\t-\t-\t-\t-\tMODERATE\t-\t-\t-\t4\t100.00\t-\t-\t-\t-\t-\t-",
+            "partial\t21:105-112\tdeletion\t-\t-\t-\tintergenic_variant\t-\t-\t-\t-\t-\t-\tMODIFIER\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-",
+        ]
+    );
+    let vcf = annotate_with_args(dir.path(), &cache, "vcf", true, &["--overlaps"]);
+    let format = vcf
+        .lines()
+        .find(|l| l.starts_with("##INFO=<ID=CSQ"))
+        .and_then(|l| l.split("Format: ").nth(1))
+        .unwrap();
+    assert_eq!(
+        format,
+        "Allele|Consequence|IMPACT|SYMBOL|Gene|Feature_type|Feature|BIOTYPE|EXON|INTRON|HGVSc|HGVSp|cDNA_position|CDS_position|Protein_position|Amino_acids|Codons|Existing_variation|DISTANCE|STRAND|FLAGS|SYMBOL_SOURCE|HGNC_ID|OverlapBP|OverlapPC|MOTIF_NAME|MOTIF_POS|HIGH_INF_POS|MOTIF_SCORE_CHANGE|TRANSCRIPTION_FACTORS\">"
+    );
+    let csq = |id: &str| -> Vec<String> {
+        vcf.lines()
+            .find(|l| l.split('\t').nth(2) == Some(id))
+            .and_then(|l| l.split('\t').nth(7))
+            .and_then(|info| info.split(';').find_map(|item| item.strip_prefix("CSQ=")))
+            .unwrap()
+            .split(',')
+            .map(str::to_owned)
+            .collect()
+    };
+    assert_eq!(
+        csq("partial"),
+        [
+            "deletion|regulatory_region_variant|MODIFIER|||RegulatoryFeature|ENSR_FIXTURE|||||||||||||||||8|38.10|||||",
+            "deletion|TFBS_ablation&TF_binding_site_variant|MODERATE|||MotifFeature|ENSM_FORWARD|||||||||||||||||4|100.00|||||",
+            "deletion|intergenic_variant|MODIFIER|||||||||||||||||||||||||||",
+        ]
+    );
+    assert_eq!(
+        csq("cover_del"),
+        [
+            "-|regulatory_region_ablation&regulatory_region_variant|MODIFIER|||RegulatoryFeature|ENSR_FIXTURE|enhancer||||||||||||||||||||||",
+            "-|TFBS_ablation&TF_binding_site_variant|MODERATE|||MotifFeature|ENSM_FORWARD|||||||||||||1||||||ENSPFM_FORWARD||||TF_A&TF_B",
+            "-|TFBS_ablation&TF_binding_site_variant|MODERATE|||MotifFeature|ENSM_REVERSE|||||||||||||-1||||||ENSPFM_REVERSE||||",
+            "-|intergenic_variant|MODIFIER|||||||||||||||||||||||||||",
+        ]
+    );
+}
+
 #[test]
 fn regulatory_and_motif_rows_use_dash_for_absent_gene() {
     let dir = tempfile::tempdir().unwrap();

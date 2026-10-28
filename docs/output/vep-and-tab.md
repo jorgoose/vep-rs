@@ -170,7 +170,7 @@ The value is the shortest gap between the variant and the transcript: the smalle
 
 `FLAGS` lists every `cds_` transcript attribute (`cds_start_NF,cds_end_NF`).
 
-**OverlapBP** and **OverlapPC** appear on every structural variant row that overlaps its transcript, breakends excepted, in the default Extra column and in JSON (`bp_overlap`, `percentage_overlap`). `--overlaps` adds them as columns to `tab`, `vcf` and Parquet. They are reported on transcript rows only; Ensembl VEP also reports them on regulatory-feature and motif-feature rows.
+**OverlapBP** and **OverlapPC** appear on every structural variant row that overlaps its feature, breakends excepted, in the default Extra column and in JSON (`bp_overlap`, `percentage_overlap`). `--overlaps` adds them as columns to `tab`, `vcf` and Parquet. They are reported on transcript, regulatory-feature and motif-feature rows, as in Ensembl VEP.
 
 ### ENSP
 
