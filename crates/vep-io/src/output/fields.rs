@@ -2609,8 +2609,14 @@ mod tests {
                 None => variant.location(),
             },
             "Allele" => string_row_allele(variant, tc, options),
+            // An allele that overlaps no transcript prints `intergenic_variant` on
+            // its intergenic row whatever its regulatory rows made its verdict.
             "Consequence" => match tc {
                 Some(x) => consequence_string(x, options),
+                None if variant.intergenic_overlap => options
+                    .terms
+                    .term(Consequence::IntergenicVariant)
+                    .to_string(),
                 None => {
                     let consequence = variant
                         .most_severe_consequence
@@ -2618,14 +2624,17 @@ mod tests {
                     options.terms.term(consequence).to_string()
                 }
             },
-            "IMPACT" => tc
-                .map(|x| x.impact.to_string())
-                .or_else(|| {
-                    variant
-                        .most_severe_consequence
-                        .map(|c| c.impact().to_string())
-                })
-                .unwrap_or_else(|| Consequence::IntergenicVariant.impact().to_string()),
+            "IMPACT" => match tc {
+                Some(x) => x.impact.to_string(),
+                None if variant.intergenic_overlap => {
+                    Consequence::IntergenicVariant.impact().to_string()
+                }
+                None => variant
+                    .most_severe_consequence
+                    .unwrap_or(Consequence::IntergenicVariant)
+                    .impact()
+                    .to_string(),
+            },
             "SYMBOL" => string_identifier(tc.and_then(|x| x.gene_symbol.as_deref())),
             "Gene" => tc
                 .map(|x| string_versioned_id(&x.gene_id, x.gene_version, options.gene_version))
@@ -2640,7 +2649,14 @@ mod tests {
                     )
                 })
                 .unwrap_or_default(),
-            "BIOTYPE" if !options.biotype => String::new(),
+            // A regulatory row's BIOTYPE is unconditional (OutputFactory.pm:1881); a
+            // transcript row's needs --biotype (:1580).
+            "BIOTYPE"
+                if !options.biotype
+                    && tc.is_none_or(|x| x.feature_type != FeatureType::RegulatoryFeature) =>
+            {
+                String::new()
+            }
             "BIOTYPE" => tc
                 .and_then(|x| x.biotype.as_deref())
                 .unwrap_or("")
@@ -2727,6 +2743,17 @@ mod tests {
             "OverlapPC" => sv_overlap(variant, tc)
                 .map(|(_, pc)| format!("{pc:.2}"))
                 .unwrap_or_default(),
+            // A regulatory row sets no STRAND (OutputFactory.pm:1867-1884); a motif
+            // row sets its feature's (:1926) unless the record is structural, whose
+            // overlap hash carries none (:2069-2102).
+            "STRAND"
+                if tc.is_some_and(|x| {
+                    x.feature_type == FeatureType::RegulatoryFeature
+                        || (variant.is_structural && x.feature_type == FeatureType::MotifFeature)
+                }) =>
+            {
+                String::new()
+            }
             "STRAND" => tc.map(|x| x.strand.to_string()).unwrap_or_default(),
             "FLAGS" => tc
                 .map(|x| {
@@ -3012,17 +3039,28 @@ mod tests {
     /// The byte writer agrees with the string table on every column, with both
     /// list separators, with and without HGVS escaping, under the whole-variant
     /// ClinVar rule, with the own-span positions, in the display vocabulary, on
-    /// a bare row, an empty consequence and the default options, and on a motif
-    /// row with factors and a matrix position and one with neither; and between
-    /// the populated sequence row, the structural row and the motif rows every
-    /// column but the two motif scores and the name nothing produces prints a
-    /// value.
+    /// a bare row, an empty consequence and the default options, on a motif
+    /// row with factors and a matrix position and one with neither, on a
+    /// regulatory row, and on the motif and regulatory rows of a structural
+    /// record; and between the populated sequence row, the structural row and
+    /// the motif rows every column but the two motif scores and the name
+    /// nothing produces prints a value. A regulatory row prints its BIOTYPE
+    /// without `--biotype` and no STRAND; a structural record's motif row prints
+    /// no STRAND either.
     #[test]
     fn write_field_value_matches_the_string_table_on_every_column() {
         let variant = populated_variant();
         let tc = populated_consequence();
         let structural = structural_variant();
         let options = all_options();
+        let regulatory = TranscriptConsequence {
+            transcript_id: Arc::from("ENSR00000001"),
+            consequences: std::iter::once(Consequence::RegulatoryRegionVariant).collect(),
+            feature_type: FeatureType::RegulatoryFeature,
+            biotype: Some(Arc::from("promoter")),
+            strand: 0,
+            ..TranscriptConsequence::default()
+        };
         let motif = TranscriptConsequence {
             transcript_id: Arc::from("ENSM00000001"),
             consequences: std::iter::once(Consequence::TfBindingSiteVariant).collect(),
@@ -3056,6 +3094,9 @@ mod tests {
                 &options,
                 sep,
             ));
+            assert_writer_matches(&variant, Some(&regulatory), &options, sep);
+            assert_writer_matches(&structural, Some(&regulatory), &options, sep);
+            assert_writer_matches(&structural, Some(&motif), &options, sep);
         }
         for column in every_column() {
             let never = matches!(column, "HIGH_INF_POS" | "MOTIF_SCORE_CHANGE" | "Unknown");
@@ -3089,6 +3130,26 @@ mod tests {
             assert_writer_matches(&structural, Some(&tc), &options, ",");
             assert_writer_matches(&variant, Some(&motif), &options, ",");
             assert_writer_matches(&variant, Some(&unbound), &options, ",");
+            assert_writer_matches(&variant, Some(&regulatory), &options, ",");
+            assert_writer_matches(&structural, Some(&motif), &options, ",");
+        }
+        for options in [all_options(), FieldOptions::default()] {
+            assert_eq!(
+                field_value("BIOTYPE", &variant, Some(&regulatory), &options, ","),
+                "promoter"
+            );
+            assert_eq!(
+                field_value("STRAND", &variant, Some(&regulatory), &options, ","),
+                ""
+            );
+            assert_eq!(
+                field_value("STRAND", &variant, Some(&motif), &options, ","),
+                "-1"
+            );
+            assert_eq!(
+                field_value("STRAND", &structural, Some(&motif), &options, ","),
+                ""
+            );
         }
         let bare = InputVariant::new("21".into(), 100, 100, b"A".to_vec(), b"G".to_vec());
         let empty = TranscriptConsequence::default();
@@ -3209,7 +3270,8 @@ mod tests {
 
     /// The byte writer agrees with the string table on a `--summary` row, whose
     /// columns are the record's identity, location, consequence list and
-    /// variant-level fields alone, and on a flagged intergenic row.
+    /// variant-level fields alone, on a flagged intergenic row, and on the
+    /// intergenic row of an allele that overlaps regulatory features alone.
     #[test]
     fn write_field_value_matches_the_string_table_on_summary_and_intergenic_rows() {
         let mut summary = populated_variant();
@@ -3267,6 +3329,23 @@ mod tests {
         assert_eq!(
             field_value("Location", &intergenic, None, &all_options(), ","),
             "21:102"
+        );
+
+        // The intergenic row of an allele whose regulatory rows made its verdict
+        // prints `intergenic_variant` and its MODIFIER impact, not the verdict.
+        let mut overlap = intergenic.clone();
+        overlap.intergenic_overlap = true;
+        overlap.most_severe_consequence = Some(Consequence::RegulatoryRegionVariant);
+        for options in [all_options(), FieldOptions::default(), display] {
+            assert_writer_matches(&overlap, None, &options, ",");
+        }
+        assert_eq!(
+            field_value("Consequence", &overlap, None, &all_options(), ","),
+            "intergenic_variant"
+        );
+        assert_eq!(
+            field_value("IMPACT", &overlap, None, &all_options(), ","),
+            "MODIFIER"
         );
     }
 
