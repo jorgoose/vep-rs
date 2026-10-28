@@ -278,6 +278,18 @@ fn record_rows(record: &[InputVariant]) -> Vec<Row> {
     rows
 }
 
+/// The consequence terms of an allele's intergenic row: `intergenic_variant`
+/// beside the regulatory and motif rows of an allele that overlaps no
+/// transcript ([`InputVariant::intergenic_overlap`]), else the verdict of an
+/// allele with no feature row.
+fn intergenic_row_terms(variant: &InputVariant) -> &[Consequence] {
+    if variant.intergenic_overlap {
+        &[Consequence::IntergenicVariant]
+    } else {
+        variant.most_severe_consequence.as_slice()
+    }
+}
+
 /// The values `pick_worst_VariationFeatureOverlapAllele` ranks one row by, each
 /// lower when better (`OutputFactory.pm:712-768`): the defaults for a row that is
 /// not against a transcript, the transcript's attributes otherwise.
@@ -517,13 +529,7 @@ fn pick_family(record: &mut [InputVariant], config: &FilterConfig) {
             Row::Transcript { allele, tc } => {
                 PickInfo::of_transcript(&record[allele].transcript_consequences[tc])
             }
-            Row::Intergenic { allele } => {
-                PickInfo::defaults(if record[allele].intergenic_overlap {
-                    &[Consequence::IntergenicVariant]
-                } else {
-                    record[allele].most_severe_consequence.as_slice()
-                })
-            }
+            Row::Intergenic { allele } => PickInfo::defaults(intergenic_row_terms(&record[allele])),
         })
         .collect();
     let order = config.pick_order.as_slice();
@@ -615,10 +621,7 @@ fn summarise(record: &mut [InputVariant], most_severe_only: bool) {
             Row::Transcript { allele, tc } => {
                 &record[allele].transcript_consequences[tc].consequences
             }
-            Row::Intergenic { allele } if record[allele].intergenic_overlap => {
-                &[Consequence::IntergenicVariant]
-            }
-            Row::Intergenic { allele } => record[allele].most_severe_consequence.as_slice(),
+            Row::Intergenic { allele } => intergenic_row_terms(&record[allele]),
         };
         terms.extend_from_slice(row_terms);
     }
