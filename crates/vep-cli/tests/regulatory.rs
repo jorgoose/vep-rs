@@ -508,6 +508,234 @@ fn sv_and_indel_classes_over_a_regulatory_feature() {
     );
 }
 
+/// The pick family through the command line, on a record inside two
+/// transcripts of one gene and the fixture's features shifted onto it, and on a
+/// record inside the same features shifted between the genes: `--pick` keeps
+/// the one worst allele of the record (the intron row; the motif row where no
+/// transcript overlaps, the intergenic row then dropped); `--per_gene` and
+/// `--pick_allele_gene` keep one transcript row per gene and every regulatory,
+/// motif and intergenic row (OutputFactory.pm:837-845, non-transcript alleles
+/// pass through); `--flag_pick` and `--flag_pick_allele` flag the one pick;
+/// `--flag_pick_allele_gene` flags the per-gene pick and every pass-through row,
+/// the intergenic row included (:623-627); `--most_severe` and `--summary` read
+/// the regulatory terms with the transcript terms.
+#[test]
+fn pick_family_flags_through_the_cli_keep_regulatory_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = dir.path().join("cache");
+    fs::create_dir_all(cache.join("transcripts/21")).unwrap();
+    fs::create_dir_all(cache.join("regulatory/21")).unwrap();
+    // Two protein-coding transcripts of ENSG00000166351 at 13609777-13645823 and
+    // three lncRNA transcripts of another gene at 13843132-13897298.
+    fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "../../tests/golden/116/GRCh38/json_cache/transcripts/21/13000001-14000000.json.gz",
+        ),
+        cache.join("transcripts/21/13000001-14000000.json.gz"),
+    )
+    .unwrap();
+    let fixture: Vec<Value> =
+        serde_json::from_slice(include_bytes!("fixtures/regulatory/1-1000000.json")).unwrap();
+    let shifted: Vec<Value> = [(13_619_894u64, "_IN_GENE"), (13_699_894, "_BETWEEN")]
+        .iter()
+        .flat_map(|(offset, suffix)| {
+            fixture.iter().map(move |feature| {
+                let mut feature = feature.clone();
+                for key in ["start", "end"] {
+                    let value = feature[key].as_u64().unwrap() + offset;
+                    feature[key] = Value::from(value);
+                }
+                let id = format!("{}{suffix}", feature["stable_id"].as_str().unwrap());
+                feature["stable_id"] = Value::from(id);
+                feature
+            })
+        })
+        .collect();
+    fs::write(
+        cache.join("regulatory/21/13000001-14000000.json"),
+        serde_json::to_vec(&shifted).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        cache.join("info.json"),
+        r#"{"assembly":"GRCh38","regulatory":true}"#,
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("in.vcf"),
+        "##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n\
+         21\t13620000\tin_gene\tC\tG\t.\t.\t.\n\
+         21\t13700000\tbetween\tC\tG\t.\t.\t.\n",
+    )
+    .unwrap();
+    // (record, Feature, Feature_type, Consequence, PICK)
+    let rows = |flags: &[&str]| -> Vec<(String, String, String, String, String)> {
+        annotate_with_args(dir.path(), &cache, "default", true, flags)
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .map(|line| {
+                let cols: Vec<&str> = line.split('\t').collect();
+                let pick = cols[13]
+                    .split(';')
+                    .find_map(|item| item.strip_prefix("PICK="))
+                    .unwrap_or("-");
+                (
+                    cols[0].to_string(),
+                    cols[4].to_string(),
+                    cols[5].to_string(),
+                    cols[6].to_string(),
+                    pick.to_string(),
+                )
+            })
+            .collect()
+    };
+    let row = |record: &str, feature: &str, kind: &str, terms: &str, pick: &str| {
+        (
+            record.to_string(),
+            feature.to_string(),
+            kind.to_string(),
+            terms.to_string(),
+            pick.to_string(),
+        )
+    };
+    let in_gene_t1 = |pick| {
+        row(
+            "in_gene",
+            "ENST00000299443",
+            "Transcript",
+            "intron_variant",
+            pick,
+        )
+    };
+    let in_gene_t2 = |pick| {
+        row(
+            "in_gene",
+            "ENST00000620442",
+            "Transcript",
+            "intron_variant",
+            pick,
+        )
+    };
+    let in_gene_rf = |pick| {
+        row(
+            "in_gene",
+            "ENSR_FIXTURE_IN_GENE",
+            "RegulatoryFeature",
+            "regulatory_region_variant",
+            pick,
+        )
+    };
+    let in_gene_mf = |pick| {
+        row(
+            "in_gene",
+            "ENSM_FORWARD_IN_GENE",
+            "MotifFeature",
+            "TF_binding_site_variant",
+            pick,
+        )
+    };
+    let between_rf = |pick| {
+        row(
+            "between",
+            "ENSR_FIXTURE_BETWEEN",
+            "RegulatoryFeature",
+            "regulatory_region_variant",
+            pick,
+        )
+    };
+    let between_mf = |pick| {
+        row(
+            "between",
+            "ENSM_FORWARD_BETWEEN",
+            "MotifFeature",
+            "TF_binding_site_variant",
+            pick,
+        )
+    };
+    let between_ig = |pick| row("between", "-", "-", "intergenic_variant", pick);
+
+    assert_eq!(
+        rows(&[]),
+        [
+            in_gene_t1("-"),
+            in_gene_t2("-"),
+            in_gene_rf("-"),
+            in_gene_mf("-"),
+            between_rf("-"),
+            between_mf("-"),
+            between_ig("-")
+        ]
+    );
+    assert_eq!(rows(&["--pick"]), [in_gene_t1("-"), between_mf("-")]);
+    for flag in ["--per_gene", "--pick_allele_gene"] {
+        assert_eq!(
+            rows(&[flag]),
+            [
+                in_gene_t1("-"),
+                in_gene_rf("-"),
+                in_gene_mf("-"),
+                between_rf("-"),
+                between_mf("-"),
+                between_ig("-")
+            ],
+            "{flag}"
+        );
+    }
+    for flag in ["--flag_pick", "--flag_pick_allele"] {
+        assert_eq!(
+            rows(&[flag]),
+            [
+                in_gene_t1("1"),
+                in_gene_t2("-"),
+                in_gene_rf("-"),
+                in_gene_mf("-"),
+                between_rf("-"),
+                between_mf("1"),
+                between_ig("-")
+            ],
+            "{flag}"
+        );
+    }
+    assert_eq!(
+        rows(&["--flag_pick_allele_gene"]),
+        [
+            in_gene_t1("1"),
+            in_gene_t2("-"),
+            in_gene_rf("1"),
+            in_gene_mf("1"),
+            between_rf("1"),
+            between_mf("1"),
+            between_ig("1")
+        ]
+    );
+    assert_eq!(
+        rows(&["--most_severe"]),
+        [
+            row("in_gene", "-", "-", "intron_variant", "-"),
+            row("between", "-", "-", "TF_binding_site_variant", "-")
+        ]
+    );
+    assert_eq!(
+        rows(&["--summary"]),
+        [
+            row(
+                "in_gene",
+                "-",
+                "-",
+                "intron_variant,TF_binding_site_variant,regulatory_region_variant",
+                "-"
+            ),
+            row(
+                "between",
+                "-",
+                "-",
+                "TF_binding_site_variant,regulatory_region_variant,intergenic_variant",
+                "-"
+            ),
+        ]
+    );
+}
+
 #[test]
 fn regulatory_and_motif_rows_use_dash_for_absent_gene() {
     let dir = tempfile::tempdir().unwrap();
