@@ -220,57 +220,59 @@ impl Row {
     }
 }
 
-/// The record's rows in Ensembl VEP's order: feature-major in the string order
-/// of the keys the record's transcript variations are stored under
-/// (`VariationFeature.pm:666` of ensembl-variation sorts them), allele-minor
+/// The record's rows in Ensembl VEP's order (`VariationFeature.pm:855-864` of
+/// ensembl-variation): the transcript rows, then the regulatory rows, then the
+/// motif rows, each kind feature-major in the string order of the keys its
+/// variations are stored under (`:666`, `:710`, `:750` sort them), allele-minor
 /// (each feature lists its reference allele's row under `--process_ref_homs`
-/// and then its alternate allele), then the intergenic row of every allele that
-/// overlaps no transcript. A feature's key is its transcript's stable id; the
-/// rejoin of a `--minimal` split stores every allele after the first under
-/// `<its allele string>_<stable id>` (`OutputFactory.pm:2316`), so such an
-/// allele's feature sorts by its allele string against the first allele's bare
-/// stable id, before it when the string starts with a `-`, a digit or a letter
-/// below the id's first. An allele whose chromosome has no transcripts has no
-/// row.
+/// and then its alternate allele); then the intergenic row of every allele that
+/// overlaps no transcript, whether it carries regulatory and motif rows or
+/// none. A feature's key is its stable id; the rejoin of a `--minimal` split
+/// stores every allele after the first under `<its allele string>_<stable id>`
+/// (`OutputFactory.pm:2316`), so such an allele's feature sorts by its allele
+/// string against the first allele's bare stable id, before it when the string
+/// starts with a `-`, a digit or a letter below the id's first. An allele whose
+/// chromosome has no transcripts has no row.
 fn record_rows(record: &[InputVariant]) -> Vec<Row> {
-    let mut rows = Vec::new();
+    let mut feature_rows: Vec<(usize, usize)> = Vec::new();
     for (allele, variant) in record.iter().enumerate() {
         for tc in 0..variant.transcript_consequences.len() {
-            rows.push(Row::Transcript { allele, tc });
-        }
-        if variant.intergenic_overlap {
-            rows.push(Row::Intergenic { allele });
+            feature_rows.push((allele, tc));
         }
     }
-    let feature_key = |row: &Row| {
-        let variant = &record[row.allele()];
-        let id = match *row {
-            Row::Transcript { tc, .. } => {
-                variant.transcript_consequences[tc].transcript_id.as_ref()
-            }
-            Row::Intergenic { .. } => "",
-        };
-        variant
+    let feature = |&(allele, tc): &(usize, usize)| &record[allele].transcript_consequences[tc];
+    let kind_rank = |row: &(usize, usize)| match feature(row).feature_type {
+        FeatureType::Transcript => 0,
+        FeatureType::RegulatoryFeature => 1,
+        FeatureType::MotifFeature => 2,
+    };
+    let feature_key = |row: &(usize, usize)| {
+        record[row.0]
             .rejoin_key_prefix
             .as_deref()
             .unwrap_or("")
             .bytes()
-            .chain(id.bytes())
+            .chain(feature(row).transcript_id.bytes())
     };
-    rows.sort_by(|a, b| {
-        feature_key(a)
-            .cmp(feature_key(b))
+    feature_rows.sort_by(|a, b| {
+        kind_rank(a)
+            .cmp(&kind_rank(b))
+            .then_with(|| feature_key(a).cmp(feature_key(b)))
             .then_with(|| {
-                record[b.allele()]
+                record[b.0]
                     .reference_allele_row
-                    .cmp(&record[a.allele()].reference_allele_row)
+                    .cmp(&record[a.0].reference_allele_row)
             })
-            .then_with(|| a.allele().cmp(&b.allele()))
+            .then_with(|| a.0.cmp(&b.0))
     });
+    let mut rows: Vec<Row> = feature_rows
+        .into_iter()
+        .map(|(allele, tc)| Row::Transcript { allele, tc })
+        .collect();
     for (allele, variant) in record.iter().enumerate() {
-        if !variant.intergenic_overlap
-            && variant.transcript_consequences.is_empty()
-            && variant.most_severe_consequence.is_some()
+        if variant.intergenic_overlap
+            || (variant.transcript_consequences.is_empty()
+                && variant.most_severe_consequence.is_some())
         {
             rows.push(Row::Intergenic { allele });
         }
@@ -1100,6 +1102,70 @@ mod tests {
         let mut record = vec![allele(b"G", 0, vec![later, earlier])];
         apply_to_record(&mut record, &config(|c| c.pick = true));
         assert_eq!(kept(&record), vec![(0, "ENST00000300000".to_string())]);
+    }
+
+    /// A full tie falls to the first row of Ensembl VEP's overlap list (`:808`),
+    /// which holds the transcript rows, then the regulatory rows, then the motif
+    /// rows, then the intergenic row (`VariationFeature.pm:855-864`), whatever
+    /// the ids: under `--pick_order canonical` every row here scores 1, so the
+    /// transcript row wins over the regulatory and motif rows whose ids sort
+    /// before its own, and without a transcript the regulatory row wins over
+    /// the motif row and over the allele's intergenic row.
+    #[test]
+    fn full_tie_falls_to_the_first_row_of_the_overlap_list() {
+        let canonical_only = config(|c| {
+            c.pick = true;
+            c.pick_order = vec![PickCriterion::Canonical];
+        });
+        let regulatory = || {
+            feature(
+                "ENSR1",
+                FeatureType::RegulatoryFeature,
+                Consequence::RegulatoryRegionVariant,
+            )
+        };
+        let motif = || {
+            feature(
+                "ENSM1",
+                FeatureType::MotifFeature,
+                Consequence::TfBindingSiteVariant,
+            )
+        };
+        let transcript = || tc("ENST1", "G1", smallvec![Consequence::IntronVariant]);
+
+        let mut record = vec![allele(b"G", 0, vec![motif(), regulatory(), transcript()])];
+        assert_eq!(
+            record_rows(&record),
+            [
+                Row::Transcript { allele: 0, tc: 2 },
+                Row::Transcript { allele: 0, tc: 1 },
+                Row::Transcript { allele: 0, tc: 0 }
+            ]
+        );
+        apply_to_record(&mut record, &canonical_only);
+        assert_eq!(kept(&record), vec![(0, "ENST1".to_string())]);
+
+        let mut v = allele(b"G", 0, vec![motif(), regulatory()]);
+        v.intergenic_overlap = true;
+        let mut record = vec![v];
+        assert_eq!(
+            record_rows(&record),
+            [
+                Row::Transcript { allele: 0, tc: 1 },
+                Row::Transcript { allele: 0, tc: 0 },
+                Row::Intergenic { allele: 0 }
+            ]
+        );
+        apply_to_record(&mut record, &canonical_only);
+        assert_eq!(kept(&record), vec![(0, "ENSR1".to_string())]);
+        assert!(!record[0].intergenic_overlap);
+
+        let mut v = allele(b"G", 0, vec![regulatory()]);
+        v.intergenic_overlap = true;
+        let mut record = vec![v];
+        apply_to_record(&mut record, &canonical_only);
+        assert_eq!(kept(&record), vec![(0, "ENSR1".to_string())]);
+        assert!(!record[0].intergenic_overlap);
     }
 
     /// The alleles of a `--minimal` split sort by the keys the rejoin stores
