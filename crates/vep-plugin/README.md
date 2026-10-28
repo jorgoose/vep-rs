@@ -5,8 +5,9 @@
 time, and keeps the loaded plugins in a registry. `vep-cli`, the only workspace crate
 that depends on it, resolves each `--plugin` name against [`vep-builtins`](../vep-builtins/README.md)
 first and hands the names no built-in claims to this crate. Each loaded plugin returns one
-JavaScript Object Notation (JSON) object per transcript consequence, merged by `vep-cli` into
-that consequence's `plugin_data` fields.
+JavaScript Object Notation (JSON) object per consequence row of the feature types it declares
+(transcript rows alone without `vep_plugin_feature_types`), merged by `vep-cli` into that row's
+`plugin_data` fields.
 
 The plugin support matrix, the data-file preparation steps and the guide to writing a plugin
 live in [docs/plugins.md](../../docs/plugins.md); this page describes the crate.

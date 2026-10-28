@@ -78,8 +78,9 @@ rather than reading the cache, so its default and tab headers compare by their
 column descriptions alone (`flag-set`, `flag-set --perl-mode`). `masks` lists the
 mask classes applied to every run of the corpus before the comparison:
 `regulatory_feature_rows` sets aside the reference's `RegulatoryFeature` and
-`MotifFeature` rows for a corpus run under `--regulatory` or `--everything`, which
-vep-rs accepts and annotates nothing for, and `order_only` compares the `DOMAINS`,
+`MotifFeature` rows for a corpus run under `--regulatory` or `--everything` against
+a cache converted without its regulatory tree, where vep-rs writes none, and
+`order_only` compares the `DOMAINS`,
 `FREQS` and `ZYG` items of both sides as multisets, for a native cache that lists a
 transcript's protein features in another order than the Ensembl cache and for the
 sample order of `--individual_zyg`, which Ensembl VEP prints in hash order
