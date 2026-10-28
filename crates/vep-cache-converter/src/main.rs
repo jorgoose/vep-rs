@@ -814,18 +814,11 @@ fn convert_data_files(src_dir: &Path, dst_dir: &Path, label: &str) -> Result<(us
 
     for entry in &entries {
         let path = entry.path();
-        let ext = path.extension().and_then(|e| e.to_str());
-        if ext != Some("json") {
-            warn!(
-                "Skipping file with unexpected name: {}",
-                entry.file_name().to_string_lossy()
-            );
-            continue;
-        }
-
-        let filestem = match path.file_stem().and_then(|s| s.to_str()) {
-            Some(s) => s.to_string(),
-            None => {
+        let extension = path.extension().and_then(|e| e.to_str());
+        let stem = path.file_stem().and_then(|s| s.to_str());
+        let filestem = match (extension, stem) {
+            (Some("json"), Some(filestem)) => filestem.to_string(),
+            _ => {
                 warn!(
                     "Skipping file with unexpected name: {}",
                     entry.file_name().to_string_lossy()
