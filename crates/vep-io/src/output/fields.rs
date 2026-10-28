@@ -1067,10 +1067,8 @@ pub fn record_rows_into<'a>(record: &[&'a InputVariant], rows: &mut Vec<Row<'a>>
 /// their sort keys ([`rejoin_key`]): the loader's ranks when both rows carry one
 /// that orders as the key does ([`orderable_rank`]), else the keys themselves.
 fn transcript_order(a: &Row<'_>, b: &Row<'_>) -> std::cmp::Ordering {
-    let type_order =
-        a.1.expect("feature row")
-            .feature_type
-            .cmp(&b.1.expect("feature row").feature_type);
+    let (feature_a, feature_b) = (a.1.expect("feature row"), b.1.expect("feature row"));
+    let type_order = feature_a.feature_type.cmp(&feature_b.feature_type);
     if !type_order.is_eq() {
         return type_order;
     }
