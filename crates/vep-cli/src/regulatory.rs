@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::Context;
+use rayon::prelude::*;
 use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use vep_core::cache_manifest::CacheManifest;
@@ -117,6 +118,9 @@ fn matrix_length<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
 struct Chromosome {
     shards: Vec<PathBuf>,
     index: OnceLock<Index>,
+    // Held by the one loader of this chromosome while its shards parse, so two
+    // chromosomes load side by side and a loaded one is never waited for.
+    loading: Mutex<()>,
 }
 
 struct Index {
@@ -129,7 +133,6 @@ struct Index {
 pub struct RegulatorySource {
     chromosomes: HashMap<String, Chromosome>,
     manifest: Arc<CacheManifest>,
-    loading: Mutex<()>,
 }
 
 impl RegulatorySource {
@@ -177,14 +180,22 @@ impl RegulatorySource {
                 Chromosome {
                     shards,
                     index: OnceLock::new(),
+                    loading: Mutex::new(()),
                 },
             );
         }
         Ok(Some(Arc::new(Self {
             chromosomes,
             manifest: Arc::clone(&cache.manifest),
-            loading: Mutex::new(()),
         })))
+    }
+
+    /// Loads every chromosome, in name order, so a corrupt shard anywhere in the
+    /// tree fails here and no later lookup meets a cold chromosome.
+    pub(crate) fn prewarm_all(&self) -> anyhow::Result<()> {
+        let mut names: Vec<&String> = self.chromosomes.keys().collect();
+        names.sort();
+        names.into_iter().try_for_each(|chr| self.prewarm(chr))
     }
 
     pub(crate) fn prewarm(&self, chr: &str) -> anyhow::Result<()> {
@@ -194,17 +205,23 @@ impl RegulatorySource {
         if chromosome.index.get().is_some() {
             return Ok(());
         }
-        let _guard = self.loading.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = chromosome.loading.lock().unwrap_or_else(|e| e.into_inner());
         if chromosome.index.get().is_some() {
             return Ok(());
         }
+        // The shards parse on rayon's global pool, as the transcript shards do:
+        // every caller runs outside the run's scoped pool, so no worker of that
+        // pool waits here holding a chromosome's lock.
+        let shards: Vec<Vec<Feature>> = chromosome
+            .shards
+            .par_iter()
+            .map(|path| read_shard_features(path, &self.manifest))
+            .collect::<anyhow::Result<_>>()?;
         let mut features = Vec::new();
         let mut seen = HashSet::new();
-        for path in &chromosome.shards {
-            for feature in read_shard_features(path, &self.manifest)? {
-                if seen.insert((feature.feature_type, Arc::clone(&feature.stable_id))) {
-                    features.push(feature);
-                }
+        for feature in shards.into_iter().flatten() {
+            if seen.insert((feature.feature_type, Arc::clone(&feature.stable_id))) {
+                features.push(feature);
             }
         }
         features.sort_by_key(|feature| feature.start);

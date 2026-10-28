@@ -234,11 +234,19 @@ impl Annotator {
     /// here (rather than per batch, and rather than in a `debug_assert!` that
     /// release builds drop) is what makes the invariant hold in production.
     /// `load_transcript_indexes` produces a conforming index via `from_loaded`.
+    ///
+    /// The regulatory source, when the configuration has one, is loaded whole
+    /// here for the same reason: a corrupt regulatory shard fails construction,
+    /// as a corrupt transcript shard does, instead of leaving every variant of
+    /// its chromosome without regulatory rows.
     pub fn new(resources: AnnotationResources, pool: Arc<ThreadPool>) -> anyhow::Result<Self> {
         // Verified at construction; the wrapper is dropped because the batch path
         // needs the `Arc` itself, and the check cannot be invalidated afterwards:
         // materialization only ever moves from empty to filled.
         MaterializedTranscriptIndexes::try_from_lazy(Arc::clone(&resources.transcripts))?;
+        if let Some(source) = &resources.regulatory_source {
+            source.prewarm_all()?;
+        }
         Ok(Self {
             inner: Arc::new(AnnotatorInner { resources, pool }),
         })
@@ -386,7 +394,8 @@ impl Annotator {
         let failure = ReadFailure::default();
         // No pre-warm pass: `annotate_batch` calls `transcripts.get` inside the
         // rayon closure and `get` never parses, so the index must already be
-        // materialized; `Annotator::new` enforces that, hence no per-batch check.
+        // materialized; `Annotator::new` enforces that, and loads the regulatory
+        // source whole, hence no per-batch check of either.
         let stats = pool.install(|| annotate_batch(batch, resources, use_parallel, &failure));
         (stats, failure.take_with_component())
     }
@@ -746,13 +755,6 @@ pub fn annotate_batch(
             &resources.synonyms,
             &resources.transcripts,
         );
-    }
-    if let Some(source) = &resources.regulatory_source {
-        for variant in batch.iter() {
-            if let Err(error) = source.prewarm(&variant.chr) {
-                failure.record(format!("{error:#}"));
-            }
-        }
     }
     if let Some(source) = &resources.variation_source {
         if let Err(error) = source.prefetch(batch.iter().map(|v| (v.chr.as_str(), v.start, v.end)))

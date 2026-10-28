@@ -17,7 +17,8 @@ fn cache(dir: &Path) -> std::path::PathBuf {
         include_bytes!("fixtures/regulatory/1-1000000.json"),
     )
     .unwrap();
-    // Unqueried chromosome must not be parsed.
+    // A chromosome the run never queries is not parsed by the command line's
+    // lazy loader, so the corrupt shard is reached only through chromosome 22.
     fs::write(cache.join("regulatory/22/1-1000000.json"), "[").unwrap();
     fs::write(
         cache.join("info.json"),
@@ -345,10 +346,37 @@ fn regulatory_only_no_intergenic_removes_all_rows() {
     assert_regulatory_only_rows(&["--no_intergenic"], false, false);
 }
 
+/// A corrupt regulatory shard fails the embedding annotator's construction, as a
+/// corrupt transcript shard does, instead of annotating every variant of the
+/// chromosome without its regulatory rows and reporting the failure as an event.
+#[test]
+fn embedding_annotator_refuses_a_corrupt_regulatory_shard_at_construction() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = cache(dir.path());
+    let config = vep_cli::Config::from_argv([
+        "vep",
+        "--json_cache",
+        cache.to_str().unwrap(),
+        "--regulatory",
+        "--no_fasta",
+    ])
+    .unwrap();
+    let error = match vep_cli::Annotator::from_config(&config) {
+        Err(error) => format!("{error:#}"),
+        Ok(_) => panic!("a cache with a corrupt regulatory shard built an annotator"),
+    };
+    assert!(
+        error.contains("parsing") && error.contains("regulatory/22/1-1000000.json"),
+        "{error}"
+    );
+}
+
 #[test]
 fn embedding_batches_load_regulatory_features_and_apply_summary_filters() {
     let dir = tempfile::tempdir().unwrap();
     let cache = cache(dir.path());
+    // The embedding annotator loads every chromosome when it is built.
+    fs::remove_dir_all(cache.join("regulatory/22")).unwrap();
     let config = vep_cli::Config::from_argv([
         "vep",
         "--json_cache",
