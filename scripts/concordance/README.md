@@ -88,9 +88,9 @@ exits zero after writing its report; the formats comparator exits by its green/r
 
 The selector is available only in the formats comparator's comparison mode, not
 `--self-parity` or `--warnings`, and cannot be combined with
-`--masks regulatory_feature_rows`. That existing mask instead excludes the **reference's**
+`--masks regulatory_feature_rows`. That mask instead excludes the **reference's**
 regulatory rows for caches without regulatory data. Its warnings comparison accepts
-either the cache-unavailable notice or the older unimplemented-feature notice.
+either the cache-unavailable notice or the notice of releases 0.1.0 to 0.5.0.
 
 ## Generating the Perl ground truth
 

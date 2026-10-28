@@ -39,8 +39,7 @@ Masks, floors and field pairs (comparison mode):
   rows in every format for a candidate cache without regulatory data, recomputes the
   ``most_severe_consequence`` of each JSON record that lost a row from the rows that remain,
   and in ``--warnings`` mode requires the candidate's notice about missing regulatory data
-  (or the older unimplemented-feature notice) and leaves
-  it out of the comparison. The class ``order_only`` is built in too: the set-valued columns
+  (or the notice of releases 0.1.0 to 0.5.0) and leaves it out of the comparison. The class ``order_only`` is built in too: the set-valued columns
   ``DOMAINS``, ``FREQS`` and ``ZYG`` (and the ``Extra`` text carrying them) agree when their
   items agree as a multiset in any order, since Ensembl VEP prints the protein features in
   the order of the cache's array and the frequencies and the per-sample zygosities in hash
@@ -80,7 +79,7 @@ Masks, floors and field pairs (comparison mode):
   both inputs retain only ``RegulatoryFeature`` and ``MotifFeature`` consequence rows,
   plus the VCF/JSON record entries of records retaining such a row. A JSON record that
   loses non-regulatory rows has its ``most_severe_consequence`` recomputed from its retained
-  rows. Other record fields still compare verbatim. This cannot be combined with
+  rows. Other record fields compare verbatim. This cannot be combined with
   ``--masks regulatory_feature_rows`` or used in warnings or self-parity mode.
 
 A comparison is green when no expected entry is missing, no actual entry is unexpected
@@ -136,7 +135,8 @@ REFERENCE_SKIPPED_RECORD = "reference_skipped_record"
 # The built-in mask class dropping the reference's regulatory rows (``without_regulatory_rows``).
 REGULATORY_FEATURE_ROWS = "regulatory_feature_rows"
 REGULATORY_KINDS = {"regulatory_feature", "motif_feature"}
-# The old and cache-aware warnings-file phrases for an unavailable --regulatory annotation.
+# The 0.1.0-to-0.5.0 and the cache-aware warnings-file phrases for --regulatory on a cache
+# without regulatory data.
 REGULATORY_NOTICE = "regulatory-feature annotation is not implemented"
 MISSING_REGULATORY_NOTICE = "this cache holds no regulatory data"
 EXAMPLES_PER_GROUP = 4

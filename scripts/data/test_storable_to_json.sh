@@ -2,11 +2,11 @@
 # storable_to_json.pl keeps a `sift` or `polyphen` marker in info.json only when the
 # conversion wrote a matrix of the tool and info.txt names the tool's `source_<tool>`
 # version, the one line VEP's availability check reads (Cache/Transcript.pm:155). This
-# suite builds small Storable caches, converts them and checks prediction markers
+# script builds small Storable caches, converts them and checks prediction markers
 # and regulatory feature shards. Regulatory metadata must describe the output tree,
 # never just repeat the input marker.
 #
-# The converter needs a perl with Storable and JSON. The suite runs the first perl on
+# The converter needs a perl with Storable and JSON. The script runs the first perl on
 # PATH when it has them, else the perl of the ensemblorg/ensembl-vep:release_116.2
 # image when docker holds it, and exits 2 with neither (a skip, not a pass). The host
 # needs gzip, for the fixture's matrix, and python3, to read the info.json back.

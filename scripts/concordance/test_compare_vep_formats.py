@@ -542,7 +542,6 @@ def regulatory_pair(request, tmp_path, monkeypatch):
     expected.write_text(render(False), encoding="utf-8")
     actual.write_text(render(True), encoding="utf-8")
     if fmt == "parquet":
-        # Keep the adapter boundary in this unit test, as in the existing Parquet test.
         monkeypatch.setattr(cvf, "parquet_as_tab", lambda path: path.read_text(encoding="utf-8"))
     return fmt, expected, actual, input_path
 
@@ -562,7 +561,7 @@ def test_cli_keep_only_regulatory_rows_in_every_format(regulatory_pair, tmp_path
     assert report["counts"]["expected_entries"] == report["counts"]["actual_entries"] == report["counts"]["compared"]
     assert report["one_sided"] == {"expected_only": 0, "actual_only": 0}
     assert report["masks"]["requested"] == []
-    # Regulatory-only comparisons still report genuine motif-field disagreements.
+    # A motif-field disagreement is reported under the selector.
     original = actual.read_text(encoding="utf-8")
     actual.write_text(original.replace("matrix1", "matrix2"), encoding="utf-8")
     assert cvf.main(args + ["--keep-only", "regulatory_feature_rows"]) == 1

@@ -290,7 +290,8 @@ const FLAG_FIELD_GROUPS: &[FieldGroup] = &[
     group("overlaps", &["OverlapBP", "OverlapPC"]),
     group("shift_length", &["SHIFT_LENGTH"]),
     group("var_synonyms", &["VAR_SYNONYMS"]),
-    // Regulatory BIOTYPE is unconditional; transcript BIOTYPE still needs --biotype.
+    // A regulatory row's BIOTYPE is unconditional (OutputFactory.pm:1881); a transcript
+    // row's needs --biotype (OutputFactory.pm:1580).
     group(
         "regulatory",
         &[

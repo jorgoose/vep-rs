@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `--regulatory` (and `--everything`) annotates regulatory and motif features from a reconverted GRCh38 cache; motif score changes and cell-type activity remain unsupported. (#78)
+- `--regulatory` (and `--everything`) annotates regulatory and motif features from a cache converted with its regulatory tree: `RegulatoryFeature` and `MotifFeature` rows with their terms, `BIOTYPE`, `STRAND`, `MOTIF_NAME`, `MOTIF_POS` and `TRANSCRIPTION_FACTORS`, and the intergenic companion row; `HIGH_INF_POS`, `MOTIF_SCORE_CHANGE` and cell-type activity are not written. (#78, #61)
 
 ### Changed
 

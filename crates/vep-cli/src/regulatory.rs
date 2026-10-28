@@ -42,7 +42,7 @@ struct Matrix {
     stable_id: Arc<str>,
     #[serde(default)]
     transcription_factors: Arc<[Arc<str>]>,
-    // Scores are not computed yet. Count positions without allocating the matrix.
+    // Only the matrix length is read: count the positions without keeping the frequencies.
     #[serde(default, rename = "frequencies", deserialize_with = "matrix_length")]
     length: u64,
 }
@@ -264,7 +264,8 @@ impl RegulatorySource {
         else {
             return;
         };
-        // Do not normalize insertions: Perl overlap requires both flanks inside the feature.
+        // An insertion keeps start = end + 1: Ensembl VEP's overlap test (InputBuffer.pm:324,
+        // VariationEffect.pm:81-85) needs both flanks inside the feature.
         let start = variant.start;
         let end = variant.end;
         let initial_rows = variant.transcript_consequences.len();
@@ -295,7 +296,9 @@ impl RegulatorySource {
                 feature_end: feature.end,
                 ..Default::default()
             };
-            // These predicates share tier 2: Perl emits ablation/amplification AND the overlap term.
+            // All six terms are tier 2 (Utils/Constants.pm:1285-1369), so the tier loop
+            // (BaseVariationFeatureOverlapAllele.pm:267-279) writes the ablation or
+            // amplification term and the overlap term together.
             if start <= feature.start && end >= feature.end {
                 let deletion = if variant.is_structural {
                     matches!(

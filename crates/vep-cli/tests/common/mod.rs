@@ -203,7 +203,8 @@ impl Corpus {
     }
 }
 
-/// Excludes regulatory rows from legacy corpus caches lacking converted shards.
+/// The mask class of a corpus whose cache holds no regulatory shards: the
+/// reference's `RegulatoryFeature` and `MotifFeature` rows are set aside.
 pub const REGULATORY_FEATURE_ROWS: &str = "regulatory_feature_rows";
 
 /// The mask class of a run whose list-valued columns carry the same items in
@@ -247,7 +248,8 @@ const REGULATORY_JSON_ARRAYS: [&str; 2] = [
     "regulatory_feature_consequences",
     "motif_feature_consequences",
 ];
-/// The missing-regulatory-cache notice expected for legacy regulatory-masked corpora.
+/// The warnings-file phrase vep-rs writes when the cache holds no regulatory
+/// data; [`REGULATORY_FEATURE_ROWS`] requires the line.
 const REGULATORY_NOTICE: &str = "this cache holds no regulatory data";
 
 /// Applies a run's mask classes to the reference entries of one format.
