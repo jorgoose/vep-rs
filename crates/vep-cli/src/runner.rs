@@ -3023,10 +3023,7 @@ pub(crate) fn annotate_one(
         transcript_filter,
     );
     if let Some(source) = &resources.regulatory_source {
-        source.annotate(variant);
-        if variant.intergenic_overlap {
-            variant.intergenic_shift = intergenic_shift(variant, &resources.effects_config);
-        }
+        source.annotate_variant(variant, &resources.effects_config);
     }
     let csq_count =
         variant.transcript_consequences.len() as u64 + u64::from(variant.intergenic_overlap);

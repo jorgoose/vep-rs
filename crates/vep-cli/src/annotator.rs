@@ -807,11 +807,7 @@ pub fn annotate_batch(
             transcript_filter,
         );
         if let Some(source) = &resources.regulatory_source {
-            source.annotate(variant);
-            if variant.intergenic_overlap {
-                variant.intergenic_shift =
-                    crate::runner::intergenic_shift(variant, &resources.effects_config);
-            }
+            source.annotate_variant(variant, &resources.effects_config);
         }
 
         if let Some(source) = &resources.variation_source {

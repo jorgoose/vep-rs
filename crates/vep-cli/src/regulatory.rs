@@ -220,6 +220,21 @@ impl RegulatorySource {
         Ok(())
     }
 
+    /// Annotates a variant's regulatory and motif overlaps after its transcript
+    /// rows, then, where the record gained its companion intergenic row, its
+    /// `--shift_3prime` shift, which the transcript path computes for an
+    /// intergenic verdict alone. Both annotation paths call this one method.
+    pub(crate) fn annotate_variant(
+        &self,
+        variant: &mut InputVariant,
+        effects: &vep_effects::EffectsConfig,
+    ) {
+        self.annotate(variant);
+        if variant.intergenic_overlap {
+            variant.intergenic_shift = crate::runner::intergenic_shift(variant, effects);
+        }
+    }
+
     pub(crate) fn annotate(&self, variant: &mut InputVariant) {
         if variant.no_allele || variant.variant_class == VariantClass::ReferenceBlock {
             return;
