@@ -1890,6 +1890,29 @@ mod tests {
         assert!(!plain.symbol && !plain.hgvs && !plain.mane_select && plain.sift.is_none());
     }
 
+    /// The `--everything` help, which the CLI reference prints, states what its
+    /// `--regulatory` part writes, the regulatory and motif rows, and the two
+    /// omissions, motif scores and cell-type activity.
+    #[test]
+    fn everything_help_names_the_regulatory_rows_and_omissions() {
+        let mut command = Args::command_with_error_table();
+        command.build();
+        let help = command
+            .get_arguments()
+            .find(|a| a.get_long() == Some("everything"))
+            .and_then(|a| a.get_long_help().or(a.get_help()))
+            .map(|h| h.to_string())
+            .unwrap();
+        for phrase in [
+            "regulatory and motif rows",
+            "motif scores",
+            "cell-type activity",
+            "omitted",
+        ] {
+            assert!(help.contains(phrase), "{phrase:?} missing from {help}");
+        }
+    }
+
     /// An option set overwrites an explicit value, as `apply_option_sets` does
     /// (Config.pm:875): `--everything --sift p` runs SIFT in `b` mode.
     #[test]
