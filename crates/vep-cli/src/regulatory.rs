@@ -13,7 +13,7 @@ use rustc_hash::FxHashMap;
 use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use vep_core::cache_manifest::CacheManifest;
-use vep_core::consequence::{Consequence, FeatureType, TranscriptConsequence};
+use vep_core::consequence::{Consequence, FeatureType, MotifFields, TranscriptConsequence};
 use vep_core::variant::{InputVariant, VariantClass};
 
 use crate::cache_resolve::ResolvedCache;
@@ -38,9 +38,10 @@ struct Feature {
 
 #[derive(Deserialize)]
 struct Matrix {
-    stable_id: String,
+    #[serde(deserialize_with = "crate::json_cache::deserialize_arc_str")]
+    stable_id: Arc<str>,
     #[serde(default)]
-    transcription_factors: Vec<String>,
+    transcription_factors: Arc<[Arc<str>]>,
     // Scores are not computed yet. Count positions without allocating the matrix.
     #[serde(default, rename = "frequencies", deserialize_with = "matrix_length")]
     length: u64,
@@ -343,22 +344,19 @@ impl RegulatorySource {
                 .as_ref()
                 .filter(|_| !variant.is_structural)
             {
-                row.plugin_data
-                    .insert("MOTIF_NAME".into(), matrix.stable_id.clone());
-                row.plugin_data.insert(
-                    "TRANSCRIPTION_FACTORS".into(),
-                    matrix.transcription_factors.join(","),
-                );
                 let relative = start as i64 - feature.start as i64 + 1;
                 let position = if feature.strand < 0 {
                     matrix.length as i64 - relative + 1
                 } else {
                     relative
                 };
-                if position >= 1 && position <= (feature.end - feature.start + 1) as i64 {
-                    row.plugin_data
-                        .insert("MOTIF_POS".into(), position.to_string());
-                }
+                let pos = (position >= 1 && position <= (feature.end - feature.start + 1) as i64)
+                    .then_some(position as u32);
+                row.motif = Some(Box::new(MotifFields {
+                    name: Arc::clone(&matrix.stable_id),
+                    pos,
+                    factors: Arc::clone(&matrix.transcription_factors),
+                }));
             }
             variant.transcript_consequences.push(row);
         }
@@ -457,9 +455,13 @@ mod tests {
             .iter()
             .find(|r| r.feature_type == FeatureType::MotifFeature)
             .unwrap();
-        assert_eq!(motif.plugin_data["MOTIF_NAME"], "ENSPFM_FORWARD");
-        assert_eq!(motif.plugin_data["MOTIF_POS"], "2");
-        assert_eq!(motif.plugin_data["TRANSCRIPTION_FACTORS"], "TF_A,TF_B");
+        let fields = motif.motif.as_deref().unwrap();
+        assert_eq!(fields.name.as_ref(), "ENSPFM_FORWARD");
+        assert_eq!(fields.pos, Some(2));
+        assert_eq!(
+            fields.factors.iter().map(AsRef::as_ref).collect::<Vec<_>>(),
+            ["TF_A", "TF_B"]
+        );
         // An unread chromosome must report malformed JSON rather than silently miss overlaps.
         let (_cold_dir, cold) = self::source();
         std::fs::write(cold.chromosomes["21"].shards[0].clone(), b"[").unwrap();
@@ -492,7 +494,7 @@ mod tests {
             .iter()
             .find(|r| r.transcript_id.as_ref() == "ENSM_REVERSE")
             .unwrap();
-        assert_eq!(row.plugin_data["MOTIF_POS"], "4"); // variant start, not end
+        assert_eq!(row.motif.as_deref().unwrap().pos, Some(4)); // variant start, not end
         let mut before = variant(114, 116, b"ACC", b"-");
         source.annotate(&mut before);
         let row = before
@@ -500,7 +502,7 @@ mod tests {
             .iter()
             .find(|r| r.transcript_id.as_ref() == "ENSM_REVERSE")
             .unwrap();
-        assert!(!row.plugin_data.contains_key("MOTIF_POS"));
+        assert_eq!(row.motif.as_deref().unwrap().pos, None);
     }
 
     /// A `.json.gz` shard loads as a `.json` shard does, through the transcript
@@ -602,10 +604,7 @@ mod tests {
             );
             assert!(row.biotype.is_none());
             for row in &v.transcript_consequences {
-                assert!(
-                    row.plugin_data.is_empty(),
-                    "structural rows omit motif extras"
-                );
+                assert!(row.motif.is_none(), "structural rows omit motif extras");
             }
         }
     }

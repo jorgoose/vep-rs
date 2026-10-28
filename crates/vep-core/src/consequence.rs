@@ -677,6 +677,11 @@ pub struct TranscriptConsequence {
     /// See [`LofteeContext`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub loftee_ctx: Option<Box<LofteeContext>>,
+    /// The motif fields of a `MotifFeature` row of a sequence variant
+    /// (`MotifFeatureVariationAllele_to_output_hash`, OutputFactory.pm:1910-1942):
+    /// `None` on every other row, a structural variant's motif row included.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub motif: Option<Box<MotifFields>>,
     /// The source transcript's [`Transcript::id_rank`]: `transcript_id`'s
     /// position in the byte order of its chromosome's transcript ids, so two
     /// rows of one chromosome compare by rank as they compare by id; rows of
@@ -695,6 +700,18 @@ pub struct TranscriptConsequence {
     /// and 662-665). `false` for every other row. Never serialized.
     #[serde(skip)]
     pub record_span_in_cds: bool,
+}
+
+/// The fields a `MotifFeature` row of a sequence variant carries beside its
+/// terms: `MOTIF_NAME`, the binding matrix's stable id; `MOTIF_POS`, the
+/// variant's first base as a position in the matrix, counted along the motif's
+/// strand, `None` when it falls outside the matrix; `TRANSCRIPTION_FACTORS`,
+/// the matrix's factor names, which print as an empty value when there are none.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MotifFields {
+    pub name: Arc<str>,
+    pub pos: Option<u32>,
+    pub factors: Arc<[Arc<str>]>,
 }
 
 /// Type of genomic feature that a consequence is annotated against.
@@ -806,6 +823,7 @@ impl Default for TranscriptConsequence {
             feature_start: 0,
             feature_end: 0,
             loftee_ctx: None,
+            motif: None,
             id_rank: 0,
             record_span_in_cds: false,
         }
@@ -878,6 +896,7 @@ impl TranscriptConsequence {
             feature_start: transcript.start,
             feature_end: transcript.end,
             loftee_ctx: None,
+            motif: None,
             id_rank: transcript.id_rank,
             record_span_in_cds: false,
         }

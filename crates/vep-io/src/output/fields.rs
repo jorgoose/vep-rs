@@ -1613,13 +1613,15 @@ fn write_row_field_value(
         "SIFT" => push_opt(out, tc.and_then(|x| x.sift.as_deref())),
         "PolyPhen" => push_opt(out, tc.and_then(|x| x.polyphen.as_deref())),
         "HIGH_INF_POS" | "MOTIF_SCORE_CHANGE" => {}
+        "MOTIF_NAME" => push_opt(out, tc.and_then(|x| x.motif.as_deref()).map(|m| &*m.name)),
+        "MOTIF_POS" => {
+            if let Some(pos) = tc.and_then(|x| x.motif.as_deref()).and_then(|m| m.pos) {
+                push_decimal(out, u64::from(pos));
+            }
+        }
         "TRANSCRIPTION_FACTORS" => {
-            if let Some(factors) = tc.and_then(|row| row.plugin_data.get(field)) {
-                push_joined(
-                    out,
-                    factors.split(',').filter(|factor| !factor.is_empty()),
-                    list_sep,
-                );
+            if let Some(motif) = tc.and_then(|row| row.motif.as_deref()) {
+                push_joined(out, motif.factors.iter().map(AsRef::as_ref), list_sep);
             }
         }
         "MAX_AF" => {
@@ -1909,9 +1911,7 @@ pub fn empty_value_is_written(
         return false;
     }
     match field {
-        "TRANSCRIPTION_FACTORS" => tc.is_some_and(|row| {
-            row.feature_type == FeatureType::MotifFeature && row.plugin_data.contains_key(field)
-        }),
+        "TRANSCRIPTION_FACTORS" => tc.is_some_and(|row| row.motif.is_some()),
         "NEAREST" => variant.nearest.as_ref().is_some_and(Vec::is_empty),
         "CLINVAR_SOMATIC_CLASSIFICATION" => {
             options.clinvar_somatic_classification
@@ -2901,11 +2901,26 @@ mod tests {
             "FREQS" => variant.freqs.join(list_sep),
             "SIFT" => tc.and_then(|x| x.sift.clone()).unwrap_or_default(),
             "PolyPhen" => tc.and_then(|x| x.polyphen.clone()).unwrap_or_default(),
-            "MOTIF_NAME"
-            | "MOTIF_POS"
-            | "HIGH_INF_POS"
-            | "MOTIF_SCORE_CHANGE"
-            | "TRANSCRIPTION_FACTORS" => String::new(),
+            "HIGH_INF_POS" | "MOTIF_SCORE_CHANGE" => String::new(),
+            "MOTIF_NAME" => tc
+                .and_then(|x| x.motif.as_deref())
+                .map(|m| m.name.to_string())
+                .unwrap_or_default(),
+            "MOTIF_POS" => tc
+                .and_then(|x| x.motif.as_deref())
+                .and_then(|m| m.pos)
+                .map(|pos| pos.to_string())
+                .unwrap_or_default(),
+            "TRANSCRIPTION_FACTORS" => tc
+                .and_then(|x| x.motif.as_deref())
+                .map(|m| {
+                    m.factors
+                        .iter()
+                        .map(AsRef::as_ref)
+                        .collect::<Vec<_>>()
+                        .join(list_sep)
+                })
+                .unwrap_or_default(),
             "MAX_AF" => frequency::max_af(variant, &options.frequency_groups())
                 .map(|(max, _)| max)
                 .unwrap_or_default(),

@@ -278,10 +278,7 @@ impl JsonOutputFormatter {
             let value = fields::field_value(name, variant, tc, &self.options, ",");
             if name == "TRANSCRIPTION_FACTORS"
                 && value.is_empty()
-                && tc.is_some_and(|row| {
-                    row.feature_type == vep_core::consequence::FeatureType::MotifFeature
-                        && row.plugin_data.contains_key("TRANSCRIPTION_FACTORS")
-                })
+                && tc.is_some_and(|row| row.motif.is_some())
             {
                 obj.insert(json_key(name), Value::Array(Vec::new()));
                 continue;

@@ -1491,20 +1491,18 @@ mod tests {
             ),
             "IMPACT=MODIFIER;DISTANCE=120;STRAND=1;BIOTYPE=protein_coding"
         );
-        let mut motif = TranscriptConsequence {
+        let motif = TranscriptConsequence {
             transcript_id: "ENSM1".into(),
             feature_type: FeatureType::MotifFeature,
             impact: Impact::MODIFIER,
             strand: -1,
+            motif: Some(Box::new(vep_core::consequence::MotifFields {
+                name: "ENSPFM1".into(),
+                pos: Some(3),
+                factors: ["A".into(), "B".into()].into(),
+            })),
             ..Default::default()
         };
-        motif
-            .plugin_data
-            .insert("MOTIF_NAME".into(), "ENSPFM1".into());
-        motif.plugin_data.insert("MOTIF_POS".into(), "3".into());
-        motif
-            .plugin_data
-            .insert("TRANSCRIPTION_FACTORS".into(), "A,B".into());
         assert_eq!(
             extra(&variant, Some(&motif), &regulatory),
             "IMPACT=MODIFIER;STRAND=-1;MOTIF_NAME=ENSPFM1;MOTIF_POS=3;TRANSCRIPTION_FACTORS=A,B"

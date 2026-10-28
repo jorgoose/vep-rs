@@ -141,8 +141,7 @@ fn regulatory_rows_and_extras_reach_every_text_format() {
         "{}",
         String::from_utf8_lossy(&result.stderr)
     );
-    assert!(String::from_utf8_lossy(&result.stderr)
-        .contains("this cache holds no regulatory data"));
+    assert!(String::from_utf8_lossy(&result.stderr).contains("this cache holds no regulatory data"));
     assert!(!String::from_utf8_lossy(&result.stdout).contains("motif_feature_consequences"));
 }
 
@@ -383,7 +382,7 @@ fn embedding_batches_load_regulatory_features_and_apply_summary_filters() {
     assert!(variants[1]
         .transcript_consequences
         .iter()
-        .any(|r| r.plugin_data.get("MOTIF_POS").is_some_and(|p| p == "4")));
+        .any(|r| r.motif.as_deref().is_some_and(|m| m.pos == Some(4))));
     let mut summary = variants.clone();
     vep_cli::apply_to_batch(
         &mut summary,
