@@ -4,7 +4,7 @@
 
 ## The cache
 
-The features come from an Ensembl VEP cache converted with `scripts/data/storable_to_json.pl` ([Cache setup](cache-setup.md#convert-an-existing-ensembl-vep-cache)). Beside `transcripts/<chr>/` the script writes `regulatory/<chr>/<start>-<end>.json`, one shard per region holding the region's regulatory features and motif features, and sets `regulatory: true` in `info.json`; `vep-cache-converter` copies the shards and writes the marker only after the tree has been written. The Ensembl VEP caches that carry a regulatory build convert with it; the human caches do, on both assemblies.
+The features come from an Ensembl VEP cache converted with `scripts/data/storable_to_json.pl` ([Cache setup](cache-setup.md#convert-an-existing-ensembl-vep-cache)). Beside `transcripts/<chr>/` the script writes `regulatory/<chr>/<start>-<end>.json`, one shard per region holding the region's regulatory features and motif features, and sets `regulatory: true` in `info.json`; `vep-cache-converter` copies the shards, as `.json` or `.json.gz`, and writes the marker only after the tree has been written. The Ensembl VEP caches that carry a regulatory build convert with it; the human caches do, on both assemblies.
 
 A cache converted without the regulatory tree holds no regulatory features, and a cache built by `vep-cache-builder` holds none: convert the Ensembl VEP cache again. Every motif feature carries its binding matrix; the converter and the loader refuse a motif without one as a corrupt shard. The shards of a chromosome are read the first time a record of that chromosome is annotated, so a run without `--regulatory` never opens them.
 

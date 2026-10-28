@@ -4,7 +4,7 @@
 //! Cache-backed regulatory overlaps (Ensembl VEP 116.2).
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::Context;
@@ -24,6 +24,7 @@ struct Feature {
     start: u64,
     end: u64,
     strand: i8,
+    #[serde(deserialize_with = "shard_feature_type")]
     feature_type: FeatureType,
     #[serde(
         default,
@@ -42,6 +43,50 @@ struct Matrix {
     // Scores are not computed yet. Count positions without allocating the matrix.
     #[serde(default, rename = "frequencies", deserialize_with = "matrix_length")]
     length: u64,
+}
+
+/// The two feature kinds a regulatory shard holds; `Transcript` and any other
+/// spelling of `feature_type` fail the parse.
+#[derive(Deserialize)]
+enum ShardFeatureType {
+    RegulatoryFeature,
+    MotifFeature,
+}
+
+fn shard_feature_type<'de, D: Deserializer<'de>>(d: D) -> Result<FeatureType, D::Error> {
+    Ok(match ShardFeatureType::deserialize(d)? {
+        ShardFeatureType::RegulatoryFeature => FeatureType::RegulatoryFeature,
+        ShardFeatureType::MotifFeature => FeatureType::MotifFeature,
+    })
+}
+
+/// Parse one shard, `.json` or `.json.gz`, checking its bytes against the
+/// cache's manifest: an array of regulatory and motif features, each motif
+/// carrying its binding matrix (the funcgen schema requires one and the GFF
+/// route blesses a stub, so a motif without one is a corrupt shard).
+fn read_shard_features(path: &Path, manifest: &CacheManifest) -> anyhow::Result<Vec<Feature>> {
+    let bytes = crate::json_cache::read_shard(path, manifest)?;
+    let shard: Vec<Feature> =
+        serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?;
+    if let Some(motif) = shard
+        .iter()
+        .find(|f| f.feature_type == FeatureType::MotifFeature && f.binding_matrix.is_none())
+    {
+        anyhow::bail!(
+            "parsing {}: motif feature {} has no binding matrix",
+            path.display(),
+            motif.stable_id
+        );
+    }
+    Ok(shard)
+}
+
+/// The number of features a regulatory shard holds, parsed as the annotator
+/// parses it, so a converter that writes shards refuses what the annotator
+/// would refuse.
+pub fn count_shard_features(path: &Path) -> anyhow::Result<usize> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    read_shard_features(path, &CacheManifest::absent(dir)).map(|shard| shard.len())
 }
 
 fn matrix_length<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
@@ -109,11 +154,22 @@ impl RegulatorySource {
                 continue;
             }
             let mut shards = Vec::new();
+            let mut other_files = 0;
             for shard in std::fs::read_dir(entry.path())? {
                 let path = shard?.path();
-                if path.extension().is_some_and(|ext| ext == "json") {
+                if crate::json_cache::is_shard_path(&path) {
                     shards.push(path);
+                } else if path.is_file() {
+                    other_files += 1;
                 }
+            }
+            // A chromosome directory of files that are not shards is a cache
+            // written in another layout, never a chromosome with no features.
+            if shards.is_empty() && other_files > 0 {
+                anyhow::bail!(
+                    "{} holds no <start>-<end>.json or .json.gz shard",
+                    entry.path().display()
+                );
             }
             shards.sort();
             chromosomes.insert(
@@ -145,24 +201,7 @@ impl RegulatorySource {
         let mut features = Vec::new();
         let mut seen = HashSet::new();
         for path in &chromosome.shards {
-            let bytes =
-                std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-            self.manifest.verify_bytes(path, &bytes)?;
-            let shard: Vec<Feature> = serde_json::from_slice(&bytes)
-                .with_context(|| format!("parsing {}", path.display()))?;
-            for feature in shard {
-                // Every motif feature carries its binding matrix (the funcgen
-                // schema requires one and the GFF route blesses a stub), so a
-                // motif without one is a corrupt shard, not a feature to skip.
-                if feature.feature_type == FeatureType::MotifFeature
-                    && feature.binding_matrix.is_none()
-                {
-                    anyhow::bail!(
-                        "parsing {}: motif feature {} has no binding matrix",
-                        path.display(),
-                        feature.stable_id
-                    );
-                }
+            for feature in read_shard_features(path, &self.manifest)? {
                 if seen.insert((feature.feature_type, Arc::clone(&feature.stable_id))) {
                     features.push(feature);
                 }
@@ -423,6 +462,59 @@ mod tests {
             .find(|r| r.transcript_id.as_ref() == "ENSM_REVERSE")
             .unwrap();
         assert!(!row.plugin_data.contains_key("MOTIF_POS"));
+    }
+
+    /// A `.json.gz` shard loads as a `.json` shard does, through the transcript
+    /// cache's reader, and a chromosome directory whose files are not shards is
+    /// refused when the source opens, never read as a chromosome with no
+    /// features.
+    #[test]
+    fn gzipped_shards_load_and_a_directory_without_shards_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let chr = dir.path().join("regulatory/21");
+        std::fs::create_dir_all(&chr).unwrap();
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(
+            &mut encoder,
+            include_bytes!("../tests/fixtures/regulatory/1-1000000.json"),
+        )
+        .unwrap();
+        std::fs::write(chr.join("1-1000000.json.gz"), encoder.finish().unwrap()).unwrap();
+        let cache = |dir: &std::path::Path| ResolvedCache {
+            dir: dir.to_string_lossy().into_owned(),
+            info: vep_core::cache_info::CacheInfo {
+                regulatory: true,
+                ..Default::default()
+            },
+            manifest: Arc::new(CacheManifest::load(dir).unwrap()),
+            assembly: Some("GRCh38".into()),
+            fasta: None,
+            synonyms: Arc::new(Default::default()),
+        };
+        let config = Config::from_argv(["vep", "--regulatory"]).unwrap();
+        let source = RegulatorySource::open(&config, &cache(dir.path()))
+            .unwrap()
+            .unwrap();
+        source.prewarm("21").unwrap();
+        let mut v = variant(106, 106, b"C", b"G");
+        source.annotate(&mut v);
+        assert_eq!(v.transcript_consequences.len(), 2);
+        assert_eq!(
+            count_shard_features(&chr.join("1-1000000.json.gz")).unwrap(),
+            3
+        );
+
+        let other = dir.path().join("regulatory/22");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("1-1000000.json.bak"), b"[]").unwrap();
+        let error = match RegulatorySource::open(&config, &cache(dir.path())) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("a directory without shards opened"),
+        };
+        assert!(
+            error.contains("holds no <start>-<end>.json or .json.gz shard"),
+            "{error}"
+        );
     }
 
     /// A motif feature without a binding matrix cannot come from a converted

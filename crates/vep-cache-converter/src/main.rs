@@ -565,8 +565,20 @@ fn validate_info(value: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
+/// The `<start>-<end>` range of a regulatory shard name, `.json` or `.json.gz`;
+/// `None` for any other name.
+fn regulatory_shard_range(name: &str) -> Option<(u64, u64)> {
+    let stem = name
+        .strip_suffix(".json.gz")
+        .or_else(|| name.strip_suffix(".json"))?;
+    let (start, end) = stem.split_once('-')?;
+    Some((start.parse().ok()?, end.parse().ok()?))
+}
+
 /// Preserve the Storable converter's regulatory JSON tree byte for byte.
-/// A shard must be a JSON array before it counts toward cache availability.
+/// A shard must parse as the annotator parses it (`vep_cli::regulatory`)
+/// before it counts toward cache availability: an array of regulatory and
+/// motif features, inflated first when it is a `.json.gz`.
 fn copy_regulatory_files(src_dir: &Path, dst_dir: &Path) -> Result<usize> {
     if !src_dir.exists() {
         return Ok(0);
@@ -590,26 +602,19 @@ fn copy_regulatory_files(src_dir: &Path, dst_dir: &Path) -> Result<usize> {
         shards.sort_by_key(|entry| entry.file_name());
         for shard in shards {
             let path = shard.path();
-            if !path.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            let is_shard = path.is_file()
+                && shard
+                    .file_name()
+                    .to_str()
+                    .and_then(regulatory_shard_range)
+                    .is_some();
+            if !is_shard {
                 continue;
             }
-            let Some((start, end)) = path
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .and_then(|stem| stem.split_once('-'))
-            else {
-                continue;
-            };
-            if start.parse::<u64>().is_err() || end.parse::<u64>().is_err() {
-                continue;
-            }
+            vep_cli::regulatory::count_shard_features(&path)
+                .with_context(|| format!("{} is not a regulatory shard", path.display()))?;
             let content =
                 fs::read(&path).with_context(|| format!("Failed to read {}", path.display()))?;
-            let value: serde_json::Value = serde_json::from_slice(&content)
-                .with_context(|| format!("Failed to parse JSON in {}", path.display()))?;
-            if !value.is_array() {
-                bail!("{} is not a regulatory JSON array", path.display());
-            }
             let out_chr = dst_dir.join(chr);
             fs::create_dir_all(&out_chr)
                 .with_context(|| format!("Failed to create {}", out_chr.display()))?;
@@ -1186,14 +1191,59 @@ mod tests {
         fs::write(src.join("LRG_485/1-1000000.json"), raw).unwrap();
         fs::write(src.join("LRG_485/1000001-2000000.json"), b"[]\n").unwrap();
         fs::write(src.join("LRG_485/not-a-region.json"), b"{}").unwrap();
+        // A gzip-compressed shard is copied as it is, once its inflated content parses.
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, raw).unwrap();
+        let compressed = encoder.finish().unwrap();
+        fs::write(src.join("LRG_485/2000001-3000000.json.gz"), &compressed).unwrap();
         let dst = tmp.path().join("dst");
-        assert_eq!(copy_regulatory_files(&src, &dst).unwrap(), 2);
+        assert_eq!(copy_regulatory_files(&src, &dst).unwrap(), 3);
         assert_eq!(fs::read(dst.join("LRG_485/1-1000000.json")).unwrap(), raw);
         assert_eq!(
             fs::read(dst.join("LRG_485/1000001-2000000.json")).unwrap(),
             b"[]\n"
         );
+        assert_eq!(
+            fs::read(dst.join("LRG_485/2000001-3000000.json.gz")).unwrap(),
+            compressed
+        );
         assert!(!dst.join("LRG_485/not-a-region.json").exists());
+        assert_eq!(
+            regulatory_shard_range("1-1000000.json"),
+            Some((1, 1_000_000))
+        );
+        assert_eq!(
+            regulatory_shard_range("1000001-2000000.json.gz"),
+            Some((1_000_001, 2_000_000))
+        );
+        assert_eq!(regulatory_shard_range("1-1000000.json.bak"), None);
+        assert_eq!(regulatory_shard_range("not-a-region.json"), None);
+    }
+
+    /// The converter refuses what the annotator refuses: a shard that is not an
+    /// array, a transcript-typed element and a motif without a binding matrix.
+    #[test]
+    fn regulatory_shards_are_parsed_as_the_annotator_parses_them() {
+        for (shard, phrase) in [
+            (&br#"{}"#[..], "expected a sequence"),
+            (
+                br#"[{"stable_id":"T1","start":1,"end":2,"strand":1,"feature_type":"Transcript"}]"#,
+                "unknown variant `Transcript`",
+            ),
+            (
+                br#"[{"stable_id":"ENSM_X","start":1,"end":2,"strand":1,"feature_type":"MotifFeature"}]"#,
+                "motif feature ENSM_X has no binding matrix",
+            ),
+        ] {
+            let tmp = Scratch::new();
+            let src = tmp.path().join("src");
+            fs::create_dir_all(src.join("21")).unwrap();
+            fs::write(src.join("21/1-1000000.json"), shard).unwrap();
+            let error = copy_regulatory_files(&src, &tmp.path().join("dst")).unwrap_err();
+            let text = format!("{error:#}");
+            assert!(text.contains("is not a regulatory shard"), "{text}");
+            assert!(text.contains(phrase), "{text}");
+        }
     }
 
     #[test]
@@ -1216,7 +1266,7 @@ mod tests {
         fs::write(src.join("regulatory/21/1-1000000.json"), b"{}").unwrap();
         fs::write(dst.join("info.json"), br#"{"regulatory":true}"#).unwrap();
         let error = convert_cache(&src, dst.to_str().unwrap(), 1_000_000).unwrap_err();
-        assert!(error.to_string().contains("not a regulatory JSON array"));
+        assert!(error.to_string().contains("is not a regulatory shard"));
         assert!(!dst.join("info.json").exists());
     }
 
