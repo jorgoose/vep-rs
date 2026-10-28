@@ -1403,15 +1403,21 @@ pub(crate) fn apply_record_rules(
         // feature's and leaves that feature's reference allele behind
         // (OutputFactory.pm:2323-2338), so of the reference rows
         // (`--process_ref_homs`) the split features carry, the first that overlaps
-        // no feature writes the record's intergenic row and the others none.
+        // no transcript writes the record's intergenic row and the others none.
+        // A feature with regulatory or motif rows alone is intergenic too
+        // (VariationFeature.pm:826-839), and the rejoin moves its regulatory
+        // variations whole, reference allele included (:2311-2318), so a later
+        // such row loses its intergenic row and keeps the rest.
         let intergenic_reference_rows = alleles.iter_mut().filter(|v| {
             v.reference_allele_row
                 && v.original_start.is_some()
-                && v.transcript_consequences.is_empty()
-                && v.most_severe_consequence.is_some()
+                && (v.intergenic_overlap
+                    || (v.transcript_consequences.is_empty()
+                        && v.most_severe_consequence.is_some()))
         });
         for later_row in intergenic_reference_rows.skip(1) {
-            later_row.most_severe_consequence = None;
+            later_row.intergenic_overlap = false;
+            crate::row_filter::settle_verdict(later_row);
         }
     }
 }
@@ -6605,6 +6611,160 @@ mod tests {
             .map(|v| v.most_severe_consequence.is_some())
             .collect();
         assert_eq!(verdicts, [true, true, true, true]);
+    }
+
+    /// A split feature that overlaps a regulatory or motif feature and no
+    /// transcript has an intergenic variation of its own
+    /// (VariationFeature.pm:826-839), so the record's one intergenic reference
+    /// row is the first feature's that overlaps no transcript, whether that
+    /// feature carries regulatory rows or none: the rejoin appends a later
+    /// feature's intergenic alleles to the first intergenic variation and leaves
+    /// its reference allele behind (OutputFactory.pm:2323-2338) but moves its
+    /// regulatory variation whole, reference allele included (:2311-2318). A
+    /// later reference row with regulatory rows alone keeps those rows and
+    /// writes no intergenic row, in either order of the two features, and a
+    /// record whose first feature overlaps a transcript takes the one intergenic
+    /// reference row from the first feature without one.
+    #[test]
+    fn a_split_record_writes_one_intergenic_reference_row_beside_regulatory_rows() {
+        use crate::individuals::RecordReading;
+        use crate::vcf_parser::{parse_vcf_line_with, split_minimal_record, VcfParse};
+        use vep_core::consequence::{FeatureType, TranscriptConsequence};
+        use vep_io::output::fields::record_rows;
+
+        let parse = VcfParse {
+            minimal: true,
+            reading: RecordReading {
+                individuals: None,
+                process_ref_homs: true,
+            },
+            ..VcfParse::default_run(false)
+        };
+        // One reference row before each split feature: `T/T`, `T/A`, `-/-`,
+        // `-/AA` and, for the third allele, `-/-`, `-/G`.
+        let split = |line: &str| -> Vec<InputVariant> {
+            let mut batch = split_minimal_record(parse_vcf_line_with(line, &parse).unwrap());
+            for v in &mut batch {
+                v.input_record = 1;
+            }
+            batch
+        };
+        let row =
+            |id: &str, feature_type: FeatureType, consequence: Consequence| TranscriptConsequence {
+                transcript_id: id.into(),
+                feature_type,
+                consequences: std::iter::once(consequence).collect(),
+                ..Default::default()
+            };
+        let intergenic = |v: &mut InputVariant| {
+            v.most_severe_consequence = Some(Consequence::IntergenicVariant);
+        };
+        let regulatory_only = |v: &mut InputVariant| {
+            v.transcript_consequences.push(row(
+                "ENSR1",
+                FeatureType::RegulatoryFeature,
+                Consequence::RegulatoryRegionVariant,
+            ));
+            v.intergenic_overlap = true;
+            v.most_severe_consequence = Some(Consequence::RegulatoryRegionVariant);
+        };
+        let genic = |v: &mut InputVariant| {
+            v.transcript_consequences.push(row(
+                "ENST1",
+                FeatureType::Transcript,
+                Consequence::IntronVariant,
+            ));
+            v.most_severe_consequence = Some(Consequence::IntronVariant);
+        };
+        // Per allele: its string, `ref` or `alt`, `overlap` when it carries the
+        // intergenic overlap, its verdict and its feature row count; then the
+        // alleles whose intergenic row prints.
+        let shape = |batch: &[InputVariant]| {
+            let alleles: Vec<String> = batch
+                .iter()
+                .map(|v| {
+                    format!(
+                        "{} {} {} {} {}",
+                        v.allele_string,
+                        if v.reference_allele_row { "ref" } else { "alt" },
+                        if v.intergenic_overlap { "overlap" } else { "-" },
+                        v.most_severe_consequence.map_or("-", |c| c.so_term()),
+                        v.transcript_consequences.len(),
+                    )
+                })
+                .collect();
+            let record: Vec<&InputVariant> = batch.iter().collect();
+            let intergenic_rows: Vec<usize> = record_rows(&record)
+                .iter()
+                .filter(|(_, tc)| tc.is_none())
+                .map(|(v, _)| batch.iter().position(|a| std::ptr::eq(a, *v)).unwrap())
+                .collect();
+            (alleles, intergenic_rows)
+        };
+        let two_alleles = "21\t20000326\tx\tTT\tTA,TTAA\t.\t.\t.";
+
+        let mut batch = split(two_alleles);
+        assert_eq!(batch.len(), 4);
+        intergenic(&mut batch[0]);
+        intergenic(&mut batch[1]);
+        regulatory_only(&mut batch[2]);
+        regulatory_only(&mut batch[3]);
+        apply_record_rules(&mut batch, None);
+        assert_eq!(
+            shape(&batch),
+            (
+                vec![
+                    "T/T ref - intergenic_variant 0".to_string(),
+                    "T/A alt - intergenic_variant 0".to_string(),
+                    "-/- ref - regulatory_region_variant 1".to_string(),
+                    "-/AA alt overlap regulatory_region_variant 1".to_string(),
+                ],
+                vec![0, 1, 3]
+            )
+        );
+
+        let mut batch = split(two_alleles);
+        regulatory_only(&mut batch[0]);
+        regulatory_only(&mut batch[1]);
+        intergenic(&mut batch[2]);
+        intergenic(&mut batch[3]);
+        apply_record_rules(&mut batch, None);
+        assert_eq!(
+            shape(&batch),
+            (
+                vec![
+                    "T/T ref overlap regulatory_region_variant 1".to_string(),
+                    "T/A alt overlap regulatory_region_variant 1".to_string(),
+                    "-/- ref - - 0".to_string(),
+                    "-/AA alt - intergenic_variant 0".to_string(),
+                ],
+                vec![0, 1, 3]
+            )
+        );
+
+        let mut batch = split("21\t20000326\tx\tTT\tTA,TTAA,TTG\t.\t.\t.");
+        assert_eq!(batch.len(), 6);
+        genic(&mut batch[0]);
+        genic(&mut batch[1]);
+        regulatory_only(&mut batch[2]);
+        regulatory_only(&mut batch[3]);
+        intergenic(&mut batch[4]);
+        intergenic(&mut batch[5]);
+        apply_record_rules(&mut batch, None);
+        assert_eq!(
+            shape(&batch),
+            (
+                vec![
+                    "T/T ref - intron_variant 1".to_string(),
+                    "T/A alt - intron_variant 1".to_string(),
+                    "-/- ref overlap regulatory_region_variant 1".to_string(),
+                    "-/AA alt overlap regulatory_region_variant 1".to_string(),
+                    "-/- ref - - 0".to_string(),
+                    "-/G alt - intergenic_variant 0".to_string(),
+                ],
+                vec![2, 3, 5]
+            )
+        );
     }
 
     /// `--max_sv_size -1` lifts the size limit: the 10.6 Mb deletion of the
