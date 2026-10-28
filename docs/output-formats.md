@@ -55,7 +55,7 @@ Outside the tested flag set there are known differences. `--regulatory` writes t
 
 The rules the formatters follow are VEP's own, cited to their Perl sources in `crates/vep-io/src/output/fields.rs` (the single field table shared by every format), `crates/vep-effects/src/display.rs` (positions, codons and peptides) and the formatters beside them. The rules a reader of the output most often needs, and the page that states each:
 
-- **Row order**, transcript-major and allele-minor, intergenic rows last: [VEP default and tab](output/vep-and-tab.md#row-order).
+- **Row order**, transcript, regulatory-feature and motif-feature rows, each kind feature-major and allele-minor, intergenic rows last: [VEP default and tab](output/vep-and-tab.md#row-order).
 - **Uploaded_variation**, the first `;`-element of the ID, else `CHROM_POS_REF/ALT1/ALT2` as written: [VEP default and tab](output/vep-and-tab.md#uploaded_variation).
 - **Positions**, `start-end` ranges with `?` for an unmappable end: [VEP default and tab](output/vep-and-tab.md#positions).
 - **Amino_acids and Codons**, `ref/alt` peptides and codon windows: [VEP default and tab](output/vep-and-tab.md#amino_acids-and-codons).
