@@ -389,6 +389,16 @@ impl FieldOptions {
             .any(|g| g.flag != "user" && self.group_active(g.flag))
     }
 
+    /// True when no group beyond `user` and `regulatory` is on: a transcript row
+    /// then carries IMPACT, DISTANCE, STRAND and FLAGS alone, since the six
+    /// regulatory fields are empty on it (BIOTYPE prints on a transcript row under
+    /// its own `biotype` group), and only a regulatory or motif row carries more.
+    pub fn only_regulatory_group_beyond_user(&self) -> bool {
+        FLAG_FIELD_GROUPS
+            .iter()
+            .all(|g| matches!(g.flag, "user" | "regulatory") || !self.group_active(g.flag))
+    }
+
     /// The frequency groups the configuration reports.
     pub fn frequency_groups(&self) -> FrequencyGroups {
         FrequencyGroups {
@@ -410,18 +420,42 @@ pub struct ExtraFieldsPlan {
     pub options: FieldOptions,
     /// [`flag_fields`] of `options`.
     pub flag_fields: Vec<&'static str>,
+    /// [`flag_fields`] without the five motif fields, which a motif row alone
+    /// carries: the keys a transcript or intergenic row can print.
+    pub transcript_flag_fields: Vec<&'static str>,
     /// [`FieldOptions::any_optional_group`] of `options`.
     pub any_optional_group: bool,
+    /// [`FieldOptions::only_regulatory_group_beyond_user`] of `options`: a
+    /// transcript row prints the `user` group alone, as it does with no optional
+    /// group, while a regulatory or motif row prints its own fields.
+    pub transcript_fast_path: bool,
 }
+
+/// The fields only a `MotifFeature` row carries.
+pub const MOTIF_FIELDS: [&str; 5] = [
+    "MOTIF_NAME",
+    "MOTIF_POS",
+    "HIGH_INF_POS",
+    "MOTIF_SCORE_CHANGE",
+    "TRANSCRIPTION_FACTORS",
+];
 
 impl ExtraFieldsPlan {
     pub fn new(options: FieldOptions) -> Self {
         let flag_fields = flag_fields(&options);
+        let transcript_flag_fields = flag_fields
+            .iter()
+            .copied()
+            .filter(|field| !MOTIF_FIELDS.contains(field))
+            .collect();
         let any_optional_group = options.any_optional_group();
+        let transcript_fast_path = options.only_regulatory_group_beyond_user();
         Self {
             options,
             flag_fields,
+            transcript_flag_fields,
             any_optional_group,
+            transcript_fast_path,
         }
     }
 }
