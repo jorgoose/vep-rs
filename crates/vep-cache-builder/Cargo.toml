@@ -3,6 +3,11 @@ name = "vep-cache-builder"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories = ["science::bioinformatics", "command-line-utilities"]
 description = "Builds the VEP JSON transcript cache from Ensembl GFF3, protein FASTA and variation VCF release files"
 
 [[bin]]
@@ -28,4 +33,4 @@ md5 = "0.7"
 
 [dev-dependencies]
 tempfile = { workspace = true }
-vep-cli = { path = "../vep-cli" }
+vep-cli = { workspace = true }

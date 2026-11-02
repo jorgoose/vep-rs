@@ -3,6 +3,11 @@ name = "vep-builtins"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "Built-in VEP plugins: tabix annotation engine, allele matching, and clinical plugins"
 
 [dependencies]

@@ -3,6 +3,11 @@ name = "vep-io"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "Input parsers (Ensembl, HGVS, SPDI, region, identifier) with format detection, and output formatters (VEP, VCF, JSON, Tab, Parquet)"
 
 [dependencies]

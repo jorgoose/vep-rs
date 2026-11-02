@@ -17,6 +17,9 @@ version = "0.5.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/natera-open-source/vep-rs"
+homepage = "https://natera-open-source.github.io/vep-rs/"
+keywords = ["vep", "ensembl", "variant-annotation", "genomics", "bioinformatics"]
+categories = ["science::bioinformatics"]
 # Dependency-driven, not source-driven. The implementation crates' own code needs
 # only 1.80 (`std::sync::LazyLock` in vep-core/src/codon.rs), but the locked
 # dependency graph floors higher: the `noodles` crates (`noodles-bgzf` 0.51 is
@@ -29,13 +32,17 @@ repository = "https://github.com/natera-open-source/vep-rs"
 rust-version = "1.89"
 
 [workspace.dependencies]
-# Workspace crates
-vep-core = { path = "crates/vep-core" }
-vep-effects = { path = "crates/vep-effects" }
-vep-io = { path = "crates/vep-io" }
-vep-plugin = { path = "crates/vep-plugin" }
-vep-builtins = { path = "crates/vep-builtins" }
-vep-fasta = { path = "crates/vep-fasta" }
+# Workspace crates. Each carries an exact version beside its path because crates.io
+# needs a version on every dependency of a published crate; the `=` pin makes a
+# workspace version bump that misses these lines fail to resolve, so the published
+# crates always depend on their own release's siblings.
+vep-core = { path = "crates/vep-core", version = "=0.5.0" }
+vep-effects = { path = "crates/vep-effects", version = "=0.5.0" }
+vep-io = { path = "crates/vep-io", version = "=0.5.0" }
+vep-plugin = { path = "crates/vep-plugin", version = "=0.5.0" }
+vep-builtins = { path = "crates/vep-builtins", version = "=0.5.0" }
+vep-fasta = { path = "crates/vep-fasta", version = "=0.5.0" }
+vep-cli = { path = "crates/vep-cli", version = "=0.5.0" }
 
 # Serialization / cache
 memmap2 = "0.9"
