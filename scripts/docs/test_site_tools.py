@@ -510,7 +510,7 @@ def test_menu_title_is_demoted_and_a_title_repeating_the_book_name_collapses(mon
     index = (site / "index.html").read_text(encoding="utf-8")
     assert f'<p class="menu-title">vep-rs {RELEASE}</p>' in index
     assert "<h1 class=" not in index
-    assert f"<title>vep-rs {RELEASE}</title>" in index
+    assert f"<title>vep-rs {RELEASE}: {postbuild.HOME_TAGLINE}</title>" in index
     assert f"<title>Setup - vep-rs {RELEASE}</title>" in (site / "guide" / "setup.html").read_text(encoding="utf-8")
 
 
@@ -538,6 +538,59 @@ def test_release_form_adds_no_channel_metas_and_writes_versions_and_the_sitemap(
         f"  <url><loc>{BASE}guide/setup.html</loc></url>\n  <url><loc>{BASE}</loc></url>\n</urlset>\n"
     )
     assert json.loads((site / "versions.json").read_text(encoding="utf-8")) == VERSIONS
+
+
+BOOK_DESCRIPTION = "The book-wide description."
+PROSE = (
+    "vep-rs takes <a href=\"x.html\">Ensembl VEP&#39;s</a> inputs and flags and writes its consequence vocabulary "
+    "in its output formats, two orders of magnitude faster than the Perl implementation on every dataset measured."
+)
+
+
+def described_page(title, body):
+    metas = "".join(
+        f'<meta {attr} content="{BOOK_DESCRIPTION}">\n'
+        for attr in ('name="description"', 'property="og:description"', 'name="twitter:description"')
+    )
+    metas += '<meta property="og:title" content="vep-rs">\n'
+    return page_html(title, body).replace("</head>", metas + "</head>")
+
+
+def test_each_page_gets_its_first_paragraph_of_prose_as_its_description(monkeypatch, capsys, tmp_path):
+    site, source = built_site(tmp_path)
+    (site / "index.html").write_text(
+        described_page("vep-rs", f"<main>\n<p>Documentation: short.</p>\n<p>{PROSE}</p>\n</main>"), encoding="utf-8"
+    )
+    (site / "guide" / "setup.html").write_text(
+        described_page("Setup", "<main>\n<h2 id=\"step-2\">Step 2</h2>\n<p>Too short to describe anything.</p>\n</main>"), encoding="utf-8"
+    )
+    code, out = finish(monkeypatch, capsys, site, "--source", str(source))
+    assert code == 0, out
+    index = (site / "index.html").read_text(encoding="utf-8")
+    expected = postbuild.page_description(index)
+    assert expected.startswith("vep-rs takes Ensembl VEP's inputs and flags")
+    assert expected.endswith("\u2026") and len(expected) <= postbuild.DESCRIPTION_MAX
+    assert BOOK_DESCRIPTION not in index
+    assert index.count(postbuild.html.escape(expected)) == 3
+    assert f'<meta property="og:title" content="vep-rs {RELEASE}: {postbuild.HOME_TAGLINE}">' in index
+    record = json.loads(index.split('<script type="application/ld+json">')[1].split("</script>")[0])
+    assert record["@type"] == "SoftwareApplication"
+    assert record["softwareVersion"] == RELEASE.lstrip("v")
+    assert record["description"] == expected
+    assert (site / "guide" / "setup.html").read_text(encoding="utf-8").count(BOOK_DESCRIPTION) == 3
+    code, out = finish(monkeypatch, capsys, site, "--source", str(source))
+    assert code == 0, out
+    assert (site / "index.html").read_text(encoding="utf-8") == index
+
+
+def test_preview_home_gets_the_tagline_but_no_json_ld(monkeypatch, capsys, tmp_path):
+    site, source = built_site(tmp_path)
+    (site / "index.html").write_text(described_page("vep-rs", f"<main><p>{PROSE}</p></main>"), encoding="utf-8")
+    code, out = finish(monkeypatch, capsys, site, "--source", str(source), "--channel", "main", base=BASE + "main/")
+    assert code == 0, out
+    index = (site / "index.html").read_text(encoding="utf-8")
+    assert postbuild.HOME_TAGLINE in index
+    assert "application/ld+json" not in index
 
 
 @pytest.mark.parametrize(
