@@ -9,7 +9,11 @@ On every page except `print.html`, `toc.html`, `404.html` and the stub mdBook
 writes for a redirected path, it inserts `<link rel="canonical">` and `og:url`
 for the page's address under `--base` and, on the preview,
 `<meta name="vep-rs-channel" content="main">` and a `noindex` robots meta, so a
-search engine lists the release and not the preview. It writes `versions.json`,
+search engine lists the release and not the preview. On those pages it also
+replaces the book-wide description metas with the page's first paragraph of
+prose, so each search result shows its own snippet, and on the home page it
+names what the project is in the title and, for a release, adds a schema.org
+SoftwareApplication JSON-LD record. It writes `versions.json`,
 which the header's channel switcher reads, and for a release `sitemap.xml`.
 
 When `VEP_RS_DOCS_README_HOME` is `1` the home page renders the README, so its
@@ -53,6 +57,16 @@ REDIRECT_URL = re.compile(r'let redirectUrl = "([^"]+)"')
 SCHEME = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*:")
 SVG_RELEASE = re.compile(r'<svg[^>]*\sdata-release="([^"]+)"')
 README_RELEASE = re.compile(r"^## Current release: (\S+)\s*$", re.MULTILINE)
+PARAGRAPH = re.compile(r"<p>(.*?)</p>", re.DOTALL)
+TAG = re.compile(r"<[^>]+>")
+DESCRIPTION_METAS = re.compile(
+    r'(<meta (?:name="description"|property="og:description"|name="twitter:description") content=")[^"]*(">)'
+)
+HOME_TITLE = re.compile(r"<title>([^<]*)</title>")
+HOME_OG_TITLES = re.compile(r'(<meta (?:property="og:title"|name="twitter:title") content=")[^"]*(">)')
+# A search result shows the title and description; these say what the project is in the words people search.
+HOME_TAGLINE = "a fast Rust reimplementation of Ensembl VEP, the Variant Effect Predictor"
+DESCRIPTION_MIN, DESCRIPTION_MAX = 80, 160
 
 
 class Ids(html.parser.HTMLParser):
@@ -99,7 +113,58 @@ def collapse_title(m):
     return f"<title>{book}</title>" if chapter in (book, book.split(" ")[0]) else m[0]
 
 
-def finish_pages(site, pages, reader_pages, base, channel, readme_home):
+def page_description(text):
+    """The page's first paragraph of prose in its main content, cut to a search snippet's length; None if none."""
+    start = text.find("<main>")
+    for m in PARAGRAPH.finditer(text, start if start >= 0 else 0):
+        prose = " ".join(html.unescape(TAG.sub("", m[1])).split())
+        if len(prose) < DESCRIPTION_MIN:
+            continue
+        if len(prose) > DESCRIPTION_MAX:
+            prose = prose[: DESCRIPTION_MAX - 1].rsplit(" ", 1)[0].rstrip(",;:") + "\u2026"
+        return prose
+    return None
+
+
+def describe_page(text):
+    """Replaces the book-wide description metas with the page's own; a page without prose keeps the book's."""
+    description = page_description(text)
+    if not description:
+        return text
+    value = html.escape(description)
+    return DESCRIPTION_METAS.sub(lambda m: m[1] + value + m[2], text)
+
+
+def title_home(text, release, channel, base):
+    """Names the project and what it is in the home page's title, and on the release adds its JSON-LD record."""
+    m = HOME_TITLE.search(text)
+    if m and HOME_TAGLINE not in m[1]:
+        title = f"{m[1]}: {HOME_TAGLINE}"
+        text = text.replace(m[0], f"<title>{html.escape(title, quote=False)}</title>", 1)
+        text = HOME_OG_TITLES.sub(lambda t: t[1] + html.escape(title) + t[2], text)
+    if not channel and "application/ld+json" not in text and "</head>" in text:
+        record = {
+            "@context": "https://schema.org",
+            "@type": "SoftwareApplication",
+            "name": "vep-rs",
+            "alternateName": "vep-rs: Ensembl VEP in Rust",
+            "description": page_description(text) or HOME_TAGLINE,
+            "applicationCategory": "Bioinformatics",
+            "operatingSystem": "Linux, macOS",
+            "programmingLanguage": "Rust",
+            "softwareVersion": release.lstrip("v"),
+            "license": "https://www.apache.org/licenses/LICENSE-2.0",
+            "url": base,
+            "codeRepository": "https://github.com/natera-open-source/vep-rs",
+            "downloadUrl": "https://github.com/natera-open-source/vep-rs/releases",
+            "offers": {"@type": "Offer", "price": "0", "priceCurrency": "USD"},
+        }
+        script = '<script type="application/ld+json">' + json.dumps(record).replace("</", "<\\/") + "</script>"
+        text = text.replace("</head>", f"    {script}\n    </head>", 1)
+    return text
+
+
+def finish_pages(site, pages, reader_pages, base, channel, readme_home, release):
     problems, inserted, present = [], 0, 0
     for page in pages:
         path = os.path.join(site, page)
@@ -108,6 +173,9 @@ def finish_pages(site, pages, reader_pages, base, channel, readme_home):
         if readme_home and page == "index.html":
             text = EDIT_HOME.sub(r'\1README.md"', text)
         if page in reader_pages:
+            text = describe_page(text)
+            if page == "index.html":
+                text = title_home(text, release, channel, base)
             if 'rel="canonical"' in text:
                 present += 1
             elif "</head>" not in text:
@@ -252,7 +320,7 @@ def main():
     }
 
     failures = []
-    failures += finish_pages(args.site, pages, reader_pages, base, args.channel, readme_home)
+    failures += finish_pages(args.site, pages, reader_pages, base, args.channel, readme_home, args.release)
     failures += write_versions(args.site, base, args.release, args.channel)
     if not args.channel:
         write_sitemap(args.site, sorted(reader_pages), base)

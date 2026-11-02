@@ -24,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Each documentation page carries its own search description, and the home page's title and schema.org record name vep-rs as a Rust reimplementation of Ensembl VEP. (#82)
 - The README states fastVEP and Ensembl VEP ClinVar times with ratios, drops vep-rs v0.4.0's re-scored rows, places Installation and Quick start before the figures and indexes the documentation site. (#77)
 
 ### Fixed
