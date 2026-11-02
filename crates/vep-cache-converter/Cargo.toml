@@ -3,6 +3,11 @@ name = "vep-cache-converter"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories = ["science::bioinformatics", "command-line-utilities"]
 description = "Validates JSON caches for vep-cli runtime use and converts tabix plugin data to the binary annotation-store format"
 
 [[bin]]
@@ -11,7 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 vep-core = { workspace = true }
-vep-cli = { path = "../vep-cli" }
+vep-cli = { workspace = true }
 vep-builtins = { workspace = true }
 noodles = { workspace = true }
 serde = { workspace = true }

@@ -3,7 +3,12 @@ name = "vep-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "CLI binary for Ensembl VEP Rust implementation"
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories = ["science::bioinformatics", "command-line-utilities"]
+description = "The vep command: a fast Rust reimplementation of the Ensembl Variant Effect Predictor (VEP) with its flags and output formats"
 default-run = "vep"
 
 [lib]
