@@ -1,0 +1,63 @@
+name: Parity row
+description: Close one open row of tests/parity/matrix.tsv (maintainers and agents)
+title: "Close the `<item>` parity row"
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        One issue per row of `tests/parity/matrix.tsv`. The columns are defined in `tests/parity/README.md`, and the recipe is `.claude/skills/close-parity-row/SKILL.md`.
+  - type: input
+    id: item
+    attributes:
+      label: Row
+      description: The row's `item`, exactly as it appears in the matrix.
+      placeholder: AlphaMissense
+    validations:
+      required: true
+  - type: dropdown
+    id: target
+    attributes:
+      label: Target
+      description: The row's `target` column. To change it, open a target decision first.
+      options:
+        - implemented
+        - documented_subset
+        - accepted_noop
+        - error
+        - removed
+    validations:
+      required: true
+  - type: input
+    id: perl_reference
+    attributes:
+      label: Ensembl VEP reference
+      description: The `perl_reference` column, narrowed to the sub and line range where you know it.
+      placeholder: Config.pm::read_config_from_file, lines 960-975
+    validations:
+      required: true
+  - type: textarea
+    id: behaviour
+    attributes:
+      label: Behaviour to match
+      description: What Ensembl VEP does for this item, each claim cited as `Module.pm:line`. For `error`, the exact refusal message vep-rs should print.
+    validations:
+      required: true
+  - type: textarea
+    id: tests
+    attributes:
+      label: Tests that will prove it
+      description: "Test 1 as `<path>.rs::<fn>`. For `implemented` and `documented_subset`, also the corpus and flag set for Test 2, and whether its reference outputs still need an Ensembl VEP run."
+    validations:
+      required: true
+  - type: dropdown
+    id: oracle
+    attributes:
+      label: Needs an Ensembl VEP run
+      description: Whether closing the row needs Docker and an Ensembl VEP 116 cache, for new expected outputs or the concordance smoke.
+      options:
+        - "No"
+        - "Yes"
+        - Unknown
+    validations:
+      required: true
