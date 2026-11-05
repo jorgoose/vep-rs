@@ -1,0 +1,102 @@
+---
+name: close-parity-row
+description: Close a row of tests/parity/matrix.tsv, moving it from `open` to `landed:<target>` with the tests its target requires. Use when porting an Ensembl VEP flag, plugin, input format or cache field, or when picking up a parity-row issue.
+---
+
+# Close a parity row
+
+A row lands in the pull request that brings its behaviour to its `target`, with the tests the target
+requires. [tests/parity/README.md](../../../tests/parity/README.md) defines the columns and the tests
+each target needs; read it before step 1. Branching, signing and the pull request follow
+[AGENTS.md](../../../AGENTS.md).
+
+## 1. Read the row
+
+```bash
+awk -F'\t' 'NR==1 || $1=="<item>"' tests/parity/matrix.tsv
+```
+
+Done when you can state the row's `target`, its `perl_reference` and its `interim` test, if it has one.
+
+## 2. Read the reference
+
+Open the `perl_reference` module and find the code that implements the item. Read it from GitHub at
+the pinned tag, `https://raw.githubusercontent.com/Ensembl/ensembl-vep/release/116.2/<path>`, or from
+the image with `docker run --rm ensemblorg/ensembl-vep:release_116.2 cat /opt/vep/src/ensembl-vep/<path>`:
+
+| `perl_reference` | `<path>` |
+| --- | --- |
+| a VEP module (`Config.pm`, `Parser/VCF.pm`) | `modules/Bio/EnsEMBL/VEP/<module>` |
+| `vep`, `INSTALL.pl` | the name itself |
+| `Variation/<module>` | `Bio/EnsEMBL/Variation/<module>` in the image; in `Ensembl/ensembl-variation` at `modules/Bio/EnsEMBL/Variation/<module>`, branch `release/116` |
+| a plugin (`<Name>.pm`) | `<Name>.pm` in `Ensembl/VEP_plugins`, branch `release/116` |
+
+Write down the behaviour vep-rs must match, each claim cited as `Module.pm:line`: for an `error` or
+`accepted_noop` row, where Ensembl VEP declares the flag and what it does with it; for the other
+targets, every behaviour the target covers.
+
+When the Perl source shows the `target` is wrong (an `error` row Ensembl VEP's own behaviour makes an
+`accepted_noop`, an `implemented` row that needs the Ensembl database), stop: report a **target
+decision** to the maintainers with the citations, and leave the row unchanged.
+
+Done when every claim has a citation you read yourself at `release/116.2`.
+
+## 3. Write Test 1 red
+
+The test lives in the crate the behaviour lives in. Follow the pattern already used for the target:
+
+| `target` | Test 1 | Pattern |
+| --- | --- | --- |
+| `error` | The refusal fires with its message, exit code 1 | `assert_refused` in `crates/vep-cli/tests/cli_errors.rs` |
+| `accepted_noop` | Output is byte-identical with and without the flag | `assert_no_effect` in `crates/vep-cli/tests/cli_noops.rs` |
+| `removed` | The flag is rejected and `args.rs` no longer declares it | `crates/vep-cli/tests/cli_errors.rs` |
+| `implemented` | The effect on a hand-built variant and transcript, the expected value taken from Ensembl VEP's output on the same input and cited | the owning crate's unit tests |
+| `documented_subset` | The subset's effect, plus a test that the page states the exclusion | the `implemented` pattern, plus `crates/vep-cli/tests/documented_subsets.rs` |
+
+Done when the test fails for the reason the row describes, and you have seen it fail.
+
+## 4. Make it green
+
+Implement until Test 1 passes.
+
+- **Command-line refusals and no-ops**: a flag refused, or accepted without effect, is an entry of
+  `ERROR_TABLE` in `crates/vep-cli/src/config.rs`; its doc comments and the existing entries are the
+  contract, and `every_error_table_entry_names_flag_need_and_route` in `cli_errors.rs` checks the
+  message's shape. The refusal message, help text and CLI reference all read the entry.
+- **Flags**: a flag in Ensembl VEP's `@VEP_PARAMS` is declared in `crates/vep-cli/src/args.rs`; its
+  `help_heading` picks the `docs/cli/` page it renders on. After any `args.rs` or error-table change,
+  regenerate the CLI reference: `VEP_UPDATE_CLI_REFERENCE=1 cargo test -p vep-cli --test
+  cli_reference`.
+- **The interim test**: once the real behaviour replaces the stop-gap, delete the test the row's
+  `interim` names, and fix every doc comment, module doc or intra-doc link that names it, including
+  in tests that belong to other rows.
+
+Done when Test 1 passes and `cargo test -p <crate>` is green.
+
+## 5. Test 2 and Test 3
+
+`implemented` and `documented_subset` rows need a golden corpus that covers the row and a comparison
+against Ensembl VEP: follow [corpus.md](corpus.md). Other targets skip this step.
+
+## 6. Land the row
+
+Edit the row:
+
+- `state`: `landed:<target>`.
+- `test1`: the tests written for this row, as `<path>.rs::<fn>` separated by `;`.
+- `test2`: the corpus, for `implemented` and `documented_subset`; empty for the other targets.
+- `interim`: empty.
+
+Find every hand-written page that states the item's old behaviour with `grep -rn -- '<flag or item>'
+docs/` and bring it in line; `docs/cli-reference.md` and `docs/cli/` are generated in step 4. A
+`documented_subset` exclusion is stated on its page in the sentences Test 1 asserts. Add a
+`CHANGELOG.md` entry under Unreleased when the change is visible to a user.
+
+Done when `python3 scripts/parity/check_parity_matrix.py` and `cargo test -p vep-cli --test
+parity_matrix` pass.
+
+## 7. Gate
+
+Run the full set in [AGENTS.md](../../../AGENTS.md#before-pushing), then commit with `-s` and open the
+pull request. Done when every command passes and its output is quoted in the pull request's
+Verification section.
